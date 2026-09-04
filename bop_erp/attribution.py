@@ -64,28 +64,28 @@ def propagate_attribution_to_pick_list(doc, method=None):
 	channels = set()
 	origins = set()
 
-	if hasattr(doc, "locations"):
-		for loc in doc.locations:
-			if loc.sales_order:
-				so = frappe.db.get_value(
-					"Sales Order", loc.sales_order, ["sales_channel", "transaction_origin"], as_dict=True
-				)
-				if so:
-					if so.sales_channel:
-						channels.add(so.sales_channel)
-					if so.transaction_origin:
-						origins.add(so.transaction_origin)
+	locations = doc.get("locations") or []
+	for loc in locations:
+		so_id = getattr(loc, "sales_order", None) if not isinstance(loc, dict) else loc.get("sales_order")
+		if so_id:
+			so = frappe.db.get_value(
+				"Sales Order", so_id, ["sales_channel", "transaction_origin"], as_dict=True
+			)
+			if so:
+				if so.sales_channel:
+					channels.add(so.sales_channel)
+				if so.transaction_origin:
+					origins.add(so.transaction_origin)
 
-	# Multi-source picking: header attribution set ONLY when homogeneous
+	# Independent resolution for operational aggregation
 	if len(channels) == 1:
 		doc.sales_channel = next(iter(channels))
-		if len(origins) == 1:
-			doc.transaction_origin = next(iter(origins))
-		else:
-			doc.transaction_origin = None
 	elif len(channels) > 1:
-		# Mixed-channel pick list: clear header channel to prevent fake attribution
 		doc.sales_channel = None
+
+	if len(origins) == 1:
+		doc.transaction_origin = next(iter(origins))
+	elif len(origins) > 1:
 		doc.transaction_origin = None
 
 def propagate_attribution_to_delivery_note(doc, method=None):
@@ -108,8 +108,8 @@ def propagate_attribution_to_delivery_note(doc, method=None):
 
 	items = doc.get("items") or []
 	for item in items:
-		if getattr(item, "against_sales_order", None) if not isinstance(item, dict) else item.get("against_sales_order"):
-			so_id = getattr(item, "against_sales_order", None) if not isinstance(item, dict) else item.get("against_sales_order")
+		so_id = getattr(item, "against_sales_order", None) if not isinstance(item, dict) else item.get("against_sales_order")
+		if so_id:
 			so = frappe.db.get_value(
 				"Sales Order",
 				so_id,
@@ -124,7 +124,7 @@ def propagate_attribution_to_delivery_note(doc, method=None):
 				if so.external_order_id:
 					ext_ids.add(so.external_order_id)
 
-	# Enforce Commercial Document Homogeneity
+	# Enforce Commercial Document Homogeneity on Channel
 	if len(channels) > 1:
 		frappe.throw(
 			_(
@@ -135,10 +135,17 @@ def propagate_attribution_to_delivery_note(doc, method=None):
 
 	if len(channels) == 1:
 		doc.sales_channel = next(iter(channels))
-		if len(origins) == 1:
-			doc.transaction_origin = next(iter(origins))
-		if len(ext_ids) == 1:
-			doc.external_order_id = next(iter(ext_ids))
+
+	# Origin resolved independently: do not reject same-channel consolidation with differing origins
+	if len(origins) == 1:
+		doc.transaction_origin = next(iter(origins))
+	elif len(origins) > 1:
+		doc.transaction_origin = None
+
+	if len(ext_ids) == 1:
+		doc.external_order_id = next(iter(ext_ids))
+	elif len(ext_ids) > 1:
+		doc.external_order_id = None
 
 def propagate_attribution_to_shipment(doc, method=None):
 	channels = set()
@@ -173,10 +180,16 @@ def propagate_attribution_to_shipment(doc, method=None):
 
 	if len(channels) == 1:
 		doc.sales_channel = next(iter(channels))
-		if len(origins) == 1:
-			doc.transaction_origin = next(iter(origins))
-		if len(ext_ids) == 1:
-			doc.external_order_id = next(iter(ext_ids))
+
+	if len(origins) == 1:
+		doc.transaction_origin = next(iter(origins))
+	elif len(origins) > 1:
+		doc.transaction_origin = None
+
+	if len(ext_ids) == 1:
+		doc.external_order_id = next(iter(ext_ids))
+	elif len(ext_ids) > 1:
+		doc.external_order_id = None
 
 def propagate_attribution_to_sales_invoice(doc, method=None):
 	if getattr(doc, "is_return", 0) and getattr(doc, "return_against", None):
@@ -229,7 +242,7 @@ def propagate_attribution_to_sales_invoice(doc, method=None):
 				if dn.external_order_id:
 					ext_ids.add(dn.external_order_id)
 
-	# Enforce Commercial Document Homogeneity
+	# Enforce Commercial Document Homogeneity on Channel
 	if len(channels) > 1:
 		frappe.throw(
 			_(
@@ -240,10 +253,16 @@ def propagate_attribution_to_sales_invoice(doc, method=None):
 
 	if len(channels) == 1:
 		doc.sales_channel = next(iter(channels))
-		if len(origins) == 1:
-			doc.transaction_origin = next(iter(origins))
-		if len(ext_ids) == 1:
-			doc.external_order_id = next(iter(ext_ids))
+
+	if len(origins) == 1:
+		doc.transaction_origin = next(iter(origins))
+	elif len(origins) > 1:
+		doc.transaction_origin = None
+
+	if len(ext_ids) == 1:
+		doc.external_order_id = next(iter(ext_ids))
+	elif len(ext_ids) > 1:
+		doc.external_order_id = None
 
 def propagate_attribution_to_payment_entry(doc, method=None):
 	channels = set()
@@ -261,15 +280,15 @@ def propagate_attribution_to_payment_entry(doc, method=None):
 			if ref_origin:
 				origins.add(ref_origin)
 
-	# Payment Allocation Rules:
-	# A. Homogeneous (single channel): attribute to that channel
-	# B. Multi-channel allocation: do NOT attribute to a single channel (set None / derived)
+	# Independent attribution resolution:
 	if len(channels) == 1:
 		doc.sales_channel = next(iter(channels))
-		if len(origins) == 1:
-			doc.transaction_origin = next(iter(origins))
 	elif len(channels) > 1:
 		doc.sales_channel = None
+
+	if len(origins) == 1:
+		doc.transaction_origin = next(iter(origins))
+	elif len(origins) > 1:
 		doc.transaction_origin = None
 
 def get_payment_channel_breakdown(doc):
@@ -277,6 +296,7 @@ def get_payment_channel_breakdown(doc):
 	Derive channel allocation breakdown from Payment Entry child references.
 	Returns a dictionary mapping sales_channel to allocated amount:
 	e.g. {'TID': 100.0, 'BAMAL': 50.0}
+	Note: This represents cash collections / payments, not revenue (authority is Sales Invoice).
 	"""
 	if isinstance(doc, str):
 		doc = frappe.get_doc("Payment Entry", doc)
@@ -290,6 +310,27 @@ def get_payment_channel_breakdown(doc):
 			channel = frappe.db.get_value(ref_doctype, ref_name, "sales_channel")
 			allocated = float(allocated or 0.0)
 			breakdown[channel] = breakdown.get(channel, 0.0) + allocated
+	return breakdown
+
+def get_payment_origin_breakdown(doc):
+	"""
+	Derive transaction origin allocation breakdown from Payment Entry child references.
+	Returns a dictionary mapping transaction_origin to allocated amount:
+	e.g. {'WEB': 100.0, 'PHONE': 50.0}
+	Note: This represents cash collections / payments, not revenue (authority is Sales Invoice).
+	"""
+	if isinstance(doc, str):
+		doc = frappe.get_doc("Payment Entry", doc)
+	breakdown = {}
+	refs = doc.get("references") or []
+	for ref in refs:
+		ref_doctype = getattr(ref, "reference_doctype", None) if not isinstance(ref, dict) else ref.get("reference_doctype")
+		ref_name = getattr(ref, "reference_name", None) if not isinstance(ref, dict) else ref.get("reference_name")
+		allocated = getattr(ref, "allocated_amount", 0.0) if not isinstance(ref, dict) else ref.get("allocated_amount", 0.0)
+		if ref_doctype in ("Sales Invoice", "Sales Order") and ref_name:
+			origin = frappe.db.get_value(ref_doctype, ref_name, "transaction_origin")
+			allocated = float(allocated or 0.0)
+			breakdown[origin] = breakdown.get(origin, 0.0) + allocated
 	return breakdown
 
 def validate_transaction_attribution(doc, method=None):

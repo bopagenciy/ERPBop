@@ -12,6 +12,7 @@ from bop_erp.attribution import (
 	propagate_attribution_to_shipment,
 	propagate_attribution_to_payment_entry,
 	get_payment_channel_breakdown,
+	get_payment_origin_breakdown,
 	validate_sales_order_attribution,
 	validate_transaction_attribution,
 	validate_submitted_immutability,
@@ -107,6 +108,32 @@ class TestAttribution(FrappeTestCase):
 		self.assertIsNone(pl.sales_channel)
 		self.assertIsNone(pl.transaction_origin)
 
+	def test_pick_list_same_channel_different_origins(self):
+		# Independent resolution: same channel inherits channel, but differing origins set origin to None
+		def mock_db_get_value(doctype, name, fieldname, *args, **kwargs):
+			if doctype == "Sales Order":
+				if name == "SO-001":
+					return frappe._dict({"sales_channel": "TID", "transaction_origin": TransactionOrigin.WEB})
+				if name == "SO-002":
+					return frappe._dict({"sales_channel": "TID", "transaction_origin": TransactionOrigin.PHONE})
+			return None
+
+		pl = frappe._dict({
+			"doctype": "Pick List",
+			"sales_channel": None,
+			"transaction_origin": None,
+			"locations": [
+				frappe._dict({"sales_order": "SO-001"}),
+				frappe._dict({"sales_order": "SO-002"}),
+			],
+		})
+
+		with patch("frappe.db.get_value", side_effect=mock_db_get_value):
+			propagate_attribution_to_pick_list(pl)
+
+		self.assertEqual(pl.sales_channel, "TID")
+		self.assertIsNone(pl.transaction_origin)
+
 	def test_delivery_note_mixed_channel_rejected(self):
 		def mock_db_get_value(doctype, name, fieldname, *args, **kwargs):
 			if doctype == "Sales Order":
@@ -150,6 +177,32 @@ class TestAttribution(FrappeTestCase):
 		self.assertEqual(dn.transaction_origin, "WEB")
 		self.assertEqual(dn.external_order_id, "101")
 
+	def test_delivery_note_same_channel_different_origins_supported(self):
+		# Delivery Note should NOT reject same-channel orders with differing origins
+		def mock_db_get_value(doctype, name, fieldname, *args, **kwargs):
+			if doctype == "Sales Order":
+				if name == "SO-1":
+					return frappe._dict({"sales_channel": "TID", "transaction_origin": "WEB", "external_order_id": "101"})
+				if name == "SO-2":
+					return frappe._dict({"sales_channel": "TID", "transaction_origin": "PHONE", "external_order_id": "102"})
+			return None
+
+		dn = frappe._dict({
+			"doctype": "Delivery Note",
+			"is_return": 0,
+			"items": [
+				frappe._dict({"against_sales_order": "SO-1"}),
+				frappe._dict({"against_sales_order": "SO-2"}),
+			],
+		})
+
+		with patch("frappe.db.get_value", side_effect=mock_db_get_value):
+			propagate_attribution_to_delivery_note(dn)
+
+		self.assertEqual(dn.sales_channel, "TID")
+		self.assertIsNone(dn.transaction_origin)
+		self.assertIsNone(dn.external_order_id)
+
 	def test_sales_invoice_mixed_channel_rejected(self):
 		def mock_db_get_value(doctype, name, fieldname, *args, **kwargs):
 			if doctype == "Sales Order":
@@ -186,11 +239,36 @@ class TestAttribution(FrappeTestCase):
 		})
 
 		with patch("frappe.db.get_value", side_effect=mock_db_get_value):
-			propagate_attribution_to_sales_invoice, propagate_attribution_to_sales_invoice(si)
+			propagate_attribution_to_sales_invoice(si)
 
 		self.assertEqual(si.sales_channel, "TID")
 		self.assertEqual(si.transaction_origin, "WEB")
 		self.assertEqual(si.external_order_id, "101")
+
+	def test_sales_invoice_same_channel_different_origins_supported(self):
+		def mock_db_get_value(doctype, name, fieldname, *args, **kwargs):
+			if doctype == "Sales Order":
+				if name == "SO-1":
+					return frappe._dict({"sales_channel": "TID", "transaction_origin": "WEB", "external_order_id": "101"})
+				if name == "SO-2":
+					return frappe._dict({"sales_channel": "TID", "transaction_origin": "PHONE", "external_order_id": "102"})
+			return None
+
+		si = frappe._dict({
+			"doctype": "Sales Invoice",
+			"is_return": 0,
+			"items": [
+				frappe._dict({"sales_order": "SO-1", "delivery_note": None}),
+				frappe._dict({"sales_order": "SO-2", "delivery_note": None}),
+			],
+		})
+
+		with patch("frappe.db.get_value", side_effect=mock_db_get_value):
+			propagate_attribution_to_sales_invoice(si)
+
+		self.assertEqual(si.sales_channel, "TID")
+		self.assertIsNone(si.transaction_origin)
+		self.assertIsNone(si.external_order_id)
 
 	def test_shipment_mixed_channel_rejected(self):
 		def mock_db_get_value(doctype, name, fieldname, *args, **kwargs):
@@ -232,6 +310,29 @@ class TestAttribution(FrappeTestCase):
 		self.assertEqual(shp.transaction_origin, "WEB")
 		self.assertEqual(shp.external_order_id, "101")
 
+	def test_shipment_same_channel_different_origins_supported(self):
+		def mock_db_get_value(doctype, name, fieldname, *args, **kwargs):
+			if doctype == "Delivery Note":
+				if name == "DN-1":
+					return frappe._dict({"sales_channel": "TID", "transaction_origin": "WEB", "external_order_id": "101"})
+				if name == "DN-2":
+					return frappe._dict({"sales_channel": "TID", "transaction_origin": "EDI", "external_order_id": "102"})
+			return None
+
+		shp = frappe._dict({
+			"doctype": "Shipment",
+			"delivery_notes": [
+				frappe._dict({"delivery_note": "DN-1"}),
+				frappe._dict({"delivery_note": "DN-2"}),
+			],
+		})
+
+		with patch("frappe.db.get_value", side_effect=mock_db_get_value):
+			propagate_attribution_to_shipment(shp)
+
+		self.assertEqual(shp.sales_channel, "TID")
+		self.assertIsNone(shp.transaction_origin)
+
 	def test_payment_entry_homogeneous_attribution(self):
 		def mock_db_get_value(doctype, name, fieldname, *args, **kwargs):
 			if doctype == "Sales Invoice" and name in ("INV-TID-1", "INV-TID-2"):
@@ -256,6 +357,31 @@ class TestAttribution(FrappeTestCase):
 
 		self.assertEqual(pe.sales_channel, "TID")
 		self.assertEqual(pe.transaction_origin, TransactionOrigin.WEB)
+
+	def test_payment_entry_same_channel_different_origins(self):
+		def mock_db_get_value(doctype, name, fieldname, *args, **kwargs):
+			if doctype == "Sales Invoice":
+				if name == "INV-1":
+					return "TID" if fieldname == "sales_channel" else TransactionOrigin.WEB
+				if name == "INV-2":
+					return "TID" if fieldname == "sales_channel" else TransactionOrigin.PHONE
+			return None
+
+		pe = frappe._dict({
+			"doctype": "Payment Entry",
+			"sales_channel": None,
+			"transaction_origin": None,
+			"references": [
+				frappe._dict({"reference_doctype": "Sales Invoice", "reference_name": "INV-1", "allocated_amount": 100.0}),
+				frappe._dict({"reference_doctype": "Sales Invoice", "reference_name": "INV-2", "allocated_amount": 50.0}),
+			],
+		})
+
+		with patch("frappe.db.get_value", side_effect=mock_db_get_value):
+			propagate_attribution_to_payment_entry(pe)
+
+		self.assertEqual(pe.sales_channel, "TID")
+		self.assertIsNone(pe.transaction_origin)
 
 	def test_payment_entry_multichannel_sets_none(self):
 		def mock_db_get_value(doctype, name, fieldname, *args, **kwargs):
@@ -304,6 +430,28 @@ class TestAttribution(FrappeTestCase):
 
 		self.assertEqual(breakdown, {"TID": 250.0, "BAMAL": 150.0})
 
+	def test_payment_entry_origin_breakdown(self):
+		def mock_db_get_value(doctype, name, fieldname, *args, **kwargs):
+			if doctype == "Sales Invoice":
+				if name == "INV-1":
+					return TransactionOrigin.WEB
+				if name == "INV-2":
+					return TransactionOrigin.PHONE
+			return None
+
+		pe = frappe._dict({
+			"doctype": "Payment Entry",
+			"references": [
+				frappe._dict({"reference_doctype": "Sales Invoice", "reference_name": "INV-1", "allocated_amount": 120.0}),
+				frappe._dict({"reference_doctype": "Sales Invoice", "reference_name": "INV-2", "allocated_amount": 80.0}),
+			],
+		})
+
+		with patch("frappe.db.get_value", side_effect=mock_db_get_value):
+			breakdown = get_payment_origin_breakdown(pe)
+
+		self.assertEqual(breakdown, {TransactionOrigin.WEB: 120.0, TransactionOrigin.PHONE: 80.0})
+
 	def test_return_channel_mismatch_rejected(self):
 		def mock_db_get_value(doctype, name, fieldname, *args, **kwargs):
 			if doctype == "Sales Invoice" and name == "INV-ORIG-001":
@@ -324,8 +472,6 @@ class TestAttribution(FrappeTestCase):
 			self.assertRaises(frappe.ValidationError, validate_transaction_attribution, doc)
 
 	def test_submitted_immutability_reads_persisted_db_state(self):
-		# Even if in-memory get_doc_before_save claims the channel was BAMAL,
-		# the database persisted state has TID. Modifying it must be blocked.
 		def mock_db_get_value(doctype, name, fieldname, *args, **kwargs):
 			if doctype == "Sales Order" and name == "SO-SUBMITTED-01":
 				return frappe._dict({"sales_channel": "TID", "transaction_origin": "WEB"})
@@ -335,7 +481,7 @@ class TestAttribution(FrappeTestCase):
 			"doctype": "Sales Order",
 			"name": "SO-SUBMITTED-01",
 			"company": self.company,
-			"sales_channel": "BAMAL", # Attempted modification
+			"sales_channel": "BAMAL",
 			"transaction_origin": "WEB",
 			"docstatus": 1,
 			"is_new": lambda: False,

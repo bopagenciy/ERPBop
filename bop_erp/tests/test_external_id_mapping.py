@@ -4,6 +4,10 @@
 import frappe
 from frappe.tests.utils import FrappeTestCase
 from bop_erp.constants import ExternalEntityType
+from bop_erp.bop_erp.doctype.external_id_mapping.external_id_mapping import (
+	compute_active_external_key,
+	compute_active_erp_key,
+)
 
 class TestExternalIDMapping(FrappeTestCase):
 	def setUp(self):
@@ -36,8 +40,16 @@ class TestExternalIDMapping(FrappeTestCase):
 
 		self.assertTrue(doc.name)
 		self.assertEqual(doc.external_id, "CUST-9999")
-		self.assertEqual(doc.active_external_key, f"TID::{ExternalEntityType.CUSTOMER}::CUST-9999")
-		self.assertEqual(doc.active_erp_key, f"TID::{ExternalEntityType.CUSTOMER}::Company::{self.company}")
+		self.assertEqual(len(doc.active_external_key), 64)
+		self.assertEqual(len(doc.active_erp_key), 64)
+		self.assertEqual(
+			doc.active_external_key,
+			compute_active_external_key("TID", ExternalEntityType.CUSTOMER, "CUST-9999"),
+		)
+		self.assertEqual(
+			doc.active_erp_key,
+			compute_active_erp_key("TID", ExternalEntityType.CUSTOMER, "Company", self.company),
+		)
 		frappe.delete_doc("External ID Mapping", doc.name)
 
 	def test_duplicate_external_id_rejected(self):
@@ -168,7 +180,7 @@ class TestExternalIDMapping(FrappeTestCase):
 			"erp_document": self.company,
 			"external_id": "PROD-CONC-1",
 			"active_external_key": m1.active_external_key,
-			"active_erp_key": "DIFFERENT-ERP-KEY",
+			"active_erp_key": "1111111111222222222233333333334444444444555555555566666666667777",
 			"active": 1,
 		})
 		self.assertRaises(Exception, m2.db_insert)
@@ -193,7 +205,7 @@ class TestExternalIDMapping(FrappeTestCase):
 			"erp_doctype": "Company",
 			"erp_document": self.company,
 			"external_id": "PROD-CONC-B",
-			"active_external_key": "DIFFERENT-EXT-KEY",
+			"active_external_key": "1111111111222222222233333333334444444444555555555566666666667777",
 			"active_erp_key": m1.active_erp_key,
 			"active": 1,
 		})
@@ -246,3 +258,150 @@ class TestExternalIDMapping(FrappeTestCase):
 		frappe.delete_doc("External ID Mapping", m1.name)
 		frappe.delete_doc("External ID Mapping", m2.name)
 		frappe.delete_doc("External ID Mapping", m3.name)
+
+	def test_product_duplicate_cannot_bypass_uniqueness_using_external_variant_id(self):
+		# Attempting to provide external_variant_id for PRODUCT must be rejected
+		doc = frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": "TID",
+			"external_entity_type": ExternalEntityType.PRODUCT,
+			"erp_doctype": "Company",
+			"erp_document": self.company,
+			"external_id": "PROD-123",
+			"external_variant_id": "VAR-SUFFIX-A",
+			"active": 1,
+		})
+		self.assertRaises(frappe.ValidationError, doc.insert)
+
+	def test_order_duplicate_cannot_bypass_uniqueness_with_variant_field(self):
+		doc = frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": "TID",
+			"external_entity_type": ExternalEntityType.ORDER,
+			"erp_doctype": "Company",
+			"erp_document": self.company,
+			"external_id": "ORD-999",
+			"external_variant_id": "VAR-ORDER-X",
+			"active": 1,
+		})
+		self.assertRaises(frappe.ValidationError, doc.insert)
+
+	def test_product_variant_ab_coexist_correctly(self):
+		v1 = frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": "TID",
+			"external_entity_type": ExternalEntityType.PRODUCT_VARIANT,
+			"erp_doctype": "Company",
+			"erp_document": self.company,
+			"external_id": "PROD-PARENT-100",
+			"external_variant_id": "COMBINATION-A",
+			"active": 1,
+		}).insert()
+
+		v2 = frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": "TID",
+			"external_entity_type": ExternalEntityType.PRODUCT_VARIANT,
+			"erp_doctype": "Company",
+			"erp_document": self.company,
+			"external_id": "PROD-PARENT-100",
+			"external_variant_id": "COMBINATION-B",
+			"active": 1,
+		}).insert()
+
+		self.assertTrue(v1.name and v2.name)
+		self.assertNotEqual(v1.active_external_key, v2.active_external_key)
+		self.assertNotEqual(v1.active_erp_key, v2.active_erp_key)
+
+		# Duplicate active variant A must be rejected
+		v_dup = frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": "TID",
+			"external_entity_type": ExternalEntityType.PRODUCT_VARIANT,
+			"erp_doctype": "Company",
+			"erp_document": self.company,
+			"external_id": "PROD-PARENT-100",
+			"external_variant_id": "COMBINATION-A",
+			"active": 1,
+		})
+		self.assertRaises(frappe.ValidationError, v_dup.insert)
+
+		frappe.delete_doc("External ID Mapping", v1.name)
+		frappe.delete_doc("External ID Mapping", v2.name)
+
+	def test_product_variant_requires_external_variant_id(self):
+		v = frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": "TID",
+			"external_entity_type": ExternalEntityType.PRODUCT_VARIANT,
+			"erp_doctype": "Company",
+			"erp_document": self.company,
+			"external_id": "PROD-PARENT-100",
+			"external_variant_id": None,
+			"active": 1,
+		})
+		self.assertRaises(frappe.ValidationError, v.insert)
+
+	def test_long_external_ids(self):
+		long_id = "VERY-LONG-EXTERNAL-ID-" + ("X" * 160)
+		doc = frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": "TID",
+			"external_entity_type": ExternalEntityType.CUSTOMER,
+			"erp_doctype": "Company",
+			"erp_document": self.company,
+			"external_id": long_id,
+			"active": 1,
+		}).insert()
+
+		self.assertTrue(doc.name)
+		self.assertEqual(len(doc.active_external_key), 64)
+		frappe.delete_doc("External ID Mapping", doc.name)
+
+	def test_external_ids_containing_separators(self):
+		sep_id = 'PART::100,200/TEST#"SPECIAL"'
+		doc = frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": "TID",
+			"external_entity_type": ExternalEntityType.CUSTOMER,
+			"erp_doctype": "Company",
+			"erp_document": self.company,
+			"external_id": sep_id,
+			"active": 1,
+		}).insert()
+
+		self.assertTrue(doc.name)
+		self.assertEqual(len(doc.active_external_key), 64)
+		frappe.delete_doc("External ID Mapping", doc.name)
+
+	def test_case_distinct_ids_remain_distinct(self):
+		h_lower = compute_active_external_key("TID", ExternalEntityType.PRODUCT, "sku-abc")
+		h_upper = compute_active_external_key("TID", ExternalEntityType.PRODUCT, "SKU-ABC")
+		self.assertNotEqual(h_lower, h_upper)
+
+		doc1 = frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": "TID",
+			"external_entity_type": ExternalEntityType.PRODUCT,
+			"erp_doctype": "Company",
+			"erp_document": self.company,
+			"external_id": "sku-abc",
+			"active": 1,
+		}).insert()
+
+		# Different ERP document or inactive to avoid ERP document uniqueness collision
+		doc2 = frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": "TID",
+			"external_entity_type": ExternalEntityType.PRODUCT,
+			"erp_doctype": "DocType",
+			"erp_document": "Company",
+			"external_id": "SKU-ABC",
+			"active": 1,
+		}).insert()
+
+		self.assertTrue(doc1.name and doc2.name)
+		self.assertNotEqual(doc1.active_external_key, doc2.active_external_key)
+
+		frappe.delete_doc("External ID Mapping", doc1.name)
+		frappe.delete_doc("External ID Mapping", doc2.name)
