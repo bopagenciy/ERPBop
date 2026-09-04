@@ -6,43 +6,37 @@ app_email = "info@bop.agency"
 app_license = "Proprietary"
 app_version = "0.0.1"
 
-# Includes in <head>
-# ------------------
-
-# include js, css files in header of desk.html
-# app_include_css = "/assets/bop_erp/css/bop_erp.css"
-# app_include_js = "/assets/bop_erp/js/bop_erp.js"
+# Fixtures
+# --------
+fixtures = [
+	"Role",
+	"Custom Field",
+]
 
 # Document Events
 # ---------------
-# doc_events = {
-# 	"*": {
-# 		"on_update": "method",
-# 		"on_cancel": "method",
-# 		"on_trash": "method"
-# 	}
-# }
-
-# Scheduled Tasks
-# ---------------
-# scheduler_events = {
-# 	"all": [
-# 		"bop_erp.tasks.all"
-# 	],
-# 	"daily": [
-# 		"bop_erp.tasks.daily"
-# 	],
-# 	"hourly": [
-# 		"bop_erp.tasks.hourly"
-# 	],
-# 	"weekly": [
-# 		"bop_erp.tasks.weekly"
-# 	],
-# 	"monthly": [
-# 		"bop_erp.tasks.monthly"
-# 	],
-# }
-
-# Testing
-# -------
-# before_tests = "bop_erp.install.before_tests"
+doc_events = {
+	"Sales Order": {
+		"validate": "bop_erp.attribution.validate_sales_order_attribution",
+	},
+	"Pick List": {
+		"before_insert": "bop_erp.attribution.propagate_attribution_to_pick_list",
+		"validate": "bop_erp.attribution.validate_transaction_attribution",
+	},
+	"Delivery Note": {
+		"before_insert": "bop_erp.attribution.propagate_attribution_to_delivery_note",
+		"validate": "bop_erp.attribution.validate_transaction_attribution",
+	},
+	"Shipment": {
+		"before_insert": "bop_erp.attribution.propagate_attribution_to_shipment",
+		"validate": "bop_erp.attribution.validate_transaction_attribution",
+	},
+	"Sales Invoice": {
+		"before_insert": "bop_erp.attribution.propagate_attribution_to_sales_invoice",
+		"validate": "bop_erp.attribution.validate_transaction_attribution",
+	},
+	"Payment Entry": {
+		"before_insert": "bop_erp.attribution.propagate_attribution_to_payment_entry",
+		"validate": "bop_erp.attribution.validate_transaction_attribution",
+	},
+}

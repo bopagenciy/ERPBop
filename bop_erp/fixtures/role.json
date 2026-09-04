@@ -1,0 +1,14 @@
+[
+ {
+  "desk_access": 1,
+  "doctype": "Role",
+  "name": "Bop ERP Administrator",
+  "role_name": "Bop ERP Administrator"
+ },
+ {
+  "desk_access": 1,
+  "doctype": "Role",
+  "name": "Bop Integration User",
+  "role_name": "Bop Integration User"
+ }
+]

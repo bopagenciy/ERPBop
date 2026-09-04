@@ -1,0 +1,220 @@
+{
+ "actions": [],
+ "autoname": "field:channel_id",
+ "creation": "2026-09-04 08:38:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "channel_id",
+  "channel_name",
+  "channel_type",
+  "company",
+  "active",
+  "column_break_1",
+  "domain",
+  "default_warehouse",
+  "default_price_list",
+  "currency",
+  "language",
+  "section_break_integration",
+  "integration_provider",
+  "external_store_id",
+  "credential_reference",
+  "column_break_sync",
+  "sync_catalog",
+  "sync_inventory",
+  "sync_prices",
+  "sync_orders",
+  "sync_customers",
+  "sync_shipping"
+ ],
+ "fields": [
+  {
+   "bold": 1,
+   "fieldname": "channel_id",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Channel ID",
+   "no_copy": 1,
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "channel_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Channel Name",
+   "reqd": 1
+  },
+  {
+   "default": "PRESTASHOP",
+   "fieldname": "channel_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Channel Type",
+   "options": "PRESTASHOP\nMARKETPLACE\nPHONE\nCOUNTER\nINTERNAL\nOTHER",
+   "reqd": 1
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Company",
+   "options": "Company",
+   "reqd": 1
+  },
+  {
+   "default": "1",
+   "fieldname": "active",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "label": "Active"
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "domain",
+   "fieldtype": "Data",
+   "label": "Domain"
+  },
+  {
+   "fieldname": "default_warehouse",
+   "fieldtype": "Link",
+   "label": "Default Warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "default_price_list",
+   "fieldtype": "Link",
+   "label": "Default Price List",
+   "options": "Price List"
+  },
+  {
+   "fieldname": "currency",
+   "fieldtype": "Link",
+   "label": "Currency",
+   "options": "Currency"
+  },
+  {
+   "fieldname": "language",
+   "fieldtype": "Link",
+   "label": "Language",
+   "options": "Language"
+  },
+  {
+   "fieldname": "section_break_integration",
+   "fieldtype": "Section Break",
+   "label": "Integration Settings"
+  },
+  {
+   "default": "NONE",
+   "fieldname": "integration_provider",
+   "fieldtype": "Select",
+   "label": "Integration Provider",
+   "options": "NONE\nPRESTASHOP\nOTHER"
+  },
+  {
+   "fieldname": "external_store_id",
+   "fieldtype": "Data",
+   "label": "External Store ID"
+  },
+  {
+   "description": "Identifier or alias pointing to secure external vault/secrets. Never store raw API tokens here.",
+   "fieldname": "credential_reference",
+   "fieldtype": "Data",
+   "label": "Credential Reference"
+  },
+  {
+   "fieldname": "column_break_sync",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "fieldname": "sync_catalog",
+   "fieldtype": "Check",
+   "label": "Sync Catalog"
+  },
+  {
+   "default": "0",
+   "fieldname": "sync_inventory",
+   "fieldtype": "Check",
+   "label": "Sync Inventory"
+  },
+  {
+   "default": "0",
+   "fieldname": "sync_prices",
+   "fieldtype": "Check",
+   "label": "Sync Prices"
+  },
+  {
+   "default": "0",
+   "fieldname": "sync_orders",
+   "fieldtype": "Check",
+   "label": "Sync Orders"
+  },
+  {
+   "default": "0",
+   "fieldname": "sync_customers",
+   "fieldtype": "Check",
+   "label": "Sync Customers"
+  },
+  {
+   "default": "0",
+   "fieldname": "sync_shipping",
+   "fieldtype": "Check",
+   "label": "Sync Shipping"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-09-04 08:38:00.000000",
+ "modified_by": "Administrator",
+ "module": "Bop ERP",
+ "name": "Sales Channel",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Bop ERP Administrator",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 0,
+   "delete": 0,
+   "email": 1,
+   "export": 0,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Bop Integration User",
+   "share": 0,
+   "write": 0
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}
