@@ -38,17 +38,15 @@
   },
   {
    "fieldname": "external_id",
-   "fieldtype": "Data",
+   "fieldtype": "Small Text",
    "in_list_view": 1,
    "label": "External ID",
-   "length": 255,
    "reqd": 1
   },
   {
    "fieldname": "external_variant_id",
-   "fieldtype": "Data",
-   "label": "External Variant/Combination ID",
-   "length": 255
+   "fieldtype": "Small Text",
+   "label": "External Variant/Combination ID"
   },
   {
    "default": "1",
@@ -115,7 +113,7 @@
  ],
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2026-09-04 08:48:00.000000",
+ "modified": "2026-09-04 09:10:00.000000",
  "modified_by": "Administrator",
  "module": "Bop ERP",
  "name": "External ID Mapping",

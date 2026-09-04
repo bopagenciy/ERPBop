@@ -8,43 +8,49 @@ from frappe import _
 from frappe.model.document import Document
 from bop_erp.constants import ExternalEntityType
 
+MAX_EXTERNAL_ID_LENGTH = 1000
+
 def compute_active_external_key(sales_channel, external_entity_type, external_id, external_variant_id=None):
 	"""
-	Canonical SHA-256 hash over deterministic JSON tuple:
-	[sales_channel, external_entity_type, external_id, variant_id_if_applicable]
-	Preserves exact case-sensitivity and eliminates delimiter ambiguity.
+	External active unique key:
+	For PRODUCT_VARIANT:
+		[sales_channel, external_entity_type, external_id, external_variant_id]
+	For all non-variant types:
+		[sales_channel, external_entity_type, external_id]
+
+	Canonical SHA-256 hash over deterministic JSON tuple.
+	External IDs are strictly opaque: casing, leading/trailing whitespace, and separators are preserved.
 	"""
-	variant_val = (
-		str(external_variant_id).strip()
-		if (external_entity_type == ExternalEntityType.PRODUCT_VARIANT and external_variant_id)
-		else None
-	)
-	identity_tuple = [
-		str(sales_channel).strip(),
-		str(external_entity_type).strip(),
-		str(external_id).strip(),
-		variant_val,
-	]
+	if str(external_entity_type) == ExternalEntityType.PRODUCT_VARIANT:
+		identity_tuple = [
+			str(sales_channel),
+			str(external_entity_type),
+			str(external_id),
+			str(external_variant_id) if external_variant_id is not None else None,
+		]
+	else:
+		identity_tuple = [
+			str(sales_channel),
+			str(external_entity_type),
+			str(external_id),
+		]
 	canonical_json = json.dumps(identity_tuple, ensure_ascii=False, separators=(",", ":"))
 	return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
-def compute_active_erp_key(sales_channel, external_entity_type, erp_doctype, erp_document, external_variant_id=None):
+def compute_active_erp_key(sales_channel, external_entity_type, erp_doctype, erp_document):
 	"""
-	Canonical SHA-256 hash over deterministic JSON tuple:
-	[sales_channel, external_entity_type, erp_doctype, erp_document, variant_id_if_applicable]
-	Preserves exact case-sensitivity and eliminates delimiter ambiguity.
+	ERP inverse active unique key MUST represent the ERP object identity:
+	[sales_channel, external_entity_type, erp_doctype, erp_document]
+
+	Canonical SHA-256 hash over deterministic JSON tuple.
+	Does NOT include external_variant_id, preventing multiple external variants from
+	mapping simultaneously to the same ERP document inside the same Sales Channel.
 	"""
-	variant_val = (
-		str(external_variant_id).strip()
-		if (external_entity_type == ExternalEntityType.PRODUCT_VARIANT and external_variant_id)
-		else None
-	)
 	identity_tuple = [
-		str(sales_channel).strip(),
-		str(external_entity_type).strip(),
-		str(erp_doctype).strip(),
-		str(erp_document).strip(),
-		variant_val,
+		str(sales_channel),
+		str(external_entity_type),
+		str(erp_doctype),
+		str(erp_document),
 	]
 	canonical_json = json.dumps(identity_tuple, ensure_ascii=False, separators=(",", ":"))
 	return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
@@ -52,6 +58,7 @@ def compute_active_erp_key(sales_channel, external_entity_type, erp_doctype, erp
 class ExternalIDMapping(Document):
 	def validate(self):
 		self.clean_fields()
+		self.validate_field_lengths()
 		self.validate_variant_semantics()
 		self.set_uniqueness_keys()
 		self.validate_linked_document()
@@ -59,11 +66,25 @@ class ExternalIDMapping(Document):
 		self.validate_erp_document_uniqueness()
 
 	def clean_fields(self):
-		if self.external_id:
-			# Whitespace stripping only; preserve exact case sensitivity
-			self.external_id = str(self.external_id).strip()
-		if self.external_variant_id:
-			self.external_variant_id = str(self.external_variant_id).strip()
+		# External IDs are opaque: DO NOT strip, lowercase, uppercase, or collapse whitespace
+		if self.external_id is not None:
+			self.external_id = str(self.external_id)
+		if self.external_variant_id is not None:
+			self.external_variant_id = str(self.external_variant_id)
+
+	def validate_field_lengths(self):
+		if self.external_id and len(self.external_id) > MAX_EXTERNAL_ID_LENGTH:
+			frappe.throw(
+				_("External ID exceeds maximum allowed length of {0} characters (received {1}).").format(
+					MAX_EXTERNAL_ID_LENGTH, len(self.external_id)
+				)
+			)
+		if self.external_variant_id and len(self.external_variant_id) > MAX_EXTERNAL_ID_LENGTH:
+			frappe.throw(
+				_("External Variant ID exceeds maximum allowed length of {0} characters (received {1}).").format(
+					MAX_EXTERNAL_ID_LENGTH, len(self.external_variant_id)
+				)
+			)
 
 	def validate_variant_semantics(self):
 		if self.external_entity_type == ExternalEntityType.PRODUCT_VARIANT:
@@ -93,7 +114,6 @@ class ExternalIDMapping(Document):
 				self.external_entity_type,
 				self.erp_doctype,
 				self.erp_document,
-				self.external_variant_id,
 			)
 		else:
 			self.active_external_key = None
@@ -140,20 +160,20 @@ class ExternalIDMapping(Document):
 		existing = frappe.db.get_value(
 			"External ID Mapping",
 			{"active_erp_key": self.active_erp_key},
-			["name", "external_id"],
+			["name", "external_id", "external_variant_id"],
 			as_dict=True,
 		)
 		if existing and existing.name != self.name:
-			var_desc = f" (Variant: '{self.external_variant_id}')" if self.external_variant_id else ""
+			var_desc = f" (Variant: '{existing.external_variant_id}')" if existing.external_variant_id else ""
 			frappe.throw(
 				_(
-					"An active mapping already exists for {0} '{1}' in Channel '{2}'{3} "
-					"(External ID: '{4}'). Cannot create duplicate active mapping."
+					"An active mapping already exists for {0} '{1}' in Channel '{2}' "
+					"(External ID: '{3}'{4}). Cannot create duplicate active mapping."
 				).format(
 					self.erp_doctype,
 					self.erp_document,
 					self.sales_channel,
-					var_desc,
 					existing.external_id,
+					var_desc,
 				)
 			)
