@@ -223,6 +223,23 @@ class PrestaShopClient:
 	def get_combination(self, combination_id: Any) -> Dict[str, Any]:
 		return self._get_resource("combinations", combination_id)
 
+	# --- Product Options (Attribute Groups) & Option Values ---
+	def list_product_options(
+		self, limit: int = 50, offset: int = 0, filters: Optional[Dict[str, Any]] = None, display: Optional[str] = None
+	) -> List[Dict[str, Any]]:
+		return self._list_resource("product_options", limit, offset, filters, display)
+
+	def get_product_option(self, option_id: Any) -> Dict[str, Any]:
+		return self._get_resource("product_options", option_id)
+
+	def list_product_option_values(
+		self, limit: int = 50, offset: int = 0, filters: Optional[Dict[str, Any]] = None, display: Optional[str] = None
+	) -> List[Dict[str, Any]]:
+		return self._list_resource("product_option_values", limit, offset, filters, display)
+
+	def get_product_option_value(self, value_id: Any) -> Dict[str, Any]:
+		return self._get_resource("product_option_values", value_id)
+
 	# --- Stock Methods ---
 	def list_stock_availables(
 		self, limit: int = 50, offset: int = 0, filters: Optional[Dict[str, Any]] = None, display: Optional[str] = None

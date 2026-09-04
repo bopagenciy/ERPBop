@@ -1,6 +1,6 @@
 {
  "actions": [],
- "autoname": "format:PS-{sales_channel}",
+ "autoname": "format:PS-{sales_channel}-{environment}",
  "creation": "2026-09-04 11:20:00.000000",
  "doctype": "DocType",
  "engine": "InnoDB",
@@ -28,8 +28,7 @@
    "in_list_view": 1,
    "label": "Sales Channel",
    "options": "Sales Channel",
-   "reqd": 1,
-   "unique": 1
+   "reqd": 1
   },
   {
    "default": "DEVELOPMENT",

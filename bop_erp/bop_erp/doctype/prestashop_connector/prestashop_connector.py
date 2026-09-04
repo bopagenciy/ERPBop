@@ -18,7 +18,42 @@ class PrestaShopConnector(Document):
 		self.validate_safety()
 		self.validate_read_only_phase()
 		self.validate_credential_reference()
+		self.validate_uniqueness()
 		self.clean_base_url()
+
+	def validate_uniqueness(self):
+		"""
+		Enforces:
+		1. Unique composite key of (sales_channel, environment).
+		2. At most one enabled connector per sales_channel.
+		"""
+		existing_env = frappe.db.get_value(
+			"PrestaShop Connector",
+			{"sales_channel": self.sales_channel, "environment": self.environment},
+			"name",
+		)
+		if existing_env and existing_env != self.name:
+			frappe.throw(
+				_("A PrestaShop Connector already exists for Sales Channel '{0}' and Environment '{1}' ({2}).").format(
+					self.sales_channel, self.environment, existing_env
+				),
+				frappe.DuplicateEntryError,
+			)
+
+		if self.enabled:
+			existing_enabled = frappe.db.get_value(
+				"PrestaShop Connector",
+				{"sales_channel": self.sales_channel, "enabled": 1},
+				"name",
+			)
+			if existing_enabled and existing_enabled != self.name:
+				frappe.throw(
+					_(
+						"Only one active PrestaShop Connector is permitted for Sales Channel '{0}'. "
+						"Connector '{1}' is already active."
+					).format(self.sales_channel, existing_enabled),
+					frappe.ValidationError,
+				)
 
 	def validate_safety(self):
 		"""Enforces strict safety denylist and environment rules before saving."""

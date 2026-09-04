@@ -48,11 +48,6 @@ class PrestaShopConfig:
 		if key:
 			return str(key).strip()
 
-		# 3. Known local development test key fallback
-		if self.environment in (IntegrationEnvironment.DEVELOPMENT, "DEVELOPMENT"):
-			if ref in ("TEST_PRESTASHOP_KEY", "PRESTASHOP_TEST_KEY", "LOCAL_PRESTASHOP_KEY"):
-				return "BOPTESTKEY1234567890123456789012"
-
 		raise PrestaShopAuthError(
 			_("Could not resolve API credential for reference '{0}'. "
 			  "Ensure it is configured in site_config.json or environment variables.").format(ref)

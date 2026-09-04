@@ -107,4 +107,9 @@ Write Enabled,Escritura Habilitada
 Webhook Enabled,Webhook Habilitado
 Timeout Seconds,Segundos de Espera
 Verify TLS,Verificar TLS
-
+"A PrestaShop Connector already exists for Sales Channel '{0}' and Environment '{1}' ({2}).","Ya existe un Conector PrestaShop para el Canal de Ventas '{0}' y Entorno '{1}' ({2})."
+"Only one active PrestaShop Connector is permitted for Sales Channel '{0}'. Connector '{1}' is already active.","Solo se permite un Conector PrestaShop activo para el Canal de Ventas '{0}'. El Conector '{1}' ya está activo."
+Category Import Error: {0},Error al importar categoría: {0}
+Attribute Import Error: {0},Error al importar atributo: {0}
+Product Import Error: {0},Error al importar producto: {0}
+Variant Import Error: {0},Error al importar variante: {0}
