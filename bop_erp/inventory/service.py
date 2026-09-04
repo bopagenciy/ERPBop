@@ -4,6 +4,7 @@
 from typing import List, Optional
 import frappe
 from frappe.utils import flt
+from frappe.model.meta import get_field_precision
 
 from bop_erp.inventory.exceptions import WarehouseNotFoundError
 from bop_erp.inventory.models import (
@@ -47,18 +48,22 @@ class InventoryService:
 			as_dict=True,
 		)
 
+		meta = frappe.get_meta("Bin")
+		field = meta.get_field("actual_qty")
+		prec = get_field_precision(field) if field else (frappe.db.get_default("float_precision") or 3)
+
 		if bin_data:
 			return WarehouseInventorySnapshot(
 				item_code=item_code,
 				warehouse=warehouse,
 				company=wh_doc.company,
 				stock_uom=bin_data.stock_uom or item_uom,
-				actual_qty=flt(bin_data.actual_qty, 3),
-				reserved_qty=flt(bin_data.reserved_qty, 3),
-				ordered_qty=flt(bin_data.ordered_qty, 3),
-				indented_qty=flt(bin_data.indented_qty, 3),
-				planned_qty=flt(bin_data.planned_qty, 3),
-				projected_qty=flt(bin_data.projected_qty, 3),
+				actual_qty=flt(bin_data.actual_qty, prec),
+				reserved_qty=flt(bin_data.reserved_qty, prec),
+				ordered_qty=flt(bin_data.ordered_qty, prec),
+				indented_qty=flt(bin_data.indented_qty, prec),
+				planned_qty=flt(bin_data.planned_qty, prec),
+				projected_qty=flt(bin_data.projected_qty, prec),
 			)
 		else:
 			return WarehouseInventorySnapshot(
@@ -132,18 +137,22 @@ class InventoryService:
 			agg_planned += wh_snap.planned_qty
 			agg_projected += wh_snap.projected_qty
 
+		meta = frappe.get_meta("Bin")
+		field = meta.get_field("actual_qty")
+		prec = get_field_precision(field) if field else (frappe.db.get_default("float_precision") or 3)
+
 		return ChannelInventorySnapshot(
 			item_code=item_code,
 			sales_channel=sales_channel,
 			company=ch_company,
 			stock_uom=item_uom,
 			warehouses=warehouse_snapshots,
-			aggregate_actual_qty=flt(agg_actual, 3),
-			aggregate_reserved_qty=flt(agg_reserved, 3),
-			aggregate_ordered_qty=flt(agg_ordered, 3),
-			aggregate_indented_qty=flt(agg_indented, 3),
-			aggregate_planned_qty=flt(agg_planned, 3),
-			aggregate_projected_qty=flt(agg_projected, 3),
+			aggregate_actual_qty=flt(agg_actual, prec),
+			aggregate_reserved_qty=flt(agg_reserved, prec),
+			aggregate_ordered_qty=flt(agg_ordered, prec),
+			aggregate_indented_qty=flt(agg_indented, prec),
+			aggregate_planned_qty=flt(agg_planned, prec),
+			aggregate_projected_qty=flt(agg_projected, prec),
 		)
 
 	@classmethod
@@ -158,9 +167,13 @@ class InventoryService:
 		Does NOT reconcile or mutate either system.
 		"""
 		snap = cls.get_channel_inventory_snapshot(item_code, sales_channel, sellable_only=True)
-		ext_val = flt(external_qty, 3)
-		actual_val = flt(snap.aggregate_actual_qty, 3)
-		proj_val = flt(snap.aggregate_projected_qty, 3)
+		meta = frappe.get_meta("Bin")
+		field = meta.get_field("actual_qty")
+		prec = get_field_precision(field) if field else (frappe.db.get_default("float_precision") or 3)
+
+		ext_val = flt(external_qty, prec)
+		actual_val = flt(snap.aggregate_actual_qty, prec)
+		proj_val = flt(snap.aggregate_projected_qty, prec)
 
 		return InventoryComparisonResult(
 			item_code=item_code,
@@ -168,6 +181,6 @@ class InventoryService:
 			external_qty=ext_val,
 			erp_aggregate_actual_qty=actual_val,
 			erp_aggregate_projected_qty=proj_val,
-			delta_actual=flt(ext_val - actual_val, 3),
-			delta_projected=flt(ext_val - proj_val, 3),
+			delta_actual=flt(ext_val - actual_val, prec),
+			delta_projected=flt(ext_val - proj_val, prec),
 		)

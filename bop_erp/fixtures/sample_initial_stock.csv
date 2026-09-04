@@ -1,0 +1,7 @@
+source_record_id,item_code,warehouse,quantity,valuation_rate,stock_uom,batch_no,serial_no,notes
+REC-001,SKU-HAMMER-01,Stores - IDP,100,15.50,Nos,,,Synthetic regular item store 1
+REC-002,SKU-HAMMER-01,Finished Goods - IDP,50,15.50,Nos,,,Synthetic regular item store 2
+REC-003,SKU-DRILL-01,Stores - IDP,25.5,120.00,Nos,,,Synthetic fractional quantity item
+REC-004,SKU-GLOVE-LG,Stores - IDP,0,4.25,Nos,,,Synthetic zero quantity item
+REC-005,ITEM-SYNTH-BATCH,Stores - IDP,200,8.50,Nos,BATCH-2026-001,,Synthetic batch managed item
+REC-006,ITEM-SYNTH-SERIAL,Stores - IDP,2,450.00,Nos,,SER-001,SER-002,Synthetic serialized item
