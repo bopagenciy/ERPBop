@@ -14,18 +14,21 @@
   "status",
   "column_break_1",
   "external_id",
+  "replay_of",
   "erp_doctype",
   "erp_document",
   "correlation_id",
   "idempotency_key",
   "payload_hash",
   "worker_id",
+  "processing_token",
   "section_execution",
   "attempt_count",
   "max_attempts",
   "next_retry_at",
   "column_break_2",
   "processing_started_at",
+  "lease_expires_at",
   "processing_finished_at",
   "section_errors",
   "last_error_code",
@@ -109,6 +112,14 @@
    "label": "External ID"
   },
   {
+   "fieldname": "replay_of",
+   "fieldtype": "Link",
+   "label": "Replay Of",
+   "no_copy": 1,
+   "options": "Integration Event",
+   "read_only": 1
+  },
+  {
    "fieldname": "erp_doctype",
    "fieldtype": "Link",
    "label": "ERP DocType",
@@ -147,6 +158,14 @@
    "read_only": 1
   },
   {
+   "fieldname": "processing_token",
+   "fieldtype": "Data",
+   "label": "Processing Token",
+   "length": 64,
+   "no_copy": 1,
+   "read_only": 1
+  },
+  {
    "fieldname": "section_execution",
    "fieldtype": "Section Break",
    "label": "Execution & Retries"
@@ -178,6 +197,13 @@
    "fieldname": "processing_started_at",
    "fieldtype": "Datetime",
    "label": "Processing Started At",
+   "read_only": 1
+  },
+  {
+   "fieldname": "lease_expires_at",
+   "fieldtype": "Datetime",
+   "label": "Lease Expires At",
+   "no_copy": 1,
    "read_only": 1
   },
   {
@@ -243,7 +269,7 @@
  ],
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2026-09-04 10:30:00.000000",
+ "modified": "2026-09-04 11:00:00.000000",
  "modified_by": "Administrator",
  "module": "Bop ERP",
  "name": "Integration Event",
