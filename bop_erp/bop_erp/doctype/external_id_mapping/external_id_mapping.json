@@ -41,7 +41,7 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "External Entity Type",
-   "options": "PRODUCT\nPRODUCT_VARIANT\nCATEGORY\nCUSTOMER\nADDRESS\nORDER\nINVOICE\nPAYMENT\nSHIPMENT",
+   "options": "PRODUCT\nPRODUCT_VARIANT\nCATEGORY\nCUSTOMER\nADDRESS\nORDER\nINVOICE\nPAYMENT\nSHIPMENT\nINVENTORY\nPRICE\nWAREHOUSE\nSTOCK_LOCATION",
    "reqd": 1
   },
   {

@@ -45,6 +45,8 @@ class ExternalEntityType:
 	SHIPMENT = "SHIPMENT"
 	INVENTORY = "INVENTORY"
 	PRICE = "PRICE"
+	WAREHOUSE = "WAREHOUSE"
+	STOCK_LOCATION = "STOCK_LOCATION"
 
 	ALL = (
 		PRODUCT,
@@ -58,6 +60,8 @@ class ExternalEntityType:
 		SHIPMENT,
 		INVENTORY,
 		PRICE,
+		WAREHOUSE,
+		STOCK_LOCATION,
 	)
 
 class IntegrationDirection:

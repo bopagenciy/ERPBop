@@ -1,0 +1,153 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "format:CIS-{sales_channel}-{warehouse}",
+ "creation": "2026-09-04 13:30:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "sales_channel",
+  "warehouse",
+  "company",
+  "column_break_1",
+  "priority",
+  "enabled",
+  "section_break_rules",
+  "allow_sellable_stock",
+  "allow_fulfillment",
+  "column_break_2",
+  "unique_source_key"
+ ],
+ "fields": [
+  {
+   "fieldname": "sales_channel",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Sales Channel",
+   "options": "Sales Channel",
+   "reqd": 1
+  },
+  {
+   "fieldname": "warehouse",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Warehouse",
+   "options": "Warehouse",
+   "reqd": 1
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Company",
+   "options": "Company",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "description": "Fulfillment prioritization (lower number = higher priority)",
+   "fieldname": "priority",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Priority"
+  },
+  {
+   "default": "1",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Enabled"
+  },
+  {
+   "fieldname": "section_break_rules",
+   "fieldtype": "Section Break",
+   "label": "Inventory Sourcing Rules"
+  },
+  {
+   "default": "1",
+   "description": "Whether stock in this warehouse contributes to channel sellable availability",
+   "fieldname": "allow_sellable_stock",
+   "fieldtype": "Check",
+   "label": "Allow Sellable Stock"
+  },
+  {
+   "default": "1",
+   "description": "Whether sales orders from this channel may be allocated and fulfilled from this warehouse",
+   "fieldname": "allow_fulfillment",
+   "fieldtype": "Check",
+   "label": "Allow Fulfillment"
+  },
+  {
+   "fieldname": "column_break_2",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "unique_source_key",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "Unique Source Key",
+   "read_only": 1,
+   "unique": 1
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-09-04 13:30:00.000000",
+ "modified_by": "Administrator",
+ "module": "Bop ERP",
+ "name": "Channel Inventory Source",
+ "naming_rule": "Expression",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Bop ERP Administrator",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 0,
+   "delete": 0,
+   "email": 1,
+   "export": 0,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Bop Integration User",
+   "share": 0,
+   "write": 0
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "priority",
+ "sort_order": "ASC",
+ "states": [],
+ "track_changes": 1
+}
