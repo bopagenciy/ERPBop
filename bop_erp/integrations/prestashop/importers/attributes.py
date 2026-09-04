@@ -1,6 +1,8 @@
 # Copyright (c) 2026, Bop Agency and Contributors
 # See license.txt
 
+import hashlib
+import re
 from typing import Dict, Any, List, Optional
 import frappe
 from frappe import _
@@ -9,13 +11,31 @@ from bop_erp.integrations.prestashop.adapters.normalizers import extract_lang_fi
 from bop_erp.integrations.prestashop.importers.base import BaseImporter, ImportResult
 
 
+def compute_stable_abbreviation(val_str: str) -> str:
+	"""
+	Computes a deterministic, order-independent abbreviation for an attribute value.
+	- If val_str <= 10 chars: stripped and capitalized.
+	- If val_str > 10 chars: first 6 chars + '_' + 3-char SHA-256 hex digest of val_str.lower().
+	Always <= 10 characters and completely deterministic independent of insertion order.
+	"""
+	clean = re.sub(r"[\s/\\+\-_]+", "-", val_str.strip()).strip("-")
+	if not clean:
+		clean = "VAL"
+	if len(clean) <= 10:
+		return clean.upper()
+
+	h = hashlib.sha256(clean.lower().encode("utf-8")).hexdigest()[:3].upper()
+	prefix = clean[:6].upper().rstrip("-")
+	return f"{prefix}_{h}"[:10]
+
+
 class AttributeImporter(BaseImporter):
 	"""
 	Imports PrestaShop Product Options (Attribute Groups) and Product Option Values
 	into native ERPNext Item Attribute and Item Attribute Value records.
 	- Option (e.g. 'Size', 'Color') -> DocType 'Item Attribute'
 	- Option Value (e.g. 'S', 'M', 'L', 'Red', 'Blue') -> Child table 'Item Attribute Value'
-	- Idempotent: Does not create duplicates if attribute or value already exists.
+	- Idempotent and order-independent abbreviation derivation.
 	"""
 
 	def import_attributes(
@@ -38,7 +58,6 @@ class AttributeImporter(BaseImporter):
 			raw_values = values_list
 
 		# Map option values by option_id (group id)
-		# PrestaShop option value record has: 'id', 'id_attribute_group', 'name'
 		values_by_group: Dict[str, List[Dict[str, Any]]] = {}
 		for val in raw_values:
 			grp_id = str(val.get("id_attribute_group", "")).strip()
@@ -98,67 +117,65 @@ class AttributeImporter(BaseImporter):
 			val_str = extract_lang_field(v.get("name")).strip()
 			if not val_str:
 				val_str = f"Val-{v.get('id')}"
-			abbr = val_str[:10].strip() or val_str
+			abbr = compute_stable_abbreviation(val_str)
 			normalized_values.append((val_str, abbr))
 
 		if existing_attr:
 			# Check existing values and append missing
-			if not self.dry_run:
-				attr_doc = frappe.get_doc("Item Attribute", existing_attr)
-				existing_vals = {row.attribute_value.lower(): row for row in attr_doc.item_attribute_values}
-				updated = False
+			attr_doc = frappe.get_doc("Item Attribute", existing_attr)
+			existing_vals = {row.attribute_value.lower(): row for row in attr_doc.item_attribute_values}
+			existing_abbrs = {row.abbr for row in attr_doc.item_attribute_values}
+			updated = False
 
-				for val_str, abbr in normalized_values:
-					if val_str.lower() not in existing_vals:
-						# Ensure unique abbr
-						existing_abbrs = {row.abbr for row in attr_doc.item_attribute_values}
-						final_abbr = abbr
-						counter = 1
-						while final_abbr in existing_abbrs:
-							final_abbr = f"{abbr[:7]}_{counter}"
-							counter += 1
+			for val_str, abbr in normalized_values:
+				if val_str.lower() not in existing_vals:
+					final_abbr = abbr
+					if final_abbr in existing_abbrs:
+						h = hashlib.sha256(val_str.lower().encode("utf-8")).hexdigest()[:4].upper()
+						final_abbr = f"{abbr[:5]}_{h}"
+					existing_abbrs.add(final_abbr)
 
+					if not self.dry_run:
 						attr_doc.append("item_attribute_values", {
 							"attribute_value": val_str,
 							"abbr": final_abbr,
 						})
-						updated = True
+					updated = True
 
-				if updated:
+			if updated:
+				if not self.dry_run:
 					attr_doc.flags.ignore_permissions = True
 					attr_doc.save()
-					return "updated"
-				return "unchanged"
+				return "updated"
 			return "unchanged"
 
 		# Create new Item Attribute
+		seen_abbrs = set()
+		seen_vals = set()
+		child_rows = []
+
+		for val_str, abbr in normalized_values:
+			if val_str.lower() in seen_vals:
+				continue
+			seen_vals.add(val_str.lower())
+
+			final_abbr = abbr
+			if final_abbr in seen_abbrs:
+				h = hashlib.sha256(val_str.lower().encode("utf-8")).hexdigest()[:4].upper()
+				final_abbr = f"{abbr[:5]}_{h}"
+			seen_abbrs.add(final_abbr)
+
+			child_rows.append({
+				"attribute_value": val_str,
+				"abbr": final_abbr,
+			})
+
 		if not self.dry_run:
 			attr_doc = frappe.get_doc({
 				"doctype": "Item Attribute",
 				"attribute_name": opt_name,
-				"item_attribute_values": [],
+				"item_attribute_values": child_rows,
 			})
-
-			seen_abbrs = set()
-			seen_vals = set()
-
-			for val_str, abbr in normalized_values:
-				if val_str.lower() in seen_vals:
-					continue
-				seen_vals.add(val_str.lower())
-
-				final_abbr = abbr
-				counter = 1
-				while final_abbr in seen_abbrs:
-					final_abbr = f"{abbr[:7]}_{counter}"
-					counter += 1
-				seen_abbrs.add(final_abbr)
-
-				attr_doc.append("item_attribute_values", {
-					"attribute_value": val_str,
-					"abbr": final_abbr,
-				})
-
 			attr_doc.flags.ignore_permissions = True
 			attr_doc.insert()
 			return "created"

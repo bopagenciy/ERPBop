@@ -3,7 +3,7 @@
 
 import hashlib
 import json
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 import frappe
 from frappe import _
 
@@ -12,16 +12,43 @@ from bop_erp.integrations.prestashop.adapters.normalizers import normalize_categ
 from bop_erp.integrations.prestashop.importers.base import BaseImporter, ImportResult
 
 
+# System / Provider virtual categories that must never be created as commercial Item Groups
+SYSTEM_CATEGORY_NAMES = {
+	"root",
+	"korijenski",
+	"početak",
+	"home",
+	"inicio",
+	"accueil",
+}
+
+
 class CategoryImporter(BaseImporter):
 	"""
 	Imports PrestaShop categories into native ERPNext Item Groups.
 	- Respects category tree hierarchy (parent item groups must exist before children).
-	- Anchors root categories to ERPNext 'All Item Groups'.
+	- Filters out PrestaShop virtual/system root categories (id=1, id=2, root flags).
+	- Anchors top-level commercial categories to ERPNext 'All Item Groups'.
 	- Maps PrestaShop Category ID -> External ID Mapping (CATEGORY).
 	- Preserves idempotency: re-running does not duplicate or corrupt Item Groups.
 	"""
 
-	def import_categories(self, category_list: Optional[List[Dict[str, Any]]] = None) -> ImportResult:
+	def is_system_root_category(self, cat) -> bool:
+		"""Detects whether a category is a PrestaShop internal root/system node."""
+		if cat.external_id in ("1", "2"):
+			return True
+		raw = cat.raw_data or {}
+		if str(raw.get("is_root_category", "0")).strip() in ("1", "true", "True"):
+			return True
+		if cat.name.strip().lower() in SYSTEM_CATEGORY_NAMES:
+			return True
+		return False
+
+	def import_categories(
+		self,
+		category_list: Optional[List[Dict[str, Any]]] = None,
+		category_ids: Optional[Set[str]] = None,
+	) -> ImportResult:
 		result = ImportResult(entity_type=ExternalEntityType.CATEGORY)
 
 		if category_list is None:
@@ -32,14 +59,11 @@ class CategoryImporter(BaseImporter):
 		# Normalize all categories
 		normalized_cats = []
 		for raw in raw_categories:
-			# Skip if minimal stub without name/id
 			if not raw.get("id"):
 				continue
 			cat = normalize_category(raw)
 			normalized_cats.append(cat)
 
-		# Topological sort or iterative resolution (parents before children)
-		# Root or parent=0 / parent=1 (PrestaShop root category) maps to "All Item Groups"
 		cats_by_id = {c.external_id: c for c in normalized_cats}
 		resolved_groups: Dict[str, str] = {}  # ext_id -> item_group_name
 
@@ -55,11 +79,10 @@ class CategoryImporter(BaseImporter):
 				root_doc.flags.ignore_permissions = True
 				root_doc.insert()
 
-		# Order by tree depth: if parent is missing or is 0/1/root, depth=0, else depth=parent.depth + 1
 		def get_depth(c, visited=None):
 			if visited is None:
 				visited = set()
-			if c.external_id in visited or not c.parent_id or c.parent_id not in cats_by_id or c.parent_id in ("0", "1", c.external_id):
+			if c.external_id in visited or not c.parent_id or c.parent_id not in cats_by_id or c.parent_id in ("0", "1", "2", c.external_id):
 				return 0
 			visited.add(c.external_id)
 			return 1 + get_depth(cats_by_id[c.parent_id], visited)
@@ -68,9 +91,15 @@ class CategoryImporter(BaseImporter):
 
 		for cat in sorted_cats:
 			result.seen += 1
-			# Skip PrestaShop internal virtual Root (id 1) if name is "Root"
-			if cat.external_id == "1" and cat.name.lower() in ("root", "inicio"):
-				result.unchanged += 1
+
+			# Filter 1: Optional category scope filter
+			if category_ids is not None and cat.external_id not in category_ids:
+				result.skipped += 1
+				continue
+
+			# Filter 2: PrestaShop system / root categories
+			if self.is_system_root_category(cat):
+				result.skipped += 1
 				resolved_groups[cat.external_id] = erp_root
 				continue
 
@@ -112,7 +141,7 @@ class CategoryImporter(BaseImporter):
 		parent_group = erp_root
 		if cat.parent_id and cat.parent_id in resolved_groups:
 			parent_group = resolved_groups[cat.parent_id]
-		elif cat.parent_id and cat.parent_id not in ("0", "1"):
+		elif cat.parent_id and cat.parent_id not in ("0", "1", "2"):
 			# Check if parent is mapped in DB
 			parent_map = self.get_active_mapping(ExternalEntityType.CATEGORY, cat.parent_id)
 			if parent_map and parent_map.erp_document:
@@ -120,7 +149,7 @@ class CategoryImporter(BaseImporter):
 
 		# Check existing mapping
 		existing_map = self.get_active_mapping(ExternalEntityType.CATEGORY, cat.external_id)
-		
+
 		# Compute payload hash for change detection
 		sync_payload = {
 			"name": cat.name,
@@ -131,15 +160,6 @@ class CategoryImporter(BaseImporter):
 		if existing_map and frappe.db.exists("Item Group", existing_map.erp_document):
 			group_name = existing_map.erp_document
 			if existing_map.sync_hash == sync_hash:
-				return "unchanged", group_name
-
-			# Need update
-			if not self.dry_run:
-				doc = frappe.get_doc("Item Group", group_name)
-				# Update parent if changed and valid
-				if doc.parent_item_group != parent_group and parent_group != doc.name:
-					doc.parent_item_group = parent_group
-					doc.save(ignore_permissions=True)
 				self.set_mapping(
 					ExternalEntityType.CATEGORY,
 					cat.external_id,
@@ -147,6 +167,21 @@ class CategoryImporter(BaseImporter):
 					group_name,
 					sync_hash=sync_hash,
 				)
+				return "unchanged", group_name
+
+			# Need update
+			if not self.dry_run:
+				doc = frappe.get_doc("Item Group", group_name)
+				if doc.parent_item_group != parent_group and parent_group != doc.name:
+					doc.parent_item_group = parent_group
+					doc.save(ignore_permissions=True)
+			self.set_mapping(
+				ExternalEntityType.CATEGORY,
+				cat.external_id,
+				"Item Group",
+				group_name,
+				sync_hash=sync_hash,
+			)
 			return "updated", group_name
 
 		# If not mapped, check if an Item Group with this exact name already exists
@@ -155,14 +190,13 @@ class CategoryImporter(BaseImporter):
 
 		if existing_group_by_name:
 			group_name = existing_group_by_name
-			if not self.dry_run:
-				self.set_mapping(
-					ExternalEntityType.CATEGORY,
-					cat.external_id,
-					"Item Group",
-					group_name,
-					sync_hash=sync_hash,
-				)
+			self.set_mapping(
+				ExternalEntityType.CATEGORY,
+				cat.external_id,
+				"Item Group",
+				group_name,
+				sync_hash=sync_hash,
+			)
 			return "updated", group_name
 
 		# Create new Item Group
@@ -191,4 +225,11 @@ class CategoryImporter(BaseImporter):
 			)
 			return "created", group_name
 		else:
+			self.set_mapping(
+				ExternalEntityType.CATEGORY,
+				cat.external_id,
+				"Item Group",
+				desired_name,
+				sync_hash=sync_hash,
+			)
 			return "created", desired_name

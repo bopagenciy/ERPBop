@@ -14,6 +14,7 @@ class ImportResult:
 	created: int = 0
 	updated: int = 0
 	unchanged: int = 0
+	skipped: int = 0
 	failed: int = 0
 	errors: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -24,6 +25,7 @@ class ImportResult:
 			"created": self.created,
 			"updated": self.updated,
 			"unchanged": self.unchanged,
+			"skipped": self.skipped,
 			"failed": self.failed,
 			"errors": self.errors,
 		}
@@ -33,6 +35,7 @@ class ImportResult:
 		self.created += other.created
 		self.updated += other.updated
 		self.unchanged += other.unchanged
+		self.skipped += other.skipped
 		self.failed += other.failed
 		self.errors.extend(other.errors)
 
@@ -41,7 +44,7 @@ class BaseImporter:
 	"""
 	Base class for entity importers.
 	Provides:
-	- dry_run handling
+	- dry_run handling and proposed action estimation
 	- savepoint boundaries per entity to guarantee failure isolation
 	- counter tracking
 	- External ID Mapping creation/retrieval helpers
@@ -51,6 +54,10 @@ class BaseImporter:
 		self.client = client
 		self.sales_channel = sales_channel
 		self.dry_run = dry_run
+		# Track mapping operations
+		self.mappings_created = 0
+		self.mappings_reused = 0
+		self.mappings_updated = 0
 
 	def get_active_mapping(
 		self,
@@ -87,6 +94,14 @@ class BaseImporter:
 	):
 		"""Creates or updates an active External ID Mapping record."""
 		if self.dry_run:
+			existing = self.get_active_mapping(external_entity_type, external_id, external_variant_id)
+			if existing:
+				if existing.sync_hash != sync_hash or existing.erp_document != erp_document:
+					self.mappings_updated += 1
+				else:
+					self.mappings_reused += 1
+			else:
+				self.mappings_created += 1
 			return
 
 		existing = self.get_active_mapping(external_entity_type, external_id, external_variant_id)
@@ -98,6 +113,9 @@ class BaseImporter:
 				doc.sync_hash = sync_hash
 				doc.last_synced_at = frappe.utils.now_datetime()
 				doc.save(ignore_permissions=True)
+				self.mappings_updated += 1
+			else:
+				self.mappings_reused += 1
 		else:
 			doc = frappe.get_doc({
 				"doctype": "External ID Mapping",
@@ -112,3 +130,4 @@ class BaseImporter:
 				"last_synced_at": frappe.utils.now_datetime(),
 			})
 			doc.insert(ignore_permissions=True)
+			self.mappings_created += 1
