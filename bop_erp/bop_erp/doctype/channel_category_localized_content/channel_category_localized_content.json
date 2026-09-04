@@ -1,5 +1,5 @@
 {
- "name": "Item Channel Localized Content",
+ "name": "Channel Category Localized Content",
  "module": "Bop ERP",
  "doctype": "DocType",
  "istable": 1,
@@ -15,36 +15,32 @@
    "reqd": 1
   },
   {
-   "fieldname": "channel_item_name",
+   "fieldname": "category_name",
    "fieldtype": "Data",
-   "label": "Localized Channel Item Name",
+   "label": "Localized Category Name",
+   "in_list_view": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "category_slug",
+   "fieldtype": "Data",
+   "label": "Localized Category Slug",
    "in_list_view": 1
   },
   {
-   "fieldname": "channel_short_description",
-   "fieldtype": "Small Text",
-   "label": "Localized Short Description"
-  },
-  {
-   "fieldname": "channel_description",
+   "fieldname": "description",
    "fieldtype": "Text Editor",
    "label": "Localized Description"
   },
   {
-   "fieldname": "channel_meta_title",
+   "fieldname": "meta_title",
    "fieldtype": "Data",
    "label": "Localized Meta Title"
   },
   {
-   "fieldname": "channel_meta_description",
+   "fieldname": "meta_description",
    "fieldtype": "Small Text",
    "label": "Localized Meta Description"
-  },
-  {
-   "fieldname": "channel_slug",
-   "fieldtype": "Data",
-   "label": "Localized Channel Slug",
-   "in_list_view": 1
   }
  ],
  "permissions": []

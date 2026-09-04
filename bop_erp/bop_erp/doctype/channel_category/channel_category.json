@@ -7,13 +7,16 @@
  "field_order": [
   "sales_channel",
   "category_name",
+  "category_key",
   "category_slug",
   "parent_channel_category",
   "column_break_1",
   "erp_item_group",
   "active",
   "sort_order",
-  "unique_channel_slug"
+  "unique_channel_slug",
+  "section_break_loc",
+  "localized_content"
  ],
  "fields": [
   {
@@ -73,6 +76,23 @@
    "hidden": 1,
    "label": "Unique Channel Slug Key",
    "unique": 1
+  },
+  {
+   "fieldname": "category_key",
+   "fieldtype": "Data",
+   "label": "Category Key",
+   "description": "Stable language-independent category identifier"
+  },
+  {
+   "fieldname": "section_break_loc",
+   "fieldtype": "Section Break",
+   "label": "Localized Storefront Content"
+  },
+  {
+   "fieldname": "localized_content",
+   "fieldtype": "Table",
+   "label": "Localized Content",
+   "options": "Channel Category Localized Content"
   }
  ],
  "index_web_pages_for_search": 1,

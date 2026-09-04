@@ -81,13 +81,18 @@ class CatalogImporter:
 		report["products"] = prod_res.to_dict()
 		report["variants"] = var_res.to_dict()
 
-		# Phase 4: Presentations & Media (Phase 1F)
+		# Phase 4: Presentations & Media (Phase 1F & 1F.1)
 		total_pres_failed = 0
 		if self.sync_presentation:
-			channel_cat_res = self.presentation_importer.sync_channel_categories()
+			channel_cat_res = self.presentation_importer.sync_channel_categories(
+				scoped_category_ids=category_ids
+			)
 			report["channel_categories"] = channel_cat_res.to_dict()
 
-			pres_res = self.presentation_importer.sync_product_presentation_and_media()
+			pres_res = self.presentation_importer.sync_product_presentation_and_media(
+				product_ids=product_ids,
+				sku_prefix_filter=sku_prefix_filter
+			)
 			report["presentations"] = pres_res.to_dict()
 			total_pres_failed = channel_cat_res.failed + pres_res.failed
 

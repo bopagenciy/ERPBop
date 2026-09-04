@@ -33,6 +33,12 @@
    "fieldtype": "Data",
    "label": "Channel Alt Text",
    "in_list_view": 1
+  },
+  {
+   "fieldname": "channel_alt_text_es",
+   "fieldtype": "Data",
+   "label": "Channel Alt Text (ES)",
+   "in_list_view": 1
   }
  ],
  "permissions": []
