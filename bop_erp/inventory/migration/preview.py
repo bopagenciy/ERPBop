@@ -38,7 +38,8 @@ class MigrationPreview:
 		total_opening_qty = 0.0
 		total_current_qty = 0.0
 		total_adjustment_delta = 0.0
-		total_inventory_value = 0.0
+		target_inventory_value = 0.0
+		current_inventory_value = 0.0
 		non_zero_current_stock_warnings = []
 
 		for r in valid_rows:
@@ -46,11 +47,15 @@ class MigrationPreview:
 			warehouse = r.resolved_warehouse
 			target_qty = flt(r.quantity)
 			rate = flt(r.valuation_rate)
-			inv_val = flt(target_qty * rate)
+			line_target_val = flt(target_qty * rate)
 
 			snap = InventoryService.get_warehouse_inventory(item_code, warehouse)
 			current_qty = flt(snap.actual_qty)
-			delta = flt(target_qty - current_qty)
+			current_rate = flt(frappe.db.get_value("Bin", {"item_code": item_code, "warehouse": warehouse}, "valuation_rate") or 0.0)
+			line_current_val = flt(current_qty * current_rate)
+
+			delta_qty = flt(target_qty - current_qty)
+			line_adj_val = flt(line_target_val - line_current_val)
 
 			if current_qty > 0:
 				non_zero_current_stock_warnings.append(
@@ -65,17 +70,23 @@ class MigrationPreview:
 				"stock_uom": r.stock_uom,
 				"source_target_qty": target_qty,
 				"current_qty": current_qty,
-				"adjustment_delta": delta,
-				"valuation_rate": rate,
-				"inventory_value": inv_val,
+				"adjustment_delta": delta_qty,
+				"target_valuation_rate": rate,
+				"current_valuation_rate": current_rate,
+				"target_inventory_value": line_target_val,
+				"current_inventory_value": line_current_val,
+				"adjustment_value": line_adj_val,
 				"batch_no": r.batch_no,
 				"serial_no": r.serial_no,
 			})
 
 			total_opening_qty += target_qty
 			total_current_qty += current_qty
-			total_adjustment_delta += delta
-			total_inventory_value += inv_val
+			total_adjustment_delta += delta_qty
+			target_inventory_value += line_target_val
+			current_inventory_value += line_current_val
+
+		estimated_adjustment_value = flt(target_inventory_value - current_inventory_value, 2)
 
 		return {
 			"batch_name": batch.name,
@@ -83,11 +94,16 @@ class MigrationPreview:
 			"company": batch.company,
 			"posting_date": batch.posting_date,
 			"posting_time": batch.posting_time,
+			"opening_difference_account": batch.opening_difference_account,
 			"total_items": len(preview_lines),
 			"total_opening_qty": flt(total_opening_qty, 3),
 			"total_current_qty": flt(total_current_qty, 3),
 			"total_adjustment_delta": flt(total_adjustment_delta, 3),
-			"total_inventory_value": flt(total_inventory_value, 2),
+			"target_inventory_value": flt(target_inventory_value, 2),
+			"current_inventory_value": flt(current_inventory_value, 2),
+			"estimated_adjustment_value": estimated_adjustment_value,
+			# Backward compatibility aliases
+			"total_inventory_value": flt(target_inventory_value, 2),
 			"warnings": non_zero_current_stock_warnings,
 			"lines": preview_lines,
 		}

@@ -67,6 +67,7 @@ class MigrationImporter:
 		posting_date: Optional[str] = None,
 		posting_time: Optional[str] = None,
 		notes: Optional[str] = None,
+		opening_difference_account: Optional[str] = None,
 	) -> str:
 		"""
 		Creates an Inventory Migration Batch and stages all Inventory Migration Row records.
@@ -90,6 +91,8 @@ class MigrationImporter:
 			batch.input_hash = input_hash
 			batch.status = "DRAFT"
 			batch.notes = notes
+			if opening_difference_account:
+				batch.opening_difference_account = opening_difference_account
 			batch.save(ignore_permissions=True)
 			# Delete old unapplied rows
 			frappe.db.delete("Inventory Migration Row", {"batch": batch.name})
@@ -102,6 +105,7 @@ class MigrationImporter:
 				"posting_date": post_date,
 				"posting_time": post_time,
 				"input_hash": input_hash,
+				"opening_difference_account": opening_difference_account,
 				"status": "DRAFT",
 				"notes": notes,
 			}).insert(ignore_permissions=True)

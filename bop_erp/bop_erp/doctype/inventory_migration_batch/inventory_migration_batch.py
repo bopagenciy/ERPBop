@@ -18,3 +18,7 @@ class InventoryMigrationBatch(Document):
 				frappe.throw(_("Cannot modify input_hash of an applied migration batch."))
 			if self.company != old.company:
 				frappe.throw(_("Cannot modify company of an applied migration batch."))
+			if self.opening_difference_account != old.opening_difference_account:
+				frappe.throw(_("Cannot modify opening difference account of an applied migration batch."))
+			if self.validation_snapshot_hash != old.validation_snapshot_hash:
+				frappe.throw(_("Cannot modify validation snapshot hash of an applied migration batch."))

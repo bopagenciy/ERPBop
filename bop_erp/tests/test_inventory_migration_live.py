@@ -56,6 +56,12 @@ class TestInventoryMigrationLive(unittest.TestCase):
 				"is_stock_item": 1,
 			}).insert(ignore_permissions=True)
 
+		cls.opening_diff_account = frappe.db.get_value(
+			"Account",
+			{"company": cls.company, "root_type": "Equity", "report_type": "Balance Sheet", "is_group": 0, "disabled": 0},
+			"name",
+		)
+
 	def test_01_live_smoke_migration_pipeline_and_clean_rollback(self):
 		"""
 		Executes end-to-end synthetic migration pipeline:
@@ -79,6 +85,7 @@ class TestInventoryMigrationLive(unittest.TestCase):
 			company=self.company,
 			records=records,
 			source_system="SYNTHETIC_SMOKE_TEST",
+			opening_difference_account=self.opening_diff_account,
 		)
 		self.assertTrue(frappe.db.exists("Inventory Migration Batch", batch_name))
 

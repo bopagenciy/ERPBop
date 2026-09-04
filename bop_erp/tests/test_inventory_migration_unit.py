@@ -57,6 +57,12 @@ class TestInventoryMigrationUnit(unittest.TestCase):
 		# Test Warehouse
 		cls.test_wh = f"Stores - {cls.abbr}"
 
+		cls.opening_diff_account = frappe.db.get_value(
+			"Account",
+			{"company": cls.company, "root_type": "Equity", "report_type": "Balance Sheet", "is_group": 0, "disabled": 0},
+			"name",
+		)
+
 		# Test Items
 		cls.simple_item = "ITEM-PHASE1H-SIMPLE-01"
 		if not frappe.db.exists("Item", cls.simple_item):
@@ -210,7 +216,7 @@ P21-002,{self.simple_item},{self.test_wh},50,12.50,Nos
 		records = [
 			{"source_record_id": "VAL-1", "item_code": self.simple_item, "warehouse": self.test_wh, "quantity": 100, "valuation_rate": 15.0},
 		]
-		batch_name = MigrationImporter.stage_batch("TEST-DRY-01", self.company, records)
+		batch_name = MigrationImporter.stage_batch("TEST-DRY-01", self.company, records, opening_difference_account=self.opening_diff_account)
 		self._track_batch(batch_name)
 
 		res = MigrationValidator.validate_batch(batch_name)
@@ -231,7 +237,7 @@ P21-002,{self.simple_item},{self.test_wh},50,12.50,Nos
 		records = [
 			{"source_record_id": "PREV-1", "item_code": self.simple_item, "warehouse": self.test_wh, "quantity": 75, "valuation_rate": 20.0},
 		]
-		batch_name = MigrationImporter.stage_batch("TEST-PREV-01", self.company, records)
+		batch_name = MigrationImporter.stage_batch("TEST-PREV-01", self.company, records, opening_difference_account=self.opening_diff_account)
 		self._track_batch(batch_name)
 
 		MigrationValidator.validate_batch(batch_name)
@@ -271,7 +277,7 @@ P21-002,{self.simple_item},{self.test_wh},50,12.50,Nos
 		records = [
 			{"source_record_id": "PREC-1", "item_code": self.simple_item, "warehouse": self.test_wh, "quantity": 12.375, "valuation_rate": 45.678},
 		]
-		batch_name = MigrationImporter.stage_batch("TEST-PREC-01", self.company, records)
+		batch_name = MigrationImporter.stage_batch("TEST-PREC-01", self.company, records, opening_difference_account=self.opening_diff_account)
 		self._track_batch(batch_name)
 
 		MigrationValidator.validate_batch(batch_name)

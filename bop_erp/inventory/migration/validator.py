@@ -1,22 +1,44 @@
-# Copyright (c) 2026, Bop Agency and Contributors
-# See license.txt
-
+import hashlib
+import json
 from typing import Dict, List, Any
 import frappe
 from frappe.utils import flt
+from bop_erp.inventory.service import InventoryService
 
 
 class MigrationValidator:
 	"""
 	Executes full pre-migration validation on staged Inventory Migration Row records.
 	Identifies all structural, catalog, warehouse, and quantity errors without writing stock entries.
+	Captures a deterministic validation snapshot hash of live ERP stock for optimistic fencing.
 	"""
+
+	@classmethod
+	def compute_stock_snapshot_hash(cls, items_warehouses: List[tuple]) -> str:
+		"""
+		Computes a deterministic SHA-256 hash of live ERP inventory for the given (item_code, warehouse) pairs.
+		Canonical sorting ensures order independence.
+		"""
+		snapshot_entries = []
+		# Deduplicate (item_code, warehouse)
+		unique_pairs = sorted(list(set(items_warehouses)), key=lambda x: (x[0], x[1]))
+		for item_code, warehouse in unique_pairs:
+			snap = InventoryService.get_warehouse_inventory(item_code, warehouse)
+			val_rate = frappe.db.get_value("Bin", {"item_code": item_code, "warehouse": warehouse}, "valuation_rate") or 0.0
+			snapshot_entries.append([
+				item_code,
+				warehouse,
+				flt(snap.actual_qty),
+				flt(val_rate),
+			])
+		canonical_json = json.dumps(snapshot_entries, ensure_ascii=False, separators=(",", ":"))
+		return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
 	@classmethod
 	def validate_batch(cls, batch_name: str) -> Dict[str, Any]:
 		batch = frappe.get_doc("Inventory Migration Batch", batch_name)
-		if batch.status == "APPLIED":
-			raise frappe.ValidationError(f"Migration batch '{batch.batch_id}' is already APPLIED.")
+		if batch.status in ["APPLIED", "APPLYING"]:
+			raise frappe.ValidationError(f"Migration batch '{batch.batch_id}' is in status '{batch.status}'.")
 
 		rows = frappe.get_all(
 			"Inventory Migration Row",
@@ -40,9 +62,45 @@ class MigrationValidator:
 		all_warnings = []
 
 		seen_item_warehouse = set()
+		valid_item_warehouse_pairs = []
 
 		# Cache company
 		company = batch.company
+
+		batch_errors = []
+
+		# 0. Validate opening difference account if specified or flag as error if missing
+		if not batch.opening_difference_account:
+			batch_errors.append("Opening Difference Account is required on Inventory Migration Batch.")
+		else:
+			acc_data = frappe.db.get_value(
+				"Account",
+				batch.opening_difference_account,
+				["name", "company", "is_group", "disabled", "report_type", "root_type", "account_type"],
+				as_dict=True,
+			)
+			if not acc_data:
+				batch_errors.append(f"Opening Difference Account '{batch.opening_difference_account}' does not exist.")
+			else:
+				if acc_data.company != company:
+					batch_errors.append(
+						f"Opening Difference Account '{batch.opening_difference_account}' belongs to company '{acc_data.company}', not batch company '{company}'."
+					)
+				if acc_data.is_group:
+					batch_errors.append(
+						f"Opening Difference Account '{batch.opening_difference_account}' is a group account. Must be a leaf account."
+					)
+				if acc_data.disabled:
+					batch_errors.append(
+						f"Opening Difference Account '{batch.opening_difference_account}' is disabled."
+					)
+				if acc_data.report_type != "Balance Sheet":
+					batch_errors.append(
+						f"Opening Difference Account '{batch.opening_difference_account}' has report_type '{acc_data.report_type}'. "
+						"Perpetual inventory opening stock entries require a Balance Sheet account (Asset, Liability, or Equity)."
+					)
+
+		all_errors.extend(batch_errors)
 
 		for r in rows:
 			row_errors = []
@@ -131,14 +189,20 @@ class MigrationValidator:
 				row_doc.status = "VALID"
 				row_doc.validation_error = ""
 				valid_count += 1
+				if row_doc.resolved_item and row_doc.resolved_warehouse:
+					valid_item_warehouse_pairs.append((row_doc.resolved_item, row_doc.resolved_warehouse))
 
 			row_doc.save(ignore_permissions=True)
+
+		# Compute validation snapshot hash across all valid items & warehouses
+		snapshot_hash = cls.compute_stock_snapshot_hash(valid_item_warehouse_pairs)
+		batch.validation_snapshot_hash = snapshot_hash
 
 		batch.total_rows = len(rows)
 		batch.valid_rows = valid_count
 		batch.error_rows = error_count
 
-		if error_count == 0 and valid_count > 0:
+		if error_count == 0 and len(batch_errors) == 0 and valid_count > 0:
 			batch.status = "READY"
 		else:
 			batch.status = "VALIDATED"
@@ -152,7 +216,9 @@ class MigrationValidator:
 			"total_rows": len(rows),
 			"valid_rows": valid_count,
 			"error_rows": error_count,
+			"validation_snapshot_hash": snapshot_hash,
 			"status": batch.status,
 			"errors": all_errors,
 			"warnings": all_warnings,
 		}
+

@@ -11,9 +11,11 @@
   "company",
   "posting_date",
   "posting_time",
+  "opening_difference_account",
   "column_break_1",
   "status",
   "input_hash",
+  "validation_snapshot_hash",
   "total_rows",
   "valid_rows",
   "error_rows",
@@ -64,6 +66,13 @@
    "label": "Posting Time"
   },
   {
+   "fieldname": "opening_difference_account",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Opening Difference Account",
+   "options": "Account"
+  },
+  {
    "fieldname": "column_break_1",
    "fieldtype": "Column Break"
   },
@@ -74,13 +83,19 @@
    "in_list_view": 1,
    "in_standard_filter": 1,
    "label": "Status",
-   "options": "DRAFT\nVALIDATED\nREADY\nAPPLIED\nFAILED\nCANCELLED",
+   "options": "DRAFT\nVALIDATED\nREADY\nAPPLYING\nAPPLIED\nFAILED\nCANCELLED",
    "reqd": 1
   },
   {
    "fieldname": "input_hash",
    "fieldtype": "Data",
    "label": "Input Hash (SHA-256)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "validation_snapshot_hash",
+   "fieldtype": "Data",
+   "label": "Validation Snapshot Hash (SHA-256)",
    "read_only": 1
   },
   {

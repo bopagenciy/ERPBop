@@ -222,3 +222,11 @@ Variant Import Error: {0},Error al importar variante: {0}
 "Applied inventory migration batch cannot change status.","El lote de migración de inventario aplicado no puede cambiar de estado."
 "Cannot modify input_hash of an applied migration batch.","No se puede modificar el input_hash de un lote de migración aplicado."
 "Cannot modify company of an applied migration batch.","No se puede modificar la empresa de un lote de migración aplicado."
+"Opening Difference Account","Cuenta de Diferencia de Apertura"
+"Validation Snapshot Hash (SHA-256)","Hash de Snapshot de Validación (SHA-256)"
+"Target Inventory Value","Valor de Inventario Objetivo"
+"Current Inventory Value","Valor de Inventario Actual"
+"Estimated Adjustment Value","Valor Estimado del Ajuste"
+"Cannot modify opening difference account of an applied migration batch.","No se puede modificar la cuenta de diferencia de apertura de un lote de migración aplicado."
+"Cannot modify validation snapshot hash of an applied migration batch.","No se puede modificar el hash del snapshot de validación de un lote de migración aplicado."
+
