@@ -90,3 +90,21 @@ Sales Channel cannot be modified on a submitted {0}.,El Canal de Ventas no puede
 Transaction Origin cannot be modified on a submitted {0}.,El Origen de Transacción no puede modificarse en un {0} validado.
 Commercial Homogeneity Violation: Delivery Note combines items from multiple Sales Channels ({0}). A Delivery Note must belong to a single homogeneous Sales Channel.,Violación de Homogeneidad Comercial: El Albarán de Entrega combina artículos de múltiples Canales de Venta ({0}). Debe pertenecer a un único Canal de Ventas homogéneo.
 Commercial Homogeneity Violation: Sales Invoice combines items from multiple Sales Channels ({0}). A Sales Invoice must belong to a single homogeneous Sales Channel.,Violación de Homogeneidad Comercial: La Factura de Venta combina artículos de múltiples Canales de Venta ({0}). Debe pertenecer a un único Canal de Ventas homogéneo.
+PrestaShop Connector,Conector PrestaShop
+Credential Reference is required.,Se requiere la Referencia de Credenciales.
+Write operations are strictly disabled in Phase 1D (Read-Only connector core).,Las operaciones de escritura están estrictamente deshabilitadas en la Fase 1D (núcleo de conector de solo lectura).
+"Credential Reference appears to be a raw API key. Do NOT store raw credentials in PrestaShop Connector. Provide a reference key name (e.g. TEST_PRESTASHOP_KEY) to resolve from secure configuration.","La Referencia de Credenciales parece ser una clave API sin procesar. NO almacene credenciales en texto plano en el Conector PrestaShop. Proporcione un nombre de clave de referencia (ej. TEST_PRESTASHOP_KEY) para resolver desde una configuración segura."
+"Could not resolve API credential for reference '{0}'. Ensure it is configured in site_config.json or environment variables.","No se pudo resolver la credencial API para la referencia '{0}'. Asegúrese de que esté configurada en site_config.json o variables de entorno."
+Sales Channel '{0}' does not exist.,El Canal de Ventas '{0}' no existe.
+No active PrestaShop Connector found for Sales Channel '{0}'.,No se encontró ningún Conector PrestaShop activo para el Canal de Ventas '{0}'.
+Unsupported entity type '{0}' for PrestaShop read synchronization.,Tipo de entidad '{0}' no compatible para la sincronización de lectura de PrestaShop.
+CRITICAL SAFETY VIOLATION: Production operations are permanently disabled in Phase 1D.,VIOLACIÓN CRÍTICA DE SEGURIDAD: Las operaciones en producción están permanentemente deshabilitadas en la Fase 1D.
+Base URL is required to validate connector target.,La URL base es requerida para validar el destino del conector.
+Last Health Check At,Último Chequeo de Salud En
+Last Health Check Status,Estado del Último Chequeo de Salud
+Read Enabled,Lectura Habilitada
+Write Enabled,Escritura Habilitada
+Webhook Enabled,Webhook Habilitado
+Timeout Seconds,Segundos de Espera
+Verify TLS,Verificar TLS
+

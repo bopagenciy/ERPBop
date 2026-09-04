@@ -98,9 +98,29 @@ def assert_safe_connector_target(environment=None, base_url=None):
 	if env == IntegrationEnvironment.PRODUCTION:
 		frappe.throw(
 			_(
-				"CRITICAL SAFETY VIOLATION: Production operations are permanently disabled in Phase 1C.2 / 1D0."
+				"CRITICAL SAFETY VIOLATION: Production operations are permanently disabled in Phase 1D."
 			),
 			frappe.ValidationError,
 		)
 
 	return True
+
+def sanitize_url_for_logging(url):
+	"""
+	Sanitizes a URL for safe logging by masking any embedded username or password.
+	e.g. http://KEY:@127.0.0.1:8082/api -> http://***@127.0.0.1:8082/api
+	"""
+	if not url:
+		return ""
+	try:
+		parsed = urlparse(str(url))
+		if parsed.username or parsed.password:
+			netloc = parsed.netloc
+			if "@" in netloc:
+				auth_part, host_part = netloc.split("@", 1)
+				sanitized_netloc = f"***@{host_part}"
+				return parsed._replace(netloc=sanitized_netloc).geturl()
+		return str(url)
+	except Exception:
+		return "[SANITIZED_URL]"
+
