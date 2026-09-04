@@ -1,1 +1,2 @@
 # Patches list
+bop_erp.patches.v1_0.migrate_phase_1f2

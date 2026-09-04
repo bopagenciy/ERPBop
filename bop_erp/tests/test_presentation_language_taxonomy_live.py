@@ -55,6 +55,22 @@ class TestPresentationLanguageTaxonomyLive(unittest.TestCase):
 			ch.save(ignore_permissions=True)
 
 		# Ensure clean taxonomy state for scoped testing: delete demo channel categories if created by earlier unscoped tests
+		demo_ids = ["3", "4", "5", "6", "7", "8", "9"]
+		demo_mappings = frappe.get_all(
+			"External ID Mapping",
+			filters={
+				"sales_channel": cls.sales_channel,
+				"external_entity_type": ExternalEntityType.CATEGORY,
+				"external_id": ["in", demo_ids],
+				"erp_doctype": "Channel Category",
+			},
+			fields=["name", "erp_document"],
+		)
+		for m in demo_mappings:
+			if m.erp_document and frappe.db.exists("Channel Category", m.erp_document):
+				frappe.delete_doc("Channel Category", m.erp_document, force=True, ignore_permissions=True)
+			frappe.delete_doc("External ID Mapping", m.name, force=True, ignore_permissions=True)
+
 		demo_keys = ["ps-3", "ps-4", "ps-5", "ps-6", "ps-7", "ps-8", "ps-9"]
 		existing_demo_cats = frappe.get_all(
 			"Channel Category",
@@ -84,24 +100,39 @@ class TestPresentationLanguageTaxonomyLive(unittest.TestCase):
 
 		# Assert Channel Category scope closure:
 		# Industrial categories must be present
-		channel_cat_11 = frappe.db.get_value(
-			"Channel Category",
-			{"sales_channel": self.sales_channel, "category_key": "ps-11"},
-			"name"
+		cat_11_mapping = frappe.db.get_value(
+			"External ID Mapping",
+			{
+				"sales_channel": self.sales_channel,
+				"external_entity_type": ExternalEntityType.CATEGORY,
+				"external_id": "11",
+				"erp_doctype": "Channel Category",
+				"active": 1,
+			},
+			"erp_document",
 		)
-		self.assertIsNotNone(channel_cat_11, "Industrial Fasteners category ps-11 must exist")
+		self.assertIsNotNone(cat_11_mapping, "Industrial Fasteners category 11 must be mapped to Channel Category")
 
-		cat_11_doc = frappe.get_doc("Channel Category", channel_cat_11)
+		cat_11_doc = frappe.get_doc("Channel Category", cat_11_mapping)
 		# Verify bilingual content on Category 11
 		self.assertEqual(cat_11_doc.get_effective_category_name("en"), "Industrial Fasteners")
 		self.assertEqual(cat_11_doc.get_effective_category_name("es"), "Fijaciones Industriales")
 		self.assertEqual(cat_11_doc.get_effective_slug("es"), "fijaciones-industriales")
 
 		# Verify demo categories are NOT present in Channel Category
-		demo_keys = ["ps-3", "ps-4", "ps-5", "ps-6", "ps-7", "ps-8", "ps-9"]
-		for dkey in demo_keys:
-			exists = frappe.db.exists("Channel Category", {"sales_channel": self.sales_channel, "category_key": dkey})
-			self.assertIsNone(exists, f"Demo category {dkey} should NOT have been imported under scoped run")
+		demo_ids = ["3", "4", "5", "6", "7", "8", "9"]
+		for did in demo_ids:
+			exists = frappe.db.exists(
+				"External ID Mapping",
+				{
+					"sales_channel": self.sales_channel,
+					"external_entity_type": ExternalEntityType.CATEGORY,
+					"external_id": did,
+					"erp_doctype": "Channel Category",
+					"active": 1,
+				},
+			)
+			self.assertIsNone(exists, f"Demo category {did} should NOT have been imported under scoped run")
 
 		# Verify Simple Product 20 (SKU-HAMMER-01) bilingual presentation
 		prod20_map = frappe.db.get_value(

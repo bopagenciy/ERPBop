@@ -111,6 +111,12 @@
    "options": "Item Channel Media"
   },
   {
+   "fieldname": "media_localized_content",
+   "fieldtype": "Table",
+   "label": "Localized Media Content",
+   "options": "Item Channel Media Localized Content"
+  },
+  {
    "fieldname": "section_localized",
    "fieldtype": "Section Break",
    "label": "Multilingual Marketing Content"

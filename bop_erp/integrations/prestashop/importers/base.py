@@ -64,6 +64,8 @@ class BaseImporter:
 		external_entity_type: str,
 		external_id: str,
 		external_variant_id: Optional[str] = None,
+		provider: Optional[str] = None,
+		erp_doctype: Optional[str] = None,
 	) -> Optional[Dict[str, Any]]:
 		"""Retrieves existing active External ID Mapping for given external identity."""
 		filters = {
@@ -74,6 +76,10 @@ class BaseImporter:
 		}
 		if external_variant_id is not None and str(external_variant_id).strip() != "":
 			filters["external_variant_id"] = str(external_variant_id)
+		if provider:
+			filters["provider"] = str(provider).strip().upper()
+		if erp_doctype:
+			filters["erp_doctype"] = erp_doctype
 
 		mapping = frappe.db.get_value(
 			"External ID Mapping",
@@ -91,10 +97,14 @@ class BaseImporter:
 		erp_document: str,
 		external_variant_id: Optional[str] = None,
 		sync_hash: Optional[str] = None,
+		provider: Optional[str] = None,
 	):
 		"""Creates or updates an active External ID Mapping record."""
+		clean_prov = str(provider).strip().upper() if provider and str(provider).strip() else None
 		if self.dry_run:
-			existing = self.get_active_mapping(external_entity_type, external_id, external_variant_id)
+			existing = self.get_active_mapping(
+				external_entity_type, external_id, external_variant_id, provider=clean_prov, erp_doctype=erp_doctype
+			)
 			if existing:
 				if existing.sync_hash != sync_hash or existing.erp_document != erp_document:
 					self.mappings_updated += 1
@@ -104,12 +114,21 @@ class BaseImporter:
 				self.mappings_created += 1
 			return
 
-		existing = self.get_active_mapping(external_entity_type, external_id, external_variant_id)
+		existing = self.get_active_mapping(
+			external_entity_type, external_id, external_variant_id, provider=clean_prov, erp_doctype=erp_doctype
+		)
 		if existing:
 			doc = frappe.get_doc("External ID Mapping", existing.name)
-			if doc.erp_doctype != erp_doctype or doc.erp_document != erp_document or doc.sync_hash != sync_hash:
+			if (
+				doc.erp_doctype != erp_doctype
+				or doc.erp_document != erp_document
+				or doc.sync_hash != sync_hash
+				or (clean_prov and doc.provider != clean_prov)
+			):
 				doc.erp_doctype = erp_doctype
 				doc.erp_document = erp_document
+				if clean_prov:
+					doc.provider = clean_prov
 				doc.sync_hash = sync_hash
 				doc.last_synced_at = frappe.utils.now_datetime()
 				doc.save(ignore_permissions=True)
@@ -117,7 +136,7 @@ class BaseImporter:
 			else:
 				self.mappings_reused += 1
 		else:
-			doc = frappe.get_doc({
+			data = {
 				"doctype": "External ID Mapping",
 				"sales_channel": self.sales_channel,
 				"external_entity_type": external_entity_type,
@@ -128,6 +147,9 @@ class BaseImporter:
 				"active": 1,
 				"sync_hash": sync_hash,
 				"last_synced_at": frappe.utils.now_datetime(),
-			})
+			}
+			if clean_prov:
+				data["provider"] = clean_prov
+			doc = frappe.get_doc(data)
 			doc.insert(ignore_permissions=True)
 			self.mappings_created += 1

@@ -54,7 +54,7 @@ class TestPrestaShopCatalogImportLive(unittest.TestCase):
 		# Verify mappings exist
 		cat_maps = frappe.db.get_all(
 			"External ID Mapping",
-			filters={"sales_channel": self.sales_channel, "external_entity_type": ExternalEntityType.CATEGORY, "active": 1},
+			filters={"sales_channel": self.sales_channel, "external_entity_type": ExternalEntityType.CATEGORY, "erp_doctype": "Item Group", "active": 1},
 			fields=["name", "erp_document", "external_id"],
 		)
 		self.assertGreater(len(cat_maps), 0)

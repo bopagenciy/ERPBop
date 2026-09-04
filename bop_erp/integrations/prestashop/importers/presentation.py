@@ -224,10 +224,6 @@ class PresentationImporter(BaseImporter):
 			primary_slug = en_data.get("slug") or extract_lang_field(c.get("link_rewrite")) or frappe.scrub(primary_name)
 			primary_slug = primary_slug.strip().lower()
 
-			# Stable node key based on PrestaShop category ID
-			category_key = f"ps-{cid}"
-			unique_key = compute_channel_category_key(self.sales_channel, category_key)
-
 			# Prepare child table rows for localized content
 			loc_rows = []
 			for lang_code, vals in loc_data.items():
@@ -240,38 +236,58 @@ class PresentationImporter(BaseImporter):
 					"meta_description": vals["meta_description"],
 				})
 
-			existing_name = frappe.db.get_value(
-				"Channel Category",
-				{"sales_channel": self.sales_channel, "unique_channel_slug": unique_key},
-				"name",
+			# First lookup via External ID Mapping (prefer External ID Mapping)
+			cat_map = self.get_active_mapping(
+				ExternalEntityType.CATEGORY, cid, provider="PRESTASHOP", erp_doctype="Channel Category"
 			)
-			if not existing_name:
-				# Also check fallback by slug from Phase 1F
-				fallback_key = compute_channel_category_key(self.sales_channel, primary_slug)
+			existing_name = None
+			if cat_map and cat_map.erp_document and frappe.db.exists("Channel Category", cat_map.erp_document):
+				existing_name = cat_map.erp_document
+			else:
+				# Backward-compatible fallback lookup for legacy ps-ID keys or slugs
+				legacy_key = compute_channel_category_key(self.sales_channel, f"ps-{cid}")
 				existing_name = frappe.db.get_value(
 					"Channel Category",
-					{"sales_channel": self.sales_channel, "unique_channel_slug": fallback_key},
+					{"sales_channel": self.sales_channel, "unique_channel_slug": legacy_key},
 					"name",
 				)
+				if not existing_name:
+					fallback_key = compute_channel_category_key(self.sales_channel, primary_slug)
+					existing_name = frappe.db.get_value(
+						"Channel Category",
+						{"sales_channel": self.sales_channel, "unique_channel_slug": fallback_key},
+						"name",
+					)
 
 			if existing_name:
 				self._channel_cat_cache[cid] = existing_name
 				if not self.dry_run:
 					cat_doc = frappe.get_doc("Channel Category", existing_name)
-					cat_doc.category_key = category_key
+					# Ensure category_key is provider-neutral (not starting with ps-)
+					if not cat_doc.category_key or cat_doc.category_key.startswith("ps-"):
+						cat_doc.category_key = f"cat_{frappe.generate_hash(length=12)}"
 					cat_doc.category_name = primary_name
 					cat_doc.category_slug = primary_slug
 					cat_doc.parent_channel_category = parent_channel_cat
 					cat_doc.set("localized_content", loc_rows)
 					cat_doc.save(ignore_permissions=True)
+					# Ensure External ID Mapping is established
+					self.set_mapping(
+						ExternalEntityType.CATEGORY,
+						cid,
+						"Channel Category",
+						cat_doc.name,
+						provider="PRESTASHOP",
+					)
 				res.unchanged += 1
 			else:
+				provider_neutral_key = f"cat_{frappe.generate_hash(length=12)}"
 				if not self.dry_run:
 					cat_doc = frappe.get_doc({
 						"doctype": "Channel Category",
 						"sales_channel": self.sales_channel,
 						"category_name": primary_name,
-						"category_key": category_key,
+						"category_key": provider_neutral_key,
 						"category_slug": primary_slug,
 						"parent_channel_category": parent_channel_cat,
 						"active": 1 if active else 0,
@@ -279,6 +295,13 @@ class PresentationImporter(BaseImporter):
 					})
 					cat_doc.insert(ignore_permissions=True)
 					self._channel_cat_cache[cid] = cat_doc.name
+					self.set_mapping(
+						ExternalEntityType.CATEGORY,
+						cid,
+						"Channel Category",
+						cat_doc.name,
+						provider="PRESTASHOP",
+					)
 				else:
 					self._channel_cat_cache[cid] = f"CC-{self.sales_channel}-{primary_slug}"
 				res.created += 1
@@ -431,8 +454,14 @@ class PresentationImporter(BaseImporter):
 				continue
 			channel_cat_doc = self._channel_cat_cache.get(cid)
 			if not channel_cat_doc:
-				key = compute_channel_category_key(self.sales_channel, f"ps-{cid}")
-				channel_cat_doc = frappe.db.get_value("Channel Category", {"sales_channel": self.sales_channel, "unique_channel_slug": key}, "name")
+				cat_map = self.get_active_mapping(
+					ExternalEntityType.CATEGORY, cid, provider="PRESTASHOP", erp_doctype="Channel Category"
+				)
+				if cat_map and cat_map.erp_document and frappe.db.exists("Channel Category", cat_map.erp_document):
+					channel_cat_doc = cat_map.erp_document
+				else:
+					key = compute_channel_category_key(self.sales_channel, f"ps-{cid}")
+					channel_cat_doc = frappe.db.get_value("Channel Category", {"sales_channel": self.sales_channel, "unique_channel_slug": key}, "name")
 
 			if channel_cat_doc and channel_cat_doc not in seen_cats:
 				seen_cats.add(channel_cat_doc)
@@ -460,7 +489,19 @@ class PresentationImporter(BaseImporter):
 				"channel_meta_description": d["meta_description"],
 			})
 
-		# 5. Check existing presentation
+		# 5. Localized media rows across all available languages
+		media_localized_rows = []
+		for m in media_assets:
+			m_asset = m["media_asset"]
+			for l_code, d in loc_data.items():
+				alt_text = d.get("name") or default_name
+				media_localized_rows.append({
+					"media_asset": m_asset,
+					"language": l_code,
+					"alt_text": alt_text,
+				})
+
+		# 6. Check existing presentation
 		active_key = compute_item_presentation_key(item_code, self.sales_channel)
 		existing_pres_name = frappe.db.get_value(
 			"Item Channel Presentation",
@@ -488,6 +529,7 @@ class PresentationImporter(BaseImporter):
 				pres.channel_meta_keywords = default_meta_kw
 				pres.set("channel_categories", channel_category_rows)
 				pres.set("media_items", media_assets)
+				pres.set("media_localized_content", media_localized_rows)
 				pres.set("localized_content", localized_rows)
 				pres.save(ignore_permissions=True)
 				self.localized_content_updated += len(localized_rows)
@@ -507,6 +549,7 @@ class PresentationImporter(BaseImporter):
 					"channel_meta_keywords": default_meta_kw,
 					"channel_categories": channel_category_rows,
 					"media_items": media_assets,
+					"media_localized_content": media_localized_rows,
 					"localized_content": localized_rows,
 				})
 				pres.insert(ignore_permissions=True)

@@ -10,30 +10,50 @@ from bop_erp.constants import ExternalEntityType
 
 MAX_EXTERNAL_ID_LENGTH = 1000
 
-def compute_active_external_key(sales_channel, external_entity_type, external_id, external_variant_id=None):
+def compute_active_external_key(sales_channel, external_entity_type, external_id, external_variant_id=None, provider=None):
 	"""
 	External active unique key:
 	For PRODUCT_VARIANT:
-		[sales_channel, external_entity_type, external_id, external_variant_id]
+		[sales_channel, (opt) provider, external_entity_type, external_id, external_variant_id]
 	For all non-variant types:
-		[sales_channel, external_entity_type, external_id]
+		[sales_channel, (opt) provider, external_entity_type, external_id]
 
 	Canonical SHA-256 hash over deterministic JSON tuple.
 	External IDs are strictly opaque: casing, leading/trailing whitespace, and separators are preserved.
+	If provider is not specified, backward-compatible tuple is preserved without breaking existing keys.
 	"""
+	clean_prov = str(provider).strip().upper() if provider and str(provider).strip() else None
+
 	if str(external_entity_type) == ExternalEntityType.PRODUCT_VARIANT:
-		identity_tuple = [
-			str(sales_channel),
-			str(external_entity_type),
-			str(external_id),
-			str(external_variant_id) if external_variant_id is not None else None,
-		]
+		if clean_prov:
+			identity_tuple = [
+				str(sales_channel),
+				clean_prov,
+				str(external_entity_type),
+				str(external_id),
+				str(external_variant_id) if external_variant_id is not None else None,
+			]
+		else:
+			identity_tuple = [
+				str(sales_channel),
+				str(external_entity_type),
+				str(external_id),
+				str(external_variant_id) if external_variant_id is not None else None,
+			]
 	else:
-		identity_tuple = [
-			str(sales_channel),
-			str(external_entity_type),
-			str(external_id),
-		]
+		if clean_prov:
+			identity_tuple = [
+				str(sales_channel),
+				clean_prov,
+				str(external_entity_type),
+				str(external_id),
+			]
+		else:
+			identity_tuple = [
+				str(sales_channel),
+				str(external_entity_type),
+				str(external_id),
+			]
 	canonical_json = json.dumps(identity_tuple, ensure_ascii=False, separators=(",", ":"))
 	return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
@@ -71,6 +91,8 @@ class ExternalIDMapping(Document):
 			self.external_id = str(self.external_id)
 		if self.external_variant_id is not None:
 			self.external_variant_id = str(self.external_variant_id)
+		if getattr(self, "provider", None):
+			self.provider = str(self.provider).strip().upper()
 
 	def validate_field_lengths(self):
 		if self.external_id and len(self.external_id) > MAX_EXTERNAL_ID_LENGTH:
@@ -108,6 +130,7 @@ class ExternalIDMapping(Document):
 				self.external_entity_type,
 				self.external_id,
 				self.external_variant_id,
+				provider=getattr(self, "provider", None),
 			)
 			self.active_erp_key = compute_active_erp_key(
 				self.sales_channel,

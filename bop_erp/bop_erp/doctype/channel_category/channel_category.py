@@ -19,17 +19,35 @@ def compute_channel_category_key(sales_channel: str, category_key: str) -> str:
 
 
 class ChannelCategory(Document):
+	def before_validate(self):
+		self.validate_stable_identity()
+
+	def autoname(self):
+		self.validate_stable_identity()
+		slug = self.category_slug or (frappe.scrub(self.category_name) if self.category_name else None) or self.category_key
+		self.category_slug = slug
+		base_name = f"CC-{self.sales_channel}-{slug}"
+		name = base_name
+		idx = 1
+		while frappe.db.exists("Channel Category", name):
+			name = f"{base_name}-{idx}"
+			idx += 1
+		self.name = name
+
 	def validate(self):
 		self.validate_stable_identity()
 		self.validate_unique_languages()
 
 	def validate_stable_identity(self):
 		if not self.category_key:
-			self.category_key = self.category_slug or frappe.scrub(self.category_name)
+			if self.category_slug and not self.category_slug.startswith("ps-"):
+				self.category_key = self.category_slug
+			else:
+				self.category_key = f"cat_{frappe.generate_hash(length=12)}"
 		self.category_key = str(self.category_key).strip().lower()
 
 		if not self.category_slug:
-			self.category_slug = self.category_key
+			self.category_slug = frappe.scrub(self.category_name) if self.category_name else self.category_key
 		self.category_slug = str(self.category_slug).strip().lower()
 
 		self.unique_channel_slug = compute_channel_category_key(self.sales_channel, self.category_key)

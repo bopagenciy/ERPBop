@@ -170,3 +170,8 @@ Variant Import Error: {0},Error al importar variante: {0}
 "Cannot add duplicate language '{0}' for presentation {1}","No se puede agregar el idioma duplicado '{0}' para la presentación {1}"
 "Cannot add duplicate language '{0}' for category {1}","No se puede agregar el idioma duplicado '{0}' para la categoría {1}"
 "Item Channel Presentation for Item '{0}' and Channel '{1}' already exists: {2}","La Presentación de Canal de Artículo para el Artículo '{0}' y Canal '{1}' ya existe: {2}"
+"Item Channel Media Localized Content","Contenido Localizado de Medios de Canal de Artículo"
+"Localized Media Content","Contenido Localizado de Medios"
+"Provider / Connector","Proveedor / Conector"
+"Duplicate localized media content for language '{0}' on media asset '{1}'.","Contenido localizado de medios duplicado para el idioma '{0}' en el activo de medios '{1}'."
+"Language '{0}' does not exist in Frappe.","El idioma '{0}' no existe en Frappe."

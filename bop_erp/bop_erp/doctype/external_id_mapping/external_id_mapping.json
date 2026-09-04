@@ -6,6 +6,7 @@
  "engine": "InnoDB",
  "field_order": [
   "sales_channel",
+  "provider",
   "external_entity_type",
   "external_id",
   "external_variant_id",
@@ -27,6 +28,13 @@
    "label": "Sales Channel",
    "options": "Sales Channel",
    "reqd": 1
+  },
+  {
+   "fieldname": "provider",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Provider / Connector",
+   "length": 50
   },
   {
    "fieldname": "external_entity_type",

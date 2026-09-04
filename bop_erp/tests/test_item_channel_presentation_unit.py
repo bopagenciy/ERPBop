@@ -122,7 +122,7 @@ class TestItemChannelPresentationUnit(unittest.TestCase):
 			"category_slug": slug_root,
 			"active": 1,
 		})
-		with self.assertRaises(frappe.DuplicateEntryError):
+		with self.assertRaises((frappe.DuplicateEntryError, frappe.UniqueValidationError)):
 			duplicate_cat.insert(ignore_permissions=True)
 
 	def test_03_item_channel_presentation_uniqueness_and_decoupling(self):

@@ -1,0 +1,38 @@
+{
+ "name": "Item Channel Media Localized Content",
+ "module": "Bop ERP",
+ "doctype": "DocType",
+ "istable": 1,
+ "editable_grid": 1,
+ "track_changes": 0,
+ "fields": [
+  {
+   "fieldname": "media_asset",
+   "fieldtype": "Link",
+   "label": "Media Asset",
+   "options": "Item Media Asset",
+   "in_list_view": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "language",
+   "fieldtype": "Link",
+   "label": "Language",
+   "options": "Language",
+   "in_list_view": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "alt_text",
+   "fieldtype": "Small Text",
+   "label": "Alternative Text",
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "title",
+   "fieldtype": "Data",
+   "label": "Caption / Title"
+  }
+ ],
+ "permissions": []
+}
