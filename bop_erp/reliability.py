@@ -197,6 +197,92 @@ def claim_event_for_processing(event_name, worker_id=None, lease_timeout_seconds
 		return True, worker_id, processing_token
 	return False, None, None
 
+def renew_processing_lease(event_name, processing_token, extension_seconds=None):
+	"""
+	Safely extends the processing lease of an active event.
+	Enforces:
+	- event must currently be in PROCESSING status
+	- processing_token must match the persisted token
+	- current lease must NOT yet be expired (lease_expires_at > now())
+	- atomically updates lease_expires_at without modifying attempt_count
+	Returns True on success; raises frappe.ValidationError on failure.
+	"""
+	if not processing_token:
+		frappe.throw(
+			_("Processing token is required to renew lease for event '{0}'.").format(event_name),
+			frappe.ValidationError,
+		)
+
+	now = now_datetime()
+
+	if extension_seconds is None:
+		try:
+			timeout_minutes = get_settings().integration_processing_timeout_minutes or 15
+			extension_seconds = int(timeout_minutes) * 60
+		except Exception:
+			extension_seconds = 900
+
+	new_lease_expires_at = now + timedelta(seconds=extension_seconds)
+
+	# Atomic conditional update requiring valid status, token, and unexpired lease
+	frappe.db.sql(
+		"""
+		UPDATE `tabIntegration Event`
+		SET lease_expires_at = %s,
+			modified = %s
+		WHERE name = %s
+		  AND status = %s
+		  AND processing_token = %s
+		  AND lease_expires_at IS NOT NULL
+		  AND lease_expires_at > %s
+		""",
+		(
+			new_lease_expires_at,
+			now,
+			event_name,
+			IntegrationStatus.PROCESSING,
+			processing_token,
+			now,
+		),
+	)
+
+	# Verify update succeeded
+	updated_lease = frappe.db.get_value("Integration Event", event_name, "lease_expires_at")
+	if updated_lease and get_datetime(updated_lease) == get_datetime(new_lease_expires_at):
+		return True
+
+	# If update failed, query reasons to produce an informative error
+	current_status, current_token, current_lease = frappe.db.get_value(
+		"Integration Event", event_name, ["status", "processing_token", "lease_expires_at"]
+	) or (None, None, None)
+
+	if current_status != IntegrationStatus.PROCESSING:
+		frappe.throw(
+			_("Cannot renew lease for event '{0}': event is in status '{1}' (expected PROCESSING).").format(
+				event_name, current_status
+			),
+			frappe.ValidationError,
+		)
+	if current_token != processing_token:
+		frappe.throw(
+			_("Cannot renew lease for event '{0}': processing token does not match active worker.").format(
+				event_name
+			),
+			frappe.ValidationError,
+		)
+	if not current_lease or get_datetime(current_lease) <= now:
+		frappe.throw(
+			_("Cannot renew lease for event '{0}': lease has already expired at {1}.").format(
+				event_name, current_lease
+			),
+			frappe.ValidationError,
+		)
+
+	frappe.throw(
+		_("Failed to renew lease for event '{0}'.").format(event_name),
+		frappe.ValidationError,
+	)
+
 def recover_stale_events(timeout_minutes=None):
 	"""
 	Scans for events stuck in PROCESSING where lease_expires_at <= now()

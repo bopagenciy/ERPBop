@@ -169,6 +169,15 @@ class IntegrationEvent(Document):
 				frappe.ValidationError,
 			)
 
+		now = now_datetime()
+		if not self.lease_expires_at or self.lease_expires_at <= now:
+			frappe.throw(
+				_("Fencing violation: Processing lease for event '{0}' expired at {1} (current time: {2}).").format(
+					self.name, self.lease_expires_at, now
+				),
+				frappe.ValidationError,
+			)
+
 	def mark_succeeded(self, processing_token, response_metadata=None):
 		self._verify_processing_lease(processing_token)
 		self.status = IntegrationStatus.SUCCEEDED

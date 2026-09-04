@@ -26,6 +26,7 @@ from bop_erp.reliability import (
 	get_events_by_external_id,
 	create_replay_event,
 	get_existing_idempotent_event,
+	renew_processing_lease,
 )
 from frappe.translate import get_translations_from_apps
 
@@ -874,3 +875,161 @@ class TestIntegrationReliability(FrappeTestCase):
 		self.assertEqual(IntegrationStatus.PROCESSING, "PROCESSING")
 		self.assertEqual(IntegrationStatus.DEAD_LETTER, "DEAD_LETTER")
 		self.assertEqual(IntegrationDirection.INBOUND, "INBOUND")
+
+	def test_expired_lease_rejects_worker_before_recovery(self):
+		doc = frappe.get_doc({
+			"doctype": "Integration Event",
+			"direction": IntegrationDirection.INBOUND,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"sales_channel": "TID",
+			"entity_type": ExternalEntityType.ORDER,
+			"operation": IntegrationOperation.SYNC,
+			"status": IntegrationStatus.PENDING,
+		}).insert()
+
+		claimed, worker, token = claim_event_for_processing(doc.name, worker_id="WORKER-EXPIRE-TEST")
+		self.assertTrue(claimed)
+
+		# Force lease expiration into the past without executing recovery
+		past = now_datetime() - timedelta(minutes=5)
+		frappe.db.set_value("Integration Event", doc.name, {
+			"lease_expires_at": past,
+		})
+
+		# Doc is still in PROCESSING status in the database
+		status_in_db = frappe.db.get_value("Integration Event", doc.name, "status")
+		self.assertEqual(status_in_db, IntegrationStatus.PROCESSING)
+
+		# Worker attempts mark_succeeded with valid token but expired lease -> MUST BE REJECTED
+		doc_worker = frappe.get_doc("Integration Event", doc.name)
+		with self.assertRaises(frappe.ValidationError):
+			doc_worker.mark_succeeded(processing_token=token)
+
+		# Worker attempts mark_failed with expired lease -> MUST BE REJECTED
+		with self.assertRaises(frappe.ValidationError):
+			doc_worker.mark_failed(processing_token=token, error_code="ERR", error_message="Failed")
+
+		# Worker attempts schedule_retry with expired lease -> MUST BE REJECTED
+		with self.assertRaises(frappe.ValidationError):
+			doc_worker.schedule_retry(processing_token=token, error_code="ERR", error_message="Failed")
+
+		# Worker attempts mark_dead_letter with expired lease -> MUST BE REJECTED
+		with self.assertRaises(frappe.ValidationError):
+			doc_worker.mark_dead_letter(processing_token=token, error_code="ERR", error_message="Failed")
+
+		frappe.delete_doc("Integration Event", doc.name)
+
+	def test_valid_lease_permits_worker(self):
+		doc = frappe.get_doc({
+			"doctype": "Integration Event",
+			"direction": IntegrationDirection.INBOUND,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"sales_channel": "TID",
+			"entity_type": ExternalEntityType.ORDER,
+			"operation": IntegrationOperation.SYNC,
+			"status": IntegrationStatus.PENDING,
+		}).insert()
+
+		claimed, worker, token = claim_event_for_processing(doc.name, worker_id="WORKER-VALID")
+		self.assertTrue(claimed)
+
+		# Valid lease permits mark_succeeded
+		doc.mark_succeeded(processing_token=token)
+		doc.reload()
+		self.assertEqual(doc.status, IntegrationStatus.SUCCEEDED)
+
+		frappe.delete_doc("Integration Event", doc.name)
+
+	def test_valid_token_renews_processing_lease(self):
+		doc = frappe.get_doc({
+			"doctype": "Integration Event",
+			"direction": IntegrationDirection.INBOUND,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"sales_channel": "TID",
+			"entity_type": ExternalEntityType.ORDER,
+			"operation": IntegrationOperation.SYNC,
+			"status": IntegrationStatus.PENDING,
+		}).insert()
+
+		claimed, worker, token = claim_event_for_processing(doc.name, worker_id="WORKER-RENEW-1", lease_timeout_seconds=300)
+		self.assertTrue(claimed)
+
+		doc.reload()
+		initial_lease = doc.lease_expires_at
+		initial_attempts = doc.attempt_count
+		self.assertEqual(initial_attempts, 1)
+
+		# Renew lease with 3600 seconds extension
+		renewed = renew_processing_lease(doc.name, token, extension_seconds=3600)
+		self.assertTrue(renewed)
+
+		doc.reload()
+		self.assertTrue(doc.lease_expires_at > initial_lease)
+		# attempt_count MUST NOT increment upon lease renewal
+		self.assertEqual(doc.attempt_count, initial_attempts)
+
+		frappe.delete_doc("Integration Event", doc.name)
+
+	def test_stale_token_cannot_renew_lease(self):
+		doc = frappe.get_doc({
+			"doctype": "Integration Event",
+			"direction": IntegrationDirection.INBOUND,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"sales_channel": "TID",
+			"entity_type": ExternalEntityType.ORDER,
+			"operation": IntegrationOperation.SYNC,
+			"status": IntegrationStatus.PENDING,
+		}).insert()
+
+		claimed, worker, token = claim_event_for_processing(doc.name, worker_id="WORKER-RENEW-2")
+		self.assertTrue(claimed)
+
+		# Stale token cannot renew lease
+		with self.assertRaises(frappe.ValidationError):
+			renew_processing_lease(doc.name, "STALE-TOKEN-XYZ-999")
+
+		frappe.delete_doc("Integration Event", doc.name)
+
+	def test_expired_lease_cannot_renew(self):
+		doc = frappe.get_doc({
+			"doctype": "Integration Event",
+			"direction": IntegrationDirection.INBOUND,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"sales_channel": "TID",
+			"entity_type": ExternalEntityType.ORDER,
+			"operation": IntegrationOperation.SYNC,
+			"status": IntegrationStatus.PENDING,
+		}).insert()
+
+		claimed, worker, token = claim_event_for_processing(doc.name, worker_id="WORKER-RENEW-3")
+		self.assertTrue(claimed)
+
+		# Force lease expiration into the past
+		past = now_datetime() - timedelta(minutes=5)
+		frappe.db.set_value("Integration Event", doc.name, "lease_expires_at", past)
+
+		# Expired lease cannot be renewed
+		with self.assertRaises(frappe.ValidationError):
+			renew_processing_lease(doc.name, token)
+
+		frappe.delete_doc("Integration Event", doc.name)
+
+	def test_terminal_event_cannot_renew_lease(self):
+		doc = frappe.get_doc({
+			"doctype": "Integration Event",
+			"direction": IntegrationDirection.INBOUND,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"sales_channel": "TID",
+			"entity_type": ExternalEntityType.ORDER,
+			"operation": IntegrationOperation.SYNC,
+			"status": IntegrationStatus.PENDING,
+		}).insert()
+
+		claimed, worker, token = claim_event_for_processing(doc.name, worker_id="WORKER-RENEW-4")
+		doc.mark_succeeded(processing_token=token)
+
+		# Terminal event cannot renew lease
+		with self.assertRaises(frappe.ValidationError):
+			renew_processing_lease(doc.name, token)
+
+		frappe.delete_doc("Integration Event", doc.name)
