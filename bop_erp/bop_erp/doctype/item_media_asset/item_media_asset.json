@@ -1,0 +1,126 @@
+{
+ "actions": [],
+ "autoname": "hash",
+ "creation": "2026-09-04 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "item",
+  "file",
+  "media_type",
+  "title",
+  "alt_text",
+  "column_break_1",
+  "content_hash",
+  "source",
+  "is_primary",
+  "sort_order",
+  "active",
+  "asset_uniqueness_key"
+ ],
+ "fields": [
+  {
+   "fieldname": "item",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Item",
+   "options": "Item",
+   "reqd": 1
+  },
+  {
+   "fieldname": "file",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "File",
+   "options": "File",
+   "reqd": 1
+  },
+  {
+   "default": "IMAGE",
+   "fieldname": "media_type",
+   "fieldtype": "Select",
+   "label": "Media Type",
+   "options": "IMAGE\nDOCUMENT\nVIDEO_REFERENCE",
+   "reqd": 1
+  },
+  {
+   "fieldname": "title",
+   "fieldtype": "Data",
+   "label": "Title"
+  },
+  {
+   "fieldname": "alt_text",
+   "fieldtype": "Data",
+   "label": "Default Alt Text"
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "SHA-256 content checksum of physical file for deduplication",
+   "fieldname": "content_hash",
+   "fieldtype": "Data",
+   "label": "Content Checksum / Hash"
+  },
+  {
+   "default": "MANUAL",
+   "fieldname": "source",
+   "fieldtype": "Select",
+   "label": "Source",
+   "options": "MANUAL\nPRESTASHOP_IMPORT\nMIGRATION\nOTHER"
+  },
+  {
+   "default": "0",
+   "fieldname": "is_primary",
+   "fieldtype": "Check",
+   "label": "Is Primary"
+  },
+  {
+   "default": "0",
+   "fieldname": "sort_order",
+   "fieldtype": "Int",
+   "label": "Sort Order"
+  },
+  {
+   "default": "1",
+   "fieldname": "active",
+   "fieldtype": "Check",
+   "label": "Active"
+  },
+  {
+   "fieldname": "asset_uniqueness_key",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "Asset Uniqueness Key",
+   "unique": 1
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-09-04 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Bop ERP",
+ "name": "Item Media Asset",
+ "naming_rule": "Random",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "sort_order",
+ "sort_order": "ASC",
+ "states": [],
+ "track_changes": 1
+}

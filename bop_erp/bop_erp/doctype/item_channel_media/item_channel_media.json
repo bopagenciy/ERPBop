@@ -1,0 +1,39 @@
+{
+ "name": "Item Channel Media",
+ "module": "Bop ERP",
+ "doctype": "DocType",
+ "istable": 1,
+ "editable_grid": 1,
+ "track_changes": 0,
+ "fields": [
+  {
+   "fieldname": "media_asset",
+   "fieldtype": "Link",
+   "label": "Media Asset",
+   "options": "Item Media Asset",
+   "in_list_view": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "is_cover",
+   "fieldtype": "Check",
+   "label": "Is Cover Image",
+   "in_list_view": 1,
+   "default": "0"
+  },
+  {
+   "fieldname": "display_order",
+   "fieldtype": "Int",
+   "label": "Display Order",
+   "in_list_view": 1,
+   "default": "0"
+  },
+  {
+   "fieldname": "channel_alt_text",
+   "fieldtype": "Data",
+   "label": "Channel Alt Text",
+   "in_list_view": 1
+  }
+ ],
+ "permissions": []
+}

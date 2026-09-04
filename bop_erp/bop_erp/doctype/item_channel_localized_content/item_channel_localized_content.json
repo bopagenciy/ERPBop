@@ -1,0 +1,45 @@
+{
+ "name": "Item Channel Localized Content",
+ "module": "Bop ERP",
+ "doctype": "DocType",
+ "istable": 1,
+ "editable_grid": 1,
+ "track_changes": 0,
+ "fields": [
+  {
+   "fieldname": "language",
+   "fieldtype": "Link",
+   "label": "Language",
+   "options": "Language",
+   "in_list_view": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "channel_item_name",
+   "fieldtype": "Data",
+   "label": "Localized Channel Item Name",
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "channel_short_description",
+   "fieldtype": "Small Text",
+   "label": "Localized Short Description"
+  },
+  {
+   "fieldname": "channel_description",
+   "fieldtype": "Text Editor",
+   "label": "Localized Description"
+  },
+  {
+   "fieldname": "channel_meta_title",
+   "fieldtype": "Data",
+   "label": "Localized Meta Title"
+  },
+  {
+   "fieldname": "channel_meta_description",
+   "fieldtype": "Small Text",
+   "label": "Localized Meta Description"
+  }
+ ],
+ "permissions": []
+}

@@ -1,0 +1,141 @@
+{
+ "name": "Item Channel Presentation",
+ "module": "Bop ERP",
+ "doctype": "DocType",
+ "naming_rule": "Random",
+ "autoname": "hash",
+ "track_changes": 1,
+ "fields": [
+  {
+   "fieldname": "active_presentation_key",
+   "fieldtype": "Data",
+   "label": "Active Presentation Key",
+   "unique": 1,
+   "read_only": 1,
+   "hidden": 1
+  },
+  {
+   "fieldname": "item",
+   "fieldtype": "Link",
+   "label": "Master Item",
+   "options": "Item",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "sales_channel",
+   "fieldtype": "Link",
+   "label": "Sales Channel",
+   "options": "Sales Channel",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "publication_status",
+   "fieldtype": "Select",
+   "label": "Publication Status",
+   "options": "DRAFT\nREADY\nPUBLISHED\nDISABLED",
+   "default": "DRAFT",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "channel_item_name",
+   "fieldtype": "Data",
+   "label": "Channel Item Name (Default/EN)",
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "channel_slug",
+   "fieldtype": "Data",
+   "label": "Channel Slug / URL Key"
+  },
+  {
+   "fieldname": "section_presentation_content",
+   "fieldtype": "Section Break",
+   "label": "Channel Presentation Content"
+  },
+  {
+   "fieldname": "channel_short_description",
+   "fieldtype": "Small Text",
+   "label": "Channel Short Description"
+  },
+  {
+   "fieldname": "channel_description",
+   "fieldtype": "Text Editor",
+   "label": "Channel Long Description"
+  },
+  {
+   "fieldname": "section_seo",
+   "fieldtype": "Section Break",
+   "label": "SEO / Metadata"
+  },
+  {
+   "fieldname": "channel_meta_title",
+   "fieldtype": "Data",
+   "label": "Channel Meta Title"
+  },
+  {
+   "fieldname": "channel_meta_description",
+   "fieldtype": "Small Text",
+   "label": "Channel Meta Description"
+  },
+  {
+   "fieldname": "channel_meta_keywords",
+   "fieldtype": "Data",
+   "label": "Channel Meta Keywords"
+  },
+  {
+   "fieldname": "section_categories",
+   "fieldtype": "Section Break",
+   "label": "Channel Navigation Categories"
+  },
+  {
+   "fieldname": "channel_categories",
+   "fieldtype": "Table",
+   "label": "Storefront Categories",
+   "options": "Item Channel Category Item"
+  },
+  {
+   "fieldname": "section_media",
+   "fieldtype": "Section Break",
+   "label": "Channel Media Selection"
+  },
+  {
+   "fieldname": "media_items",
+   "fieldtype": "Table",
+   "label": "Channel Media Items",
+   "options": "Item Channel Media"
+  },
+  {
+   "fieldname": "section_localized",
+   "fieldtype": "Section Break",
+   "label": "Multilingual Marketing Content"
+  },
+  {
+   "fieldname": "localized_content",
+   "fieldtype": "Table",
+   "label": "Localized Content",
+   "options": "Item Channel Localized Content"
+  }
+ ],
+ "permissions": [
+  {
+   "role": "System Manager",
+   "read": 1,
+   "write": 1,
+   "create": 1,
+   "delete": 1
+  },
+  {
+   "role": "Item Manager",
+   "read": 1,
+   "write": 1,
+   "create": 1,
+   "delete": 0
+  }
+ ]
+}

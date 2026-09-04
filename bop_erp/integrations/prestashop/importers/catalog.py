@@ -9,6 +9,7 @@ from bop_erp.integrations.prestashop.importers.base import BaseImporter, ImportR
 from bop_erp.integrations.prestashop.importers.categories import CategoryImporter
 from bop_erp.integrations.prestashop.importers.attributes import AttributeImporter
 from bop_erp.integrations.prestashop.importers.products import ProductImporter
+from bop_erp.integrations.prestashop.importers.presentation import PresentationImporter
 
 
 class CatalogImporter:
@@ -32,15 +33,18 @@ class CatalogImporter:
 		sales_channel: str,
 		dry_run: bool = False,
 		allow_trusted_sku_reuse: bool = True,
+		sync_presentation: bool = True,
 	):
 		self.client = client
 		self.sales_channel = sales_channel
 		self.dry_run = dry_run
+		self.sync_presentation = sync_presentation
 		self.category_importer = CategoryImporter(client, sales_channel, dry_run=dry_run)
 		self.attribute_importer = AttributeImporter(client, sales_channel, dry_run=dry_run)
 		self.product_importer = ProductImporter(
 			client, sales_channel, dry_run=dry_run, allow_trusted_sku_reuse=allow_trusted_sku_reuse
 		)
+		self.presentation_importer = PresentationImporter(client, sales_channel, dry_run=dry_run)
 
 	def run(
 		self,
@@ -56,6 +60,8 @@ class CatalogImporter:
 			"attributes": None,
 			"products": None,
 			"variants": None,
+			"channel_categories": None,
+			"presentations": None,
 			"mappings": None,
 			"success": True,
 		}
@@ -75,6 +81,16 @@ class CatalogImporter:
 		report["products"] = prod_res.to_dict()
 		report["variants"] = var_res.to_dict()
 
+		# Phase 4: Presentations & Media (Phase 1F)
+		total_pres_failed = 0
+		if self.sync_presentation:
+			channel_cat_res = self.presentation_importer.sync_channel_categories()
+			report["channel_categories"] = channel_cat_res.to_dict()
+
+			pres_res = self.presentation_importer.sync_product_presentation_and_media()
+			report["presentations"] = pres_res.to_dict()
+			total_pres_failed = channel_cat_res.failed + pres_res.failed
+
 		# Mapping metrics across all importers
 		total_map_created = (
 			self.category_importer.mappings_created + self.product_importer.mappings_created
@@ -91,7 +107,7 @@ class CatalogImporter:
 			"updated": total_map_updated,
 		}
 
-		total_failed = cat_res.failed + attr_res.failed + prod_res.failed + var_res.failed
+		total_failed = cat_res.failed + attr_res.failed + prod_res.failed + var_res.failed + total_pres_failed
 		report["success"] = (total_failed == 0)
 		report["total_failed"] = total_failed
 

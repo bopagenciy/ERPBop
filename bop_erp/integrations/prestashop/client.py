@@ -122,7 +122,7 @@ class PrestaShopClient:
 			)
 
 		if not expected_json:
-			return resp.text
+			return resp.content
 
 		try:
 			return resp.json()
@@ -213,6 +213,10 @@ class PrestaShopClient:
 
 	def get_product(self, product_id: Any) -> Dict[str, Any]:
 		return self._get_resource("products", product_id)
+
+	def get_product_image_binary(self, product_id: Any, image_id: Any) -> bytes:
+		"""Fetches raw image binary content from /api/images/products/{product_id}/{image_id}."""
+		return self._request("GET", f"images/products/{product_id}/{image_id}", expected_json=False)
 
 	# --- Combination Methods ---
 	def list_combinations(
