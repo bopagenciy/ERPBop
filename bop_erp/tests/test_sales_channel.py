@@ -84,19 +84,19 @@ class TestSalesChannel(FrappeTestCase):
 			"doctype": "Sales Channel",
 			"channel_id": channel_id,
 			"channel_name": "Referenced Channel",
-			"channel_type": ChannelType.WEB if hasattr(ChannelType, "WEB") else ChannelType.OTHER,
+			"channel_type": ChannelType.OTHER,
 			"company": self.company,
 			"active": 1,
 		}).insert()
 
-		# Create an External ID Mapping referencing this channel
+		# Reference in External ID Mapping
 		mapping = frappe.get_doc({
 			"doctype": "External ID Mapping",
 			"sales_channel": channel_id,
 			"external_entity_type": "CUSTOMER",
 			"erp_doctype": "Company",
 			"erp_document": self.company,
-			"external_id": "EXT-REF-100",
+			"external_id": "EXT-REF-TEST",
 			"active": 1,
 		}).insert()
 
@@ -107,3 +107,36 @@ class TestSalesChannel(FrappeTestCase):
 		frappe.delete_doc("External ID Mapping", mapping.name, force=True)
 		frappe.delete_doc("Sales Channel", channel_id)
 		self.assertFalse(frappe.db.exists("Sales Channel", channel_id))
+
+	def test_channel_delete_blocked_by_all_transaction_types(self):
+		from unittest.mock import patch
+
+		channel_id = "TEST_CH_ALL_TX"
+		if frappe.db.exists("Sales Channel", channel_id):
+			frappe.delete_doc("Sales Channel", channel_id, force=True)
+
+		doc = frappe.get_doc({
+			"doctype": "Sales Channel",
+			"channel_id": channel_id,
+			"channel_name": "All Tx Channel",
+			"channel_type": ChannelType.OTHER,
+			"company": self.company,
+			"active": 1,
+		}).insert()
+
+		transaction_doctypes = [
+			"Sales Order",
+			"Pick List",
+			"Delivery Note",
+			"Shipment",
+			"Sales Invoice",
+			"Payment Entry",
+		]
+
+		for dt in transaction_doctypes:
+			with patch("frappe.db.count", side_effect=lambda doctype, filters: 1 if doctype == dt else 0):
+				self.assertTrue(doc.has_transaction_references(channel_id))
+				self.assertRaises(frappe.ValidationError, frappe.delete_doc, "Sales Channel", channel_id)
+
+		frappe.delete_doc("Sales Channel", channel_id)
+

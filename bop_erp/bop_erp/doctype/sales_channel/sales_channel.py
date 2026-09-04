@@ -48,6 +48,7 @@ class SalesChannel(Document):
 			("Sales Order", "sales_channel"),
 			("Pick List", "sales_channel"),
 			("Delivery Note", "sales_channel"),
+			("Shipment", "sales_channel"),
 			("Sales Invoice", "sales_channel"),
 			("Payment Entry", "sales_channel"),
 			("External ID Mapping", "sales_channel"),

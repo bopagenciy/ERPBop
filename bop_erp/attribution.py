@@ -34,46 +34,59 @@ def validate_channel_company(sales_channel, company):
 		)
 
 def validate_submitted_immutability(doc):
-	if doc.is_new() or doc.docstatus != 1:
+	if doc.docstatus != 1 or getattr(doc, "__islocal", False):
 		return
 
-	old_doc = doc.get_doc_before_save()
-	if not old_doc:
+	persisted = None
+	if getattr(doc, "name", None):
+		persisted = frappe.db.get_value(
+			doc.doctype, doc.name, ["sales_channel", "transaction_origin"], as_dict=True
+		)
+
+	if not persisted and hasattr(doc, "get_doc_before_save"):
+		before = doc.get_doc_before_save()
+		if before:
+			persisted = frappe._dict({
+				"sales_channel": getattr(before, "sales_channel", None) if not isinstance(before, dict) else before.get("sales_channel"),
+				"transaction_origin": getattr(before, "transaction_origin", None) if not isinstance(before, dict) else before.get("transaction_origin"),
+			})
+
+	if not persisted:
 		return
 
-	if hasattr(doc, "sales_channel") and old_doc.get("sales_channel") != doc.get("sales_channel"):
-		if frappe.session.user != "Administrator":
-			frappe.throw(_("Sales Channel cannot be modified on a submitted document."))
+	if hasattr(doc, "sales_channel") and doc.get("sales_channel") != persisted.sales_channel:
+		frappe.throw(_("Sales Channel cannot be modified on a submitted {0}.").format(doc.doctype))
 
-	if hasattr(doc, "transaction_origin") and old_doc.get("transaction_origin") != doc.get("transaction_origin"):
-		if frappe.session.user != "Administrator":
-			frappe.throw(_("Transaction Origin cannot be modified on a submitted document."))
+	if hasattr(doc, "transaction_origin") and doc.get("transaction_origin") != persisted.transaction_origin:
+		frappe.throw(_("Transaction Origin cannot be modified on a submitted {0}.").format(doc.doctype))
 
 def propagate_attribution_to_pick_list(doc, method=None):
-	if getattr(doc, "sales_channel", None):
-		return
+	channels = set()
+	origins = set()
 
-	sales_order_id = None
 	if hasattr(doc, "locations"):
 		for loc in doc.locations:
 			if loc.sales_order:
-				sales_order_id = loc.sales_order
-				break
+				so = frappe.db.get_value(
+					"Sales Order", loc.sales_order, ["sales_channel", "transaction_origin"], as_dict=True
+				)
+				if so:
+					if so.sales_channel:
+						channels.add(so.sales_channel)
+					if so.transaction_origin:
+						origins.add(so.transaction_origin)
 
-	if sales_order_id:
-		so = frappe.db.get_value(
-			"Sales Order",
-			sales_order_id,
-			["sales_channel", "transaction_origin", "external_order_id"],
-			as_dict=True,
-		)
-		if so:
-			if not doc.sales_channel and so.sales_channel:
-				doc.sales_channel = so.sales_channel
-			if not doc.transaction_origin and so.transaction_origin:
-				doc.transaction_origin = so.transaction_origin
-			if not doc.external_order_id and so.external_order_id:
-				doc.external_order_id = so.external_order_id
+	# Multi-source picking: header attribution set ONLY when homogeneous
+	if len(channels) == 1:
+		doc.sales_channel = next(iter(channels))
+		if len(origins) == 1:
+			doc.transaction_origin = next(iter(origins))
+		else:
+			doc.transaction_origin = None
+	elif len(channels) > 1:
+		# Mixed-channel pick list: clear header channel to prevent fake attribution
+		doc.sales_channel = None
+		doc.transaction_origin = None
 
 def propagate_attribution_to_delivery_note(doc, method=None):
 	if getattr(doc, "is_return", 0) and getattr(doc, "return_against", None):
@@ -89,56 +102,81 @@ def propagate_attribution_to_delivery_note(doc, method=None):
 			doc.external_order_id = orig.external_order_id
 		return
 
-	if getattr(doc, "sales_channel", None):
-		return
+	channels = set()
+	origins = set()
+	ext_ids = set()
 
-	sales_order_id = None
-	if hasattr(doc, "items"):
-		for item in doc.items:
-			if getattr(item, "against_sales_order", None):
-				sales_order_id = item.against_sales_order
-				break
+	items = doc.get("items") or []
+	for item in items:
+		if getattr(item, "against_sales_order", None) if not isinstance(item, dict) else item.get("against_sales_order"):
+			so_id = getattr(item, "against_sales_order", None) if not isinstance(item, dict) else item.get("against_sales_order")
+			so = frappe.db.get_value(
+				"Sales Order",
+				so_id,
+				["sales_channel", "transaction_origin", "external_order_id"],
+				as_dict=True,
+			)
+			if so:
+				if so.sales_channel:
+					channels.add(so.sales_channel)
+				if so.transaction_origin:
+					origins.add(so.transaction_origin)
+				if so.external_order_id:
+					ext_ids.add(so.external_order_id)
 
-	if sales_order_id:
-		so = frappe.db.get_value(
-			"Sales Order",
-			sales_order_id,
-			["sales_channel", "transaction_origin", "external_order_id"],
-			as_dict=True,
+	# Enforce Commercial Document Homogeneity
+	if len(channels) > 1:
+		frappe.throw(
+			_(
+				"Commercial Homogeneity Violation: Delivery Note combines items from multiple Sales Channels ({0}). "
+				"A Delivery Note must belong to a single homogeneous Sales Channel."
+			).format(", ".join(sorted(channels)))
 		)
-		if so:
-			if not doc.sales_channel and so.sales_channel:
-				doc.sales_channel = so.sales_channel
-			if not doc.transaction_origin and so.transaction_origin:
-				doc.transaction_origin = so.transaction_origin
-			if not doc.external_order_id and so.external_order_id:
-				doc.external_order_id = so.external_order_id
+
+	if len(channels) == 1:
+		doc.sales_channel = next(iter(channels))
+		if len(origins) == 1:
+			doc.transaction_origin = next(iter(origins))
+		if len(ext_ids) == 1:
+			doc.external_order_id = next(iter(ext_ids))
 
 def propagate_attribution_to_shipment(doc, method=None):
-	if getattr(doc, "sales_channel", None):
-		return
+	channels = set()
+	origins = set()
+	ext_ids = set()
 
-	delivery_note_id = None
-	if hasattr(doc, "delivery_notes"):
-		for dn in doc.delivery_notes:
-			if dn.delivery_note:
-				delivery_note_id = dn.delivery_note
-				break
+	delivery_notes = doc.get("delivery_notes") or []
+	for dn_row in delivery_notes:
+		dn_id = getattr(dn_row, "delivery_note", None) if not isinstance(dn_row, dict) else dn_row.get("delivery_note")
+		if dn_id:
+			dn = frappe.db.get_value(
+				"Delivery Note",
+				dn_id,
+				["sales_channel", "transaction_origin", "external_order_id"],
+				as_dict=True,
+			)
+			if dn:
+				if dn.sales_channel:
+					channels.add(dn.sales_channel)
+				if dn.transaction_origin:
+					origins.add(dn.transaction_origin)
+				if dn.external_order_id:
+					ext_ids.add(dn.external_order_id)
 
-	if delivery_note_id:
-		dn = frappe.db.get_value(
-			"Delivery Note",
-			delivery_note_id,
-			["sales_channel", "transaction_origin", "external_order_id"],
-			as_dict=True,
+	if len(channels) > 1:
+		frappe.throw(
+			_(
+				"Commercial Homogeneity Violation: Shipment combines deliveries from multiple Sales Channels ({0}). "
+				"A Shipment must belong to a single homogeneous Sales Channel."
+			).format(", ".join(sorted(channels)))
 		)
-		if dn:
-			if not doc.sales_channel and dn.sales_channel:
-				doc.sales_channel = dn.sales_channel
-			if not doc.transaction_origin and dn.transaction_origin:
-				doc.transaction_origin = dn.transaction_origin
-			if not doc.external_order_id and dn.external_order_id:
-				doc.external_order_id = dn.external_order_id
+
+	if len(channels) == 1:
+		doc.sales_channel = next(iter(channels))
+		if len(origins) == 1:
+			doc.transaction_origin = next(iter(origins))
+		if len(ext_ids) == 1:
+			doc.external_order_id = next(iter(ext_ids))
 
 def propagate_attribution_to_sales_invoice(doc, method=None):
 	if getattr(doc, "is_return", 0) and getattr(doc, "return_against", None):
@@ -154,62 +192,105 @@ def propagate_attribution_to_sales_invoice(doc, method=None):
 			doc.external_order_id = orig.external_order_id
 		return
 
-	if getattr(doc, "sales_channel", None):
-		return
+	channels = set()
+	origins = set()
+	ext_ids = set()
 
-	sales_order_id = None
-	delivery_note_id = None
-	if hasattr(doc, "items"):
-		for item in doc.items:
-			if getattr(item, "sales_order", None):
-				sales_order_id = item.sales_order
-				break
-			if getattr(item, "delivery_note", None):
-				delivery_note_id = item.delivery_note
-				break
+	items = doc.get("items") or []
+	for item in items:
+		so_id = getattr(item, "sales_order", None) if not isinstance(item, dict) else item.get("sales_order")
+		dn_id = getattr(item, "delivery_note", None) if not isinstance(item, dict) else item.get("delivery_note")
+		if so_id:
+			so = frappe.db.get_value(
+				"Sales Order",
+				so_id,
+				["sales_channel", "transaction_origin", "external_order_id"],
+				as_dict=True,
+			)
+			if so:
+				if so.sales_channel:
+					channels.add(so.sales_channel)
+				if so.transaction_origin:
+					origins.add(so.transaction_origin)
+				if so.external_order_id:
+					ext_ids.add(so.external_order_id)
+		elif dn_id:
+			dn = frappe.db.get_value(
+				"Delivery Note",
+				dn_id,
+				["sales_channel", "transaction_origin", "external_order_id"],
+				as_dict=True,
+			)
+			if dn:
+				if dn.sales_channel:
+					channels.add(dn.sales_channel)
+				if dn.transaction_origin:
+					origins.add(dn.transaction_origin)
+				if dn.external_order_id:
+					ext_ids.add(dn.external_order_id)
 
-	if sales_order_id:
-		so = frappe.db.get_value(
-			"Sales Order",
-			sales_order_id,
-			["sales_channel", "transaction_origin", "external_order_id"],
-			as_dict=True,
+	# Enforce Commercial Document Homogeneity
+	if len(channels) > 1:
+		frappe.throw(
+			_(
+				"Commercial Homogeneity Violation: Sales Invoice combines items from multiple Sales Channels ({0}). "
+				"A Sales Invoice must belong to a single homogeneous Sales Channel."
+			).format(", ".join(sorted(channels)))
 		)
-		if so:
-			if not doc.sales_channel and so.sales_channel:
-				doc.sales_channel = so.sales_channel
-			if not doc.transaction_origin and so.transaction_origin:
-				doc.transaction_origin = so.transaction_origin
-			if not doc.external_order_id and so.external_order_id:
-				doc.external_order_id = so.external_order_id
-	elif delivery_note_id:
-		dn = frappe.db.get_value(
-			"Delivery Note",
-			delivery_note_id,
-			["sales_channel", "transaction_origin", "external_order_id"],
-			as_dict=True,
-		)
-		if dn:
-			if not doc.sales_channel and dn.sales_channel:
-				doc.sales_channel = dn.sales_channel
-			if not doc.transaction_origin and dn.transaction_origin:
-				doc.transaction_origin = dn.transaction_origin
-			if not doc.external_order_id and dn.external_order_id:
-				doc.external_order_id = dn.external_order_id
+
+	if len(channels) == 1:
+		doc.sales_channel = next(iter(channels))
+		if len(origins) == 1:
+			doc.transaction_origin = next(iter(origins))
+		if len(ext_ids) == 1:
+			doc.external_order_id = next(iter(ext_ids))
 
 def propagate_attribution_to_payment_entry(doc, method=None):
-	if getattr(doc, "sales_channel", None):
-		return
+	channels = set()
+	origins = set()
 
-	if hasattr(doc, "references"):
-		for ref in doc.references:
-			if ref.reference_doctype in ("Sales Invoice", "Sales Order") and ref.reference_name:
-				ref_channel = frappe.db.get_value(ref.reference_doctype, ref.reference_name, "sales_channel")
-				ref_origin = frappe.db.get_value(ref.reference_doctype, ref.reference_name, "transaction_origin")
-				if ref_channel:
-					doc.sales_channel = ref_channel
-					doc.transaction_origin = ref_origin
-					break
+	refs = doc.get("references") or []
+	for ref in refs:
+		ref_doctype = getattr(ref, "reference_doctype", None) if not isinstance(ref, dict) else ref.get("reference_doctype")
+		ref_name = getattr(ref, "reference_name", None) if not isinstance(ref, dict) else ref.get("reference_name")
+		if ref_doctype in ("Sales Invoice", "Sales Order") and ref_name:
+			ref_channel = frappe.db.get_value(ref_doctype, ref_name, "sales_channel")
+			ref_origin = frappe.db.get_value(ref_doctype, ref_name, "transaction_origin")
+			if ref_channel:
+				channels.add(ref_channel)
+			if ref_origin:
+				origins.add(ref_origin)
+
+	# Payment Allocation Rules:
+	# A. Homogeneous (single channel): attribute to that channel
+	# B. Multi-channel allocation: do NOT attribute to a single channel (set None / derived)
+	if len(channels) == 1:
+		doc.sales_channel = next(iter(channels))
+		if len(origins) == 1:
+			doc.transaction_origin = next(iter(origins))
+	elif len(channels) > 1:
+		doc.sales_channel = None
+		doc.transaction_origin = None
+
+def get_payment_channel_breakdown(doc):
+	"""
+	Derive channel allocation breakdown from Payment Entry child references.
+	Returns a dictionary mapping sales_channel to allocated amount:
+	e.g. {'TID': 100.0, 'BAMAL': 50.0}
+	"""
+	if isinstance(doc, str):
+		doc = frappe.get_doc("Payment Entry", doc)
+	breakdown = {}
+	refs = doc.get("references") or []
+	for ref in refs:
+		ref_doctype = getattr(ref, "reference_doctype", None) if not isinstance(ref, dict) else ref.get("reference_doctype")
+		ref_name = getattr(ref, "reference_name", None) if not isinstance(ref, dict) else ref.get("reference_name")
+		allocated = getattr(ref, "allocated_amount", 0.0) if not isinstance(ref, dict) else ref.get("allocated_amount", 0.0)
+		if ref_doctype in ("Sales Invoice", "Sales Order") and ref_name:
+			channel = frappe.db.get_value(ref_doctype, ref_name, "sales_channel")
+			allocated = float(allocated or 0.0)
+			breakdown[channel] = breakdown.get(channel, 0.0) + allocated
+	return breakdown
 
 def validate_transaction_attribution(doc, method=None):
 	validate_submitted_immutability(doc)
@@ -217,9 +298,12 @@ def validate_transaction_attribution(doc, method=None):
 	if getattr(doc, "is_return", 0) and getattr(doc, "return_against", None):
 		ref_doctype = doc.doctype
 		orig_channel = frappe.db.get_value(ref_doctype, doc.return_against, "sales_channel")
-		if orig_channel and doc.get("sales_channel") and doc.sales_channel != orig_channel:
-			frappe.throw(
-				_("Return / Credit Note channel '{0}' must match the original {1} channel '{2}'.").format(
-					doc.sales_channel, ref_doctype, orig_channel
+		if orig_channel:
+			if not doc.get("sales_channel"):
+				doc.sales_channel = orig_channel
+			elif doc.sales_channel != orig_channel:
+				frappe.throw(
+					_("Return / Credit Note channel '{0}' must match the original {1} channel '{2}'.").format(
+						doc.sales_channel, ref_doctype, orig_channel
+					)
 				)
-			)

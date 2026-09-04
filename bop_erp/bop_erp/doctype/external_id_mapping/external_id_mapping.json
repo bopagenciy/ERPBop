@@ -14,7 +14,10 @@
   "erp_doctype",
   "erp_document",
   "last_synced_at",
-  "sync_hash"
+  "sync_hash",
+  "section_break_keys",
+  "active_external_key",
+  "active_erp_key"
  ],
  "fields": [
   {
@@ -82,11 +85,33 @@
    "fieldname": "sync_hash",
    "fieldtype": "Data",
    "label": "Sync Hash"
+  },
+  {
+   "fieldname": "section_break_keys",
+   "fieldtype": "Section Break",
+   "hidden": 1,
+   "label": "System Constraints"
+  },
+  {
+   "fieldname": "active_external_key",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "Active External Key",
+   "no_copy": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "active_erp_key",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "Active ERP Key",
+   "no_copy": 1,
+   "unique": 1
   }
  ],
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2026-09-04 08:38:00.000000",
+ "modified": "2026-09-04 08:48:00.000000",
  "modified_by": "Administrator",
  "module": "Bop ERP",
  "name": "External ID Mapping",
