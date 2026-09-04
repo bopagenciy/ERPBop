@@ -94,6 +94,15 @@ class TestStockMigrationApplyHardeningLive(unittest.TestCase):
 				"create_new_batch": 1,
 			}).insert(ignore_permissions=True)
 
+	def setUp(self):
+		self.orig_serial_batch_setting = frappe.db.get_single_value("Stock Settings", "enable_serial_and_batch_no_for_item")
+		frappe.db.set_single_value("Stock Settings", "enable_serial_and_batch_no_for_item", 1)
+		frappe.db.commit()
+
+	def tearDown(self):
+		frappe.db.set_single_value("Stock Settings", "enable_serial_and_batch_no_for_item", self.orig_serial_batch_setting)
+		frappe.db.commit()
+
 	def test_01_live_apply_multi_item_pipeline_and_clean_rollback(self):
 		"""
 		Tests live apply of standard, serialized, and batch-managed items.

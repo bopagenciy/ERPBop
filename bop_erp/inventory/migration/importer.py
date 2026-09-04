@@ -40,6 +40,28 @@ class MigrationImporter:
 		return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
 	@classmethod
+	def compute_batch_rows_hash(cls, batch_name: str) -> str:
+		"""
+		Recomputes deterministic SHA-256 payload hash directly from the current staged
+		Inventory Migration Row records in the database.
+		"""
+		rows = frappe.get_all(
+			"Inventory Migration Row",
+			filters={"batch": batch_name},
+			fields=[
+				"source_record_id",
+				"item_code",
+				"warehouse",
+				"quantity",
+				"valuation_rate",
+				"stock_uom",
+				"batch_no",
+				"serial_no",
+			],
+		)
+		return cls.compute_payload_hash(rows)
+
+	@classmethod
 	def parse_csv(cls, csv_text: str) -> List[Dict[str, Any]]:
 		"""Parses CSV string into a list of record dicts."""
 		reader = csv.DictReader(StringIO(csv_text.strip()))

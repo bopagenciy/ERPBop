@@ -14,8 +14,78 @@ class MigrationExecutor:
 
 	@classmethod
 	def apply_batch(cls, batch_name: str, user: str = "Administrator") -> Dict[str, Any]:
-		# 1. Atomic Concurrency Claim: Attempt transition from READY -> APPLYING
-		# Using direct UPDATE with row count prevents two workers from applying simultaneously
+		from bop_erp.inventory.migration.importer import MigrationImporter
+
+		# Step 1: Pre-Claim Validation & Immutability Gates (while in READY state)
+		batch = frappe.get_doc("Inventory Migration Batch", batch_name)
+
+		if batch.status != "READY":
+			if batch.status == "APPLYING":
+				raise frappe.ValidationError(
+					f"Migration batch '{batch_name}' is currently being applied by another process."
+				)
+			raise frappe.ValidationError(
+				f"Migration batch '{batch_name}' is in status '{batch.status}'. Only 'READY' batches can be applied."
+			)
+
+		if batch.error_rows > 0:
+			raise frappe.ValidationError(
+				f"Migration batch '{batch.batch_id}' has {batch.error_rows} error rows and cannot be applied."
+			)
+
+		if batch.valid_rows == 0:
+			raise frappe.ValidationError(f"Migration batch '{batch.batch_id}' has no valid rows to apply.")
+
+		# Gate 1.1: Staged row payload hash recomputation check
+		current_rows_hash = MigrationImporter.compute_batch_rows_hash(batch.name)
+		if not batch.input_hash or current_rows_hash != batch.input_hash:
+			batch.status = "VALIDATED"
+			batch.notes = (batch.notes or "") + "\nPre-apply check: Staged rows were modified since staging/validation."
+			batch.save(ignore_permissions=True)
+			frappe.db.commit()
+			raise frappe.ValidationError(
+				f"Staged migration rows for batch '{batch.batch_id}' were modified since validation. "
+				"Batch status has been reverted to 'VALIDATED' and must be revalidated before applying."
+			)
+
+		# Gate 1.2: Validated Batch Configuration Snapshot Integrity
+		current_config_hash = MigrationValidator.compute_config_hash(batch)
+		if not batch.validated_config_hash or current_config_hash != batch.validated_config_hash:
+			batch.status = "VALIDATED"
+			batch.notes = (batch.notes or "") + "\nPre-apply check: Batch execution parameters were modified since validation."
+			batch.save(ignore_permissions=True)
+			frappe.db.commit()
+			raise frappe.ValidationError(
+				f"Batch configuration (company, posting_date, posting_time, opening account, or input hash) "
+				f"for batch '{batch.batch_id}' was modified since validation. "
+				"Batch status has been reverted to 'VALIDATED' and must be revalidated before applying."
+			)
+
+		# Gate 1.3: Explicit Opening Difference Account Integrity
+		if not batch.opening_difference_account:
+			batch.status = "VALIDATED"
+			batch.save(ignore_permissions=True)
+			frappe.db.commit()
+			raise frappe.ValidationError(
+				"Explicit 'opening_difference_account' is required on Inventory Migration Batch before apply."
+			)
+
+		diff_acc_data = frappe.db.get_value(
+			"Account",
+			batch.opening_difference_account,
+			["name", "company", "is_group", "disabled", "report_type"],
+			as_dict=True,
+		)
+		if not diff_acc_data or diff_acc_data.company != batch.company or diff_acc_data.is_group or diff_acc_data.disabled or diff_acc_data.report_type != "Balance Sheet":
+			batch.status = "VALIDATED"
+			batch.save(ignore_permissions=True)
+			frappe.db.commit()
+			raise frappe.ValidationError(
+				f"Opening difference account '{batch.opening_difference_account}' is invalid or no longer meets requirements. "
+				"Batch status has been reverted to 'VALIDATED'."
+			)
+
+		# Step 2: Atomic Concurrency Claim: Attempt transition from READY -> APPLYING
 		frappe.db.sql(
 			"""
 			UPDATE `tabInventory Migration Batch`
@@ -26,10 +96,7 @@ class MigrationExecutor:
 		)
 
 		if getattr(frappe.db._cursor, "rowcount", 0) <= 0:
-			# Batch was either not READY, or another worker already claimed it
 			current_status = frappe.db.get_value("Inventory Migration Batch", batch_name, "status")
-			if not current_status:
-				raise frappe.DoesNotExistError(f"Inventory Migration Batch '{batch_name}' does not exist.")
 			if current_status == "APPLYING":
 				raise frappe.ValidationError(
 					f"Migration batch '{batch_name}' is currently being applied by another process."
@@ -38,22 +105,13 @@ class MigrationExecutor:
 				f"Migration batch '{batch_name}' is in status '{current_status}'. Only 'READY' batches can be applied."
 			)
 
-		# Immediately commit the claim so concurrent transactions see APPLYING
+		# Immediately commit the claim so concurrent transactions observe APPLYING
 		frappe.db.commit()
 
-		# Reload batch document under the APPLYING lock
-		batch = frappe.get_doc("Inventory Migration Batch", batch_name)
+		# Reload batch under the APPLYING fence
+		batch.reload()
 
 		try:
-			# 2. Pre-apply Immutability & Safety Validation Gate
-			if batch.error_rows > 0:
-				raise frappe.ValidationError(
-					f"Migration batch '{batch.batch_id}' has {batch.error_rows} error rows and cannot be applied."
-				)
-
-			if batch.valid_rows == 0:
-				raise frappe.ValidationError(f"Migration batch '{batch.batch_id}' has no valid rows to apply.")
-
 			valid_rows = frappe.get_all(
 				"Inventory Migration Row",
 				filters={"batch": batch.name, "status": "VALID"},
@@ -74,38 +132,7 @@ class MigrationExecutor:
 			if not valid_rows:
 				raise frappe.ValidationError(f"No valid rows found for batch '{batch.batch_id}'.")
 
-			# 3. Explicit Opening Difference Account Enforcement
-			if not batch.opening_difference_account:
-				raise frappe.ValidationError(
-					"Explicit 'opening_difference_account' is required on Inventory Migration Batch before apply."
-				)
-
-			diff_acc_data = frappe.db.get_value(
-				"Account",
-				batch.opening_difference_account,
-				["name", "company", "is_group", "disabled", "report_type"],
-				as_dict=True,
-			)
-			if not diff_acc_data:
-				raise frappe.ValidationError(
-					f"Opening difference account '{batch.opening_difference_account}' does not exist."
-				)
-			if diff_acc_data.company != batch.company:
-				raise frappe.ValidationError(
-					f"Opening difference account '{batch.opening_difference_account}' belongs to company '{diff_acc_data.company}', not '{batch.company}'."
-				)
-			if diff_acc_data.is_group or diff_acc_data.disabled:
-				raise frappe.ValidationError(
-					f"Opening difference account '{batch.opening_difference_account}' cannot be a group or disabled account."
-				)
-			if diff_acc_data.report_type != "Balance Sheet":
-				raise frappe.ValidationError(
-					f"Opening difference account '{batch.opening_difference_account}' has report_type '{diff_acc_data.report_type}'. "
-					"Opening stock reconciliation requires a Balance Sheet account (Asset, Liability, or Equity)."
-				)
-
-			# 4. Validation Snapshot Drift Protection (Optimistic Safety Check)
-			# Extract all valid (item_code, warehouse) pairs and re-check current live stock hash
+			# Step 3: Concurrency-Sensitive Live ERP Inventory Snapshot Check
 			pairs = [(r.resolved_item, r.resolved_warehouse) for r in valid_rows]
 			current_snapshot_hash = MigrationValidator.compute_stock_snapshot_hash(pairs)
 

@@ -22,3 +22,5 @@ class InventoryMigrationBatch(Document):
 				frappe.throw(_("Cannot modify opening difference account of an applied migration batch."))
 			if self.validation_snapshot_hash != old.validation_snapshot_hash:
 				frappe.throw(_("Cannot modify validation snapshot hash of an applied migration batch."))
+			if self.validated_config_hash != old.validated_config_hash:
+				frappe.throw(_("Cannot modify validated config hash of an applied migration batch."))

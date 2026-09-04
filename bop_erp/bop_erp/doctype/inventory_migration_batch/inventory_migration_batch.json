@@ -16,6 +16,7 @@
   "status",
   "input_hash",
   "validation_snapshot_hash",
+  "validated_config_hash",
   "total_rows",
   "valid_rows",
   "error_rows",
@@ -96,6 +97,12 @@
    "fieldname": "validation_snapshot_hash",
    "fieldtype": "Data",
    "label": "Validation Snapshot Hash (SHA-256)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "validated_config_hash",
+   "fieldtype": "Data",
+   "label": "Validated Config Hash (SHA-256)",
    "read_only": 1
   },
   {

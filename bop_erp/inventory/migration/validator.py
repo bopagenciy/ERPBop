@@ -14,23 +14,74 @@ class MigrationValidator:
 	"""
 
 	@classmethod
+	def compute_config_hash(cls, batch) -> str:
+		"""
+		Computes deterministic SHA-256 hash across the validated batch execution parameters:
+		company, posting_date, posting_time, opening_difference_account, and input_hash.
+		"""
+		canonical_config = [
+			str(batch.company or "").strip(),
+			str(batch.posting_date or "").strip(),
+			str(batch.posting_time or "").strip(),
+			str(batch.opening_difference_account or "").strip(),
+			str(batch.input_hash or "").strip(),
+		]
+		canonical_json = json.dumps(canonical_config, ensure_ascii=False, separators=(",", ":"))
+		return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+	@classmethod
 	def compute_stock_snapshot_hash(cls, items_warehouses: List[tuple]) -> str:
 		"""
-		Computes a deterministic SHA-256 hash of live ERP inventory for the given (item_code, warehouse) pairs.
-		Canonical sorting ensures order independence.
+		Computes a deterministic, order-independent SHA-256 hash of live ERP inventory
+		for the given (item_code, warehouse) pairs.
+		Extends the fingerprint to include native active Serial No identities and native Batch quantities.
 		"""
+		from erpnext.stock.doctype.batch.batch import get_batch_qty
+
 		snapshot_entries = []
-		# Deduplicate (item_code, warehouse)
+		# Deduplicate and sort (item_code, warehouse)
 		unique_pairs = sorted(list(set(items_warehouses)), key=lambda x: (x[0], x[1]))
 		for item_code, warehouse in unique_pairs:
 			snap = InventoryService.get_warehouse_inventory(item_code, warehouse)
 			val_rate = frappe.db.get_value("Bin", {"item_code": item_code, "warehouse": warehouse}, "valuation_rate") or 0.0
+
+			item_flags = frappe.db.get_value("Item", item_code, ["has_serial_no", "has_batch_no"], as_dict=True) or {}
+
+			# Native Serial No snapshot: active serials in this warehouse sorted canonically
+			serials = []
+			if item_flags.get("has_serial_no"):
+				serials = frappe.get_all(
+					"Serial No",
+					filters={"item_code": item_code, "warehouse": warehouse, "status": "Active"},
+					pluck="name",
+					order_by="name asc",
+				)
+				serials = sorted(serials)
+
+			# Native Batch snapshot: all distinct batches with non-zero balance in this warehouse sorted canonically
+			batch_distribution = []
+			if item_flags.get("has_batch_no"):
+				item_batches = frappe.get_all(
+					"Batch",
+					filters={"item": item_code},
+					pluck="name",
+					order_by="name asc",
+				)
+				for b_name in sorted(item_batches):
+					b_qty = flt(get_batch_qty(batch_no=b_name, warehouse=warehouse))
+					if b_qty > 0 or b_qty < 0:
+						batch_distribution.append([b_name, b_qty])
+				batch_distribution.sort(key=lambda x: x[0])
+
 			snapshot_entries.append([
 				item_code,
 				warehouse,
 				flt(snap.actual_qty),
 				flt(val_rate),
+				serials,
+				batch_distribution,
 			])
+
 		canonical_json = json.dumps(snapshot_entries, ensure_ascii=False, separators=(",", ":"))
 		return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
@@ -194,9 +245,19 @@ class MigrationValidator:
 
 			row_doc.save(ignore_permissions=True)
 
+		from bop_erp.inventory.migration.importer import MigrationImporter
+
+		# Sync batch.input_hash with current staged row state
+		current_rows_hash = MigrationImporter.compute_batch_rows_hash(batch.name)
+		batch.input_hash = current_rows_hash
+
 		# Compute validation snapshot hash across all valid items & warehouses
 		snapshot_hash = cls.compute_stock_snapshot_hash(valid_item_warehouse_pairs)
 		batch.validation_snapshot_hash = snapshot_hash
+
+		# Compute validated configuration hash across batch parameters
+		config_hash = cls.compute_config_hash(batch)
+		batch.validated_config_hash = config_hash
 
 		batch.total_rows = len(rows)
 		batch.valid_rows = valid_count
@@ -217,6 +278,7 @@ class MigrationValidator:
 			"valid_rows": valid_count,
 			"error_rows": error_count,
 			"validation_snapshot_hash": snapshot_hash,
+			"validated_config_hash": config_hash,
 			"status": batch.status,
 			"errors": all_errors,
 			"warnings": all_warnings,
