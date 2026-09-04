@@ -1,0 +1,100 @@
+{
+ "actions": [],
+ "creation": "2026-09-04 10:30:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "integration_section",
+  "integration_max_attempts",
+  "integration_processing_timeout_minutes",
+  "column_break_1",
+  "integration_retry_schedule",
+  "integration_metadata_max_length"
+ ],
+ "fields": [
+  {
+   "fieldname": "integration_section",
+   "fieldtype": "Section Break",
+   "label": "Integration Reliability & Retries"
+  },
+  {
+   "default": "5",
+   "fieldname": "integration_max_attempts",
+   "fieldtype": "Int",
+   "label": "Max Integration Attempts"
+  },
+  {
+   "default": "15",
+   "fieldname": "integration_processing_timeout_minutes",
+   "fieldtype": "Int",
+   "label": "Processing Timeout (Minutes)"
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "60, 300, 900, 3600, 14400",
+   "fieldname": "integration_retry_schedule",
+   "fieldtype": "Small Text",
+   "label": "Retry Backoff Schedule (Seconds, Comma-Separated)"
+  },
+  {
+   "default": "5000",
+   "fieldname": "integration_metadata_max_length",
+   "fieldtype": "Int",
+   "label": "Max Metadata Length (Characters)"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-09-04 10:30:00.000000",
+ "modified_by": "Administrator",
+ "module": "Bop ERP",
+ "name": "Bop ERP Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Bop ERP Administrator",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 0,
+   "delete": 0,
+   "email": 0,
+   "export": 0,
+   "print": 0,
+   "read": 1,
+   "report": 0,
+   "role": "Bop Integration User",
+   "share": 0,
+   "write": 0
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}
