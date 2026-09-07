@@ -1843,6 +1843,452 @@ class TestReservationsATPLive(unittest.TestCase):
 			frappe.db.set_value("Channel Inventory Source", self.cis_orlando, "priority", 20)
 			self._cleanup_stock([reco_m, reco_o])
 
+	def test_29_live_critical_counterexample_uncovered_so_demand_atp_zero(self):
+		"""
+		VERIFIES PHASE 1I.4 SECTION 1 CRITICAL COUNTEREXAMPLE:
+		Sellable channel pool: Warehouse Miami (Wh A), Warehouse Orlando (Wh B).
+		Physical inventory:
+		    Miami (A): actual_qty = 0
+		    Orlando (B): actual_qty = 10
+		Demand:
+		    Sales Order 1: target Miami (A), qty = 10 (unreserved pending SO demand)
+		    Sales Order 2: target Miami (A), qty = 4, with active SRE of 4 in Orlando (B)
+		Pool calculations:
+		    Orlando local physical capacity = 10 - 4 = 6
+		    Miami local physical capacity = 0
+		    base_pool_capacity = 6 + 0 = 6
+		    Uncovered SO demand (SO 1) = 10 - 0 = 10
+		    Channel ATP = max(0, 6 - 10) = 0
+		"""
+		reco_o = self._setup_stock(self.wh_orlando, 10.0)
+		so1 = None
+		so2 = None
+		sre2 = None
+		try:
+			cust = frappe.db.get_value("Customer", {"disabled": 0}, "name")
+			if not cust:
+				cust = frappe.get_doc({"doctype": "Customer", "customer_name": "Test Cust Counterexample"}).insert(ignore_permissions=True).name
+
+			# SO 1: 10 units at Miami (pending, no SRE)
+			so1 = frappe.get_doc({
+				"doctype": "Sales Order",
+				"company": self.company,
+				"customer": cust,
+				"delivery_date": frappe.utils.nowdate(),
+				"items": [
+					{
+						"item_code": self.item_code,
+						"warehouse": self.wh_miami,
+						"qty": 10.0,
+						"rate": 25.0,
+					}
+				],
+			}).insert(ignore_permissions=True)
+			so1.submit()
+
+			# SO 2: 4 units at Miami, covered by SRE in Orlando
+			so2 = frappe.get_doc({
+				"doctype": "Sales Order",
+				"company": self.company,
+				"customer": cust,
+				"delivery_date": frappe.utils.nowdate(),
+				"items": [
+					{
+						"item_code": self.item_code,
+						"warehouse": self.wh_miami,
+						"qty": 4.0,
+						"rate": 25.0,
+					}
+				],
+			}).insert(ignore_permissions=True)
+			so2.submit()
+
+			sre2 = frappe.get_doc({
+				"doctype": "Stock Reservation Entry",
+				"item_code": self.item_code,
+				"warehouse": self.wh_orlando,
+				"voucher_type": "Sales Order",
+				"voucher_no": so2.name,
+				"voucher_detail_no": so2.items[0].name,
+				"voucher_qty": 4.0,
+				"available_qty": 10.0,
+				"reserved_qty": 4.0,
+				"company": self.company,
+				"stock_uom": "Nos",
+			}).insert(ignore_permissions=True)
+			sre2.submit()
+
+			# Verify Channel ATP is strictly 0.0 (prevents overselling)
+			ch_atp = get_channel_atp(self.item_code, self.channel)
+			self.assertEqual(ch_atp.base_physical_capacity, 6.0)
+			self.assertEqual(ch_atp.uncovered_sales_order_demand, 10.0)
+			self.assertEqual(ch_atp.aggregate_atp_qty, 0.0)
+
+		finally:
+			if sre2:
+				try:
+					sre2.reload()
+					sre2.cancel()
+					frappe.delete_doc("Stock Reservation Entry", sre2.name, force=True, ignore_permissions=True)
+				except Exception:
+					pass
+			for so in [so1, so2]:
+				if so:
+					try:
+						so.reload()
+						so.cancel()
+						frappe.delete_doc("Sales Order", so.name, force=True, ignore_permissions=True)
+					except Exception:
+						pass
+			self._cleanup_stock([reco_o])
+
+	def test_30_live_transactional_reservation_rejected_by_uncovered_so_demand(self):
+		"""
+		VERIFIES TRANSACTIONAL CHANNEL RESERVATION REJECTION:
+		In the critical counterexample state (channel ATP = 0),
+		calling reserve_channel_stock(requested_qty=1) MUST be rejected with
+		InsufficientStockToReserveError and commit NO database records.
+		"""
+		reco_o = self._setup_stock(self.wh_orlando, 10.0)
+		so1 = None
+		so2 = None
+		sre2 = None
+		try:
+			cust = frappe.db.get_value("Customer", {"disabled": 0}, "name")
+			if not cust:
+				cust = frappe.get_doc({"doctype": "Customer", "customer_name": "Test Cust Reject"}).insert(ignore_permissions=True).name
+
+			so1 = frappe.get_doc({
+				"doctype": "Sales Order",
+				"company": self.company,
+				"customer": cust,
+				"delivery_date": frappe.utils.nowdate(),
+				"items": [{"item_code": self.item_code, "warehouse": self.wh_miami, "qty": 10.0, "rate": 25.0}],
+			}).insert(ignore_permissions=True)
+			so1.submit()
+
+			so2 = frappe.get_doc({
+				"doctype": "Sales Order",
+				"company": self.company,
+				"customer": cust,
+				"delivery_date": frappe.utils.nowdate(),
+				"items": [{"item_code": self.item_code, "warehouse": self.wh_miami, "qty": 4.0, "rate": 25.0}],
+			}).insert(ignore_permissions=True)
+			so2.submit()
+
+			sre2 = frappe.get_doc({
+				"doctype": "Stock Reservation Entry",
+				"item_code": self.item_code,
+				"warehouse": self.wh_orlando,
+				"voucher_type": "Sales Order",
+				"voucher_no": so2.name,
+				"voucher_detail_no": so2.items[0].name,
+				"voucher_qty": 4.0,
+				"available_qty": 10.0,
+				"reserved_qty": 4.0,
+				"company": self.company,
+				"stock_uom": "Nos",
+			}).insert(ignore_permissions=True)
+			sre2.submit()
+
+			# Attempt to reserve 1 unit on channel: must fail because channel ATP = 0
+			with self.assertRaises(InsufficientStockToReserveError):
+				reserve_channel_stock(
+					item_code=self.item_code,
+					sales_channel=self.channel,
+					requested_qty=1.0,
+				)
+
+		finally:
+			if sre2:
+				try:
+					sre2.reload()
+					sre2.cancel()
+					frappe.delete_doc("Stock Reservation Entry", sre2.name, force=True, ignore_permissions=True)
+				except Exception:
+					pass
+			for so in [so1, so2]:
+				if so:
+					try:
+						so.reload()
+						so.cancel()
+						frappe.delete_doc("Sales Order", so.name, force=True, ignore_permissions=True)
+					except Exception:
+						pass
+			self._cleanup_stock([reco_o])
+
+	def test_31_live_multiwarehouse_successful_allocation_with_partial_uncovered_demand(self):
+		"""
+		VERIFIES SUCCESSFUL CHANNEL ALLOCATION WHEN ATP > 0:
+		Orlando: actual 12. SRE 4 for SO2 => local physical cap = 8.
+		Miami: actual 0. SO1 pending = 6.
+		Base physical cap = 8. Uncovered SO = 6.
+		Channel ATP = 8 - 6 = 2.
+		reserve_channel_stock(requested_qty=2) MUST succeed and allocate 2 from Orlando.
+		"""
+		reco_o = self._setup_stock(self.wh_orlando, 12.0)
+		so1 = None
+		so2 = None
+		sre2 = None
+		res_sre_names = []
+		try:
+			cust = frappe.db.get_value("Customer", {"disabled": 0}, "name")
+			if not cust:
+				cust = frappe.get_doc({"doctype": "Customer", "customer_name": "Test Cust Success"}).insert(ignore_permissions=True).name
+
+			so1 = frappe.get_doc({
+				"doctype": "Sales Order",
+				"company": self.company,
+				"customer": cust,
+				"delivery_date": frappe.utils.nowdate(),
+				"items": [{"item_code": self.item_code, "warehouse": self.wh_miami, "qty": 6.0, "rate": 25.0}],
+			}).insert(ignore_permissions=True)
+			so1.submit()
+
+			so2 = frappe.get_doc({
+				"doctype": "Sales Order",
+				"company": self.company,
+				"customer": cust,
+				"delivery_date": frappe.utils.nowdate(),
+				"items": [{"item_code": self.item_code, "warehouse": self.wh_miami, "qty": 4.0, "rate": 25.0}],
+			}).insert(ignore_permissions=True)
+			so2.submit()
+
+			sre2 = frappe.get_doc({
+				"doctype": "Stock Reservation Entry",
+				"item_code": self.item_code,
+				"warehouse": self.wh_orlando,
+				"voucher_type": "Sales Order",
+				"voucher_no": so2.name,
+				"voucher_detail_no": so2.items[0].name,
+				"voucher_qty": 4.0,
+				"available_qty": 12.0,
+				"reserved_qty": 4.0,
+				"company": self.company,
+				"stock_uom": "Nos",
+			}).insert(ignore_permissions=True)
+			sre2.submit()
+
+			# Check ATP is exactly 2.0
+			ch_atp = get_channel_atp(self.item_code, self.channel)
+			self.assertEqual(ch_atp.base_physical_capacity, 8.0)
+			self.assertEqual(ch_atp.uncovered_sales_order_demand, 6.0)
+			self.assertEqual(ch_atp.aggregate_atp_qty, 2.0)
+
+			# Reserve 2.0: should succeed
+			res = reserve_channel_stock(
+				item_code=self.item_code,
+				sales_channel=self.channel,
+				requested_qty=2.0,
+				idempotency_key="TEST-31-SUCCESS",
+			)
+			self.assertTrue(res.success)
+			self.assertEqual(res.reserved_qty, 2.0)
+			self.assertEqual(len(res.allocations), 1)
+			self.assertEqual(res.allocations[0].warehouse, self.wh_orlando)
+			res_sre_names.append(res.allocations[0].stock_reservation_entry)
+
+		finally:
+			for sname in res_sre_names:
+				try:
+					release_stock_reservation(sname)
+					frappe.delete_doc("Stock Reservation Entry", sname, force=True, ignore_permissions=True)
+				except Exception:
+					pass
+			if sre2:
+				try:
+					sre2.reload()
+					sre2.cancel()
+					frappe.delete_doc("Stock Reservation Entry", sre2.name, force=True, ignore_permissions=True)
+				except Exception:
+					pass
+			for so in [so1, so2]:
+				if so:
+					try:
+						so.reload()
+						so.cancel()
+						frappe.delete_doc("Sales Order", so.name, force=True, ignore_permissions=True)
+					except Exception:
+						pass
+			self._cleanup_stock([reco_o])
+
+	def test_32_live_all_or_nothing_and_partial_mode_with_uncovered_demand(self):
+		"""
+		VERIFIES ALL-OR-NOTHING VS PARTIAL MODE UNDER UNCOVERED DEMAND:
+		Channel ATP = 2.0.
+		allow_partial=False: request 3.0 => raises InsufficientStockToReserveError, 0 reserved.
+		allow_partial=True: request 3.0 => reserves exactly 2.0, remaining 1.0 unallocated.
+		"""
+		reco_o = self._setup_stock(self.wh_orlando, 12.0)
+		so1 = None
+		sre2 = None
+		so2 = None
+		res_sre_names = []
+		try:
+			cust = frappe.db.get_value("Customer", {"disabled": 0}, "name")
+			if not cust:
+				cust = frappe.get_doc({"doctype": "Customer", "customer_name": "Test Cust Partial"}).insert(ignore_permissions=True).name
+
+			so1 = frappe.get_doc({
+				"doctype": "Sales Order",
+				"company": self.company,
+				"customer": cust,
+				"delivery_date": frappe.utils.nowdate(),
+				"items": [{"item_code": self.item_code, "warehouse": self.wh_miami, "qty": 6.0, "rate": 25.0}],
+			}).insert(ignore_permissions=True)
+			so1.submit()
+
+			so2 = frappe.get_doc({
+				"doctype": "Sales Order",
+				"company": self.company,
+				"customer": cust,
+				"delivery_date": frappe.utils.nowdate(),
+				"items": [{"item_code": self.item_code, "warehouse": self.wh_miami, "qty": 4.0, "rate": 25.0}],
+			}).insert(ignore_permissions=True)
+			so2.submit()
+
+			sre2 = frappe.get_doc({
+				"doctype": "Stock Reservation Entry",
+				"item_code": self.item_code,
+				"warehouse": self.wh_orlando,
+				"voucher_type": "Sales Order",
+				"voucher_no": so2.name,
+				"voucher_detail_no": so2.items[0].name,
+				"voucher_qty": 4.0,
+				"available_qty": 12.0,
+				"reserved_qty": 4.0,
+				"company": self.company,
+				"stock_uom": "Nos",
+			}).insert(ignore_permissions=True)
+			sre2.submit()
+
+			# 1. All-or-nothing: request 3.0 with ATP 2.0 => failure
+			with self.assertRaises(InsufficientStockToReserveError):
+				reserve_channel_stock(
+					item_code=self.item_code,
+					sales_channel=self.channel,
+					requested_qty=3.0,
+					allow_partial=False,
+				)
+
+			# 2. Partial mode: request 3.0 with ATP 2.0 => allocates 2.0
+			res = reserve_channel_stock(
+				item_code=self.item_code,
+				sales_channel=self.channel,
+				requested_qty=3.0,
+				allow_partial=True,
+				idempotency_key="TEST-32-PARTIAL",
+			)
+			self.assertTrue(res.success)
+			self.assertEqual(res.reserved_qty, 2.0)
+			res_sre_names.append(res.allocations[0].stock_reservation_entry)
+
+		finally:
+			for sname in res_sre_names:
+				try:
+					release_stock_reservation(sname)
+					frappe.delete_doc("Stock Reservation Entry", sname, force=True, ignore_permissions=True)
+				except Exception:
+					pass
+			if sre2:
+				try:
+					sre2.reload()
+					sre2.cancel()
+					frappe.delete_doc("Stock Reservation Entry", sre2.name, force=True, ignore_permissions=True)
+				except Exception:
+					pass
+			for so in [so1, so2]:
+				if so:
+					try:
+						so.reload()
+						so.cancel()
+						frappe.delete_doc("Sales Order", so.name, force=True, ignore_permissions=True)
+					except Exception:
+						pass
+			self._cleanup_stock([reco_o])
+
+	def test_33_live_sre_outside_pool_and_target_outside_pool(self):
+		"""
+		VERIFIES SRE OUTSIDE POOL REDUCES UNCOVERED DEMAND & TARGET OUTSIDE POOL:
+		1. Sales Order targets Miami (in pool) for 10 units.
+		   SRE for 6 units is created in Quarantine (OUTSIDE sellable pool).
+		   The SRE outside the pool reduces the uncovered demand from 10 to 4!
+		2. Sales Order targets Quarantine (outside sellable pool) for 5 units.
+		   This SO target outside the pool does NOT burden the sellable channel pool.
+		"""
+		reco_m = self._setup_stock(self.wh_miami, 15.0)
+		reco_q = self._setup_stock(self.wh_quarantine, 10.0)
+		so1 = None
+		sre1_q = None
+		so_out = None
+		try:
+			cust = frappe.db.get_value("Customer", {"disabled": 0}, "name")
+			if not cust:
+				cust = frappe.get_doc({"doctype": "Customer", "customer_name": "Test Cust PoolBound"}).insert(ignore_permissions=True).name
+
+			# SO 1: targets Miami (in pool), qty = 10
+			so1 = frappe.get_doc({
+				"doctype": "Sales Order",
+				"company": self.company,
+				"customer": cust,
+				"delivery_date": frappe.utils.nowdate(),
+				"items": [{"item_code": self.item_code, "warehouse": self.wh_miami, "qty": 10.0, "rate": 25.0}],
+			}).insert(ignore_permissions=True)
+			so1.submit()
+
+			# SRE for SO 1 located in Quarantine (outside pool) for 6 units
+			sre1_q = frappe.get_doc({
+				"doctype": "Stock Reservation Entry",
+				"item_code": self.item_code,
+				"warehouse": self.wh_quarantine,
+				"voucher_type": "Sales Order",
+				"voucher_no": so1.name,
+				"voucher_detail_no": so1.items[0].name,
+				"voucher_qty": 10.0,
+				"available_qty": 10.0,
+				"reserved_qty": 6.0,
+				"company": self.company,
+				"stock_uom": "Nos",
+			}).insert(ignore_permissions=True)
+			sre1_q.submit()
+
+			# SO Outside: targets Quarantine (outside pool) for 5 units
+			so_out = frappe.get_doc({
+				"doctype": "Sales Order",
+				"company": self.company,
+				"customer": cust,
+				"delivery_date": frappe.utils.nowdate(),
+				"items": [{"item_code": self.item_code, "warehouse": self.wh_quarantine, "qty": 5.0, "rate": 25.0}],
+			}).insert(ignore_permissions=True)
+			so_out.submit()
+
+			# Evaluate Channel ATP:
+			# Sellable pool: Miami (actual 15, physical SRE 0, local cap 15).
+			# Uncovered demand: SO 1 (pending 10 - SRE in Q 6 = 4). SO outside is ignored.
+			# Channel ATP = 15 - 4 = 11.0.
+			ch_atp = get_channel_atp(self.item_code, self.channel)
+			self.assertEqual(ch_atp.base_physical_capacity, 15.0)
+			self.assertEqual(ch_atp.uncovered_sales_order_demand, 4.0)
+			self.assertEqual(ch_atp.aggregate_atp_qty, 11.0)
+
+		finally:
+			if sre1_q:
+				try:
+					sre1_q.reload()
+					sre1_q.cancel()
+					frappe.delete_doc("Stock Reservation Entry", sre1_q.name, force=True, ignore_permissions=True)
+				except Exception:
+					pass
+			for so in [so1, so_out]:
+				if so:
+					try:
+						so.reload()
+						so.cancel()
+						frappe.delete_doc("Sales Order", so.name, force=True, ignore_permissions=True)
+					except Exception:
+						pass
+			self._cleanup_stock([reco_m, reco_q])
+
 	def test_99_safety_invariance_restoration(self):
 		"""
 		Verifies that after all tests and cleanups, exact zero counts are restored across all

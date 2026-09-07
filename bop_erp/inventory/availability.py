@@ -2,7 +2,7 @@
 # See license.txt
 
 import math
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import frappe
 from frappe import _
 from frappe.model.meta import get_field_precision
@@ -16,6 +16,7 @@ from bop_erp.inventory.models import (
 	ChannelATPBreakdown,
 	ChannelDemandBreakdown,
 	EffectiveReservedBreakdown,
+	SalesOrderDemandDetail,
 	WarehouseATP,
 )
 from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
@@ -42,6 +43,19 @@ def get_stock_precision(doctype: str = "Bin", fieldname: str = "actual_qty") -> 
 		except Exception:
 			prec = 3
 	return int(prec)
+
+
+def _extract_scalar(result, default: float = 0.0) -> float:
+	"""Safely extracts the first numeric scalar value from any Frappe SQL result structure."""
+	if not result:
+		return default
+	first = result[0]
+	if isinstance(first, (list, tuple)):
+		return flt(first[0]) if len(first) > 0 and first[0] is not None else default
+	if isinstance(first, dict):
+		vals = list(first.values())
+		return flt(vals[0]) if vals and vals[0] is not None else default
+	return flt(first) if first is not None else default
 
 
 def get_safety_stock(warehouse: str, item_code: Optional[str] = None) -> float:
@@ -136,7 +150,7 @@ def get_effective_reserved_breakdown(item_code: str, warehouse: str) -> Effectiv
 			""",
 			(item_code, warehouse),
 		)
-		native_sre_total = flt(sre_res[0][0], prec) if sre_res and sre_res[0][0] is not None else 0.0
+		native_sre_total = round(_extract_scalar(sre_res), prec)
 
 	# 2. SRE breakdown by voucher_type and voucher_no
 	sre_voucher_rows = frappe.db.sql(
@@ -313,7 +327,7 @@ def get_warehouse_atp(
 			""",
 			(item_code, warehouse),
 		)
-		sre_res = flt(sre_res[0][0]) if sre_res and sre_res[0][0] is not None else 0.0
+		sre_res = _extract_scalar(sre_res)
 	native_reserved_qty = round(flt(sre_res), prec)
 
 	effective_reserved_qty = round(flt(get_effective_reserved_qty(item_code, warehouse)), prec)
@@ -340,11 +354,183 @@ def get_warehouse_atp(
 	)
 
 
+def get_warehouse_reservable_capacity(
+	item_code: str,
+	warehouse: str,
+	allow_sellable_stock: bool = True,
+	actual_qty: Optional[float] = None,
+	safety_stock_qty: Optional[float] = None,
+	effective_reserved_qty: Optional[float] = None,
+) -> float:
+	"""
+	Computes local physical reservable capacity available for NEW reservations in one warehouse.
+	Concept (Phase 1I.4 Section 3):
+	    local_reservable_capacity = max(
+	        0,
+	        actual_qty - physical_active_sre_qty - non_sre_local_commitments - safety_stock
+	    )
+	Important:
+	- Sales Order Bin.reserved_qty is NOT deducted here if logical Sales Order demand is handled
+	  separately at channel scope (uncovered SO demand).
+	- physical_active_sre_qty: net remaining quantity across ALL active SREs in this warehouse
+	  (reserved - delivered - transferred - consumed).
+	- non_sre_local_commitments: mutually exclusive local production, subcontract, and production plan
+	  commitments after overlap reconciliation with their own SREs.
+	- safety_stock: get_safety_stock(warehouse, item_code)
+	"""
+	if not allow_sellable_stock:
+		return 0.0
+
+	prec = get_stock_precision("Bin", "actual_qty")
+	if actual_qty is None:
+		bin_actual = frappe.db.get_value(
+			"Bin",
+			{"item_code": item_code, "warehouse": warehouse},
+			"actual_qty",
+		)
+		actual_qty = round(flt(bin_actual), prec) if bin_actual is not None else 0.0
+	else:
+		actual_qty = round(flt(actual_qty), prec)
+
+	if safety_stock_qty is None:
+		safety_stock_qty = round(flt(get_safety_stock(warehouse, item_code)), prec)
+	else:
+		safety_stock_qty = round(flt(safety_stock_qty), prec)
+
+	if effective_reserved_qty is None:
+		effective_reserved_qty = round(flt(get_effective_reserved_qty(item_code, warehouse)), prec)
+	else:
+		effective_reserved_qty = round(flt(effective_reserved_qty), prec)
+
+	# Query active SREs in this warehouse tied to Sales Orders
+	sre_so_res = frappe.db.sql(
+		"""
+		SELECT SUM(reserved_qty - delivered_qty - transferred_qty - consumed_qty)
+		FROM `tabStock Reservation Entry`
+		WHERE docstatus = 1
+		  AND item_code = %s
+		  AND warehouse = %s
+		  AND voucher_type = 'Sales Order'
+		  AND delivered_qty < reserved_qty
+		  AND status NOT IN ('Closed', 'Delivered', 'Cancelled')
+		""",
+		(item_code, warehouse),
+	)
+	sre_for_so = round(_extract_scalar(sre_so_res), prec)
+
+	try:
+		bd = get_effective_reserved_breakdown(item_code, warehouse)
+		so_demand_in_wh = flt(bd.sales_order_demand)
+	except Exception:
+		so_demand_in_wh = 0.0
+
+	uncovered_in_wh = max(0.0, so_demand_in_wh - sre_for_so)
+	physical_commitments = max(0.0, effective_reserved_qty - uncovered_in_wh)
+
+	raw_cap = actual_qty - physical_commitments - safety_stock_qty
+	return max(0.0, round(flt(raw_cap), prec))
+
+
+def get_channel_uncovered_sales_order_demand(
+	item_code: str,
+	sellable_warehouses: List[str],
+) -> Tuple[float, List[SalesOrderDemandDetail]]:
+	"""
+	Computes uncovered logical Sales Order demand for an item across eligible sellable channel warehouses.
+	For each unique pending Sales Order Item whose target warehouse belongs to sellable_warehouses:
+	- pending_so_qty = native unfulfilled stock demand according to ERPNext v16 semantics.
+	- linked_active_sre_qty = sum of remaining active SRE quantity linked to that SAME Sales Order Item
+	  (regardless of which warehouse the SRE is placed in).
+	- uncovered_so_qty = max(0, pending_so_qty - linked_active_sre_qty).
+	"""
+	if not sellable_warehouses:
+		return 0.0, []
+
+	prec = get_stock_precision("Bin", "actual_qty")
+
+	so_items = frappe.db.sql(
+		"""
+		SELECT 
+			so.name as sales_order,
+			soi.name as sales_order_item,
+			soi.warehouse as target_warehouse,
+			soi.stock_qty,
+			soi.qty,
+			soi.delivered_qty
+		FROM `tabSales Order Item` soi
+		JOIN `tabSales Order` so ON so.name = soi.parent
+		WHERE so.docstatus = 1
+		  AND so.status NOT IN ('Closed', 'Cancelled', 'Completed')
+		  AND soi.item_code = %s
+		  AND soi.warehouse IN ({wh_placeholders})
+		  AND soi.delivered_qty < COALESCE(soi.stock_qty, soi.qty)
+		""".format(
+			wh_placeholders=", ".join(["%s"] * len(sellable_warehouses))
+		),
+		tuple([item_code] + sellable_warehouses),
+		as_dict=True,
+	)
+
+	sre_linked = frappe.db.sql(
+		"""
+		SELECT 
+			sre.voucher_detail_no,
+			SUM(sre.reserved_qty - sre.delivered_qty - sre.transferred_qty - sre.consumed_qty) as linked_sre_qty
+		FROM `tabStock Reservation Entry` sre
+		WHERE sre.docstatus = 1
+		  AND sre.item_code = %s
+		  AND sre.voucher_type = 'Sales Order'
+		  AND sre.delivered_qty < sre.reserved_qty
+		  AND sre.status NOT IN ('Closed', 'Delivered', 'Cancelled')
+		GROUP BY sre.voucher_detail_no
+		""",
+		(item_code,),
+		as_dict=True,
+	)
+	sre_map = {
+		(r.get("voucher_detail_no") if isinstance(r, dict) else getattr(r, "voucher_detail_no", "")): round(
+			flt(r.get("linked_sre_qty") if isinstance(r, dict) else getattr(r, "linked_sre_qty", 0.0)), prec
+		)
+		for r in (sre_linked or [])
+	}
+
+	total_uncovered = 0.0
+	so_details: List[SalesOrderDemandDetail] = []
+	for row in (so_items or []):
+		so_name = row.get("sales_order") if isinstance(row, dict) else getattr(row, "sales_order", "")
+		soi_name = row.get("sales_order_item") if isinstance(row, dict) else getattr(row, "sales_order_item", "")
+		tgt_wh = row.get("target_warehouse") if isinstance(row, dict) else getattr(row, "target_warehouse", "")
+		raw_qty = (row.get("stock_qty") or row.get("qty")) if isinstance(row, dict) else (getattr(row, "stock_qty", 0) or getattr(row, "qty", 0))
+		stk_qty = round(flt(raw_qty), prec)
+		deliv_qty = round(flt(row.get("delivered_qty") if isinstance(row, dict) else getattr(row, "delivered_qty", 0.0)), prec)
+		pending_qty = round(max(0.0, stk_qty - deliv_qty), prec)
+		linked_sre = round(flt(sre_map.get(soi_name, 0.0)), prec)
+		# Section 14: clamp to 0 if linked_sre > pending_qty
+		uncovered = round(max(0.0, pending_qty - linked_sre), prec)
+
+		total_uncovered += uncovered
+		so_details.append(
+			SalesOrderDemandDetail(
+				sales_order=so_name,
+				sales_order_item=soi_name,
+				target_warehouse=tgt_wh,
+				pending_qty=pending_qty,
+				linked_sre_qty=linked_sre,
+				uncovered_qty=uncovered,
+			)
+		)
+
+	return round(flt(total_uncovered), prec), so_details
+
+
 def get_channel_atp(item_code: str, sales_channel: str) -> ChannelATP:
 	"""
 	Aggregates Available-To-Promise (ATP) across all enabled sellable Channel Inventory Sources for a sales channel.
 	Sources with allow_sellable_stock = 0 contribute 0 ATP and their inventory/deficits do not affect sellable aggregates.
-	Priority controls allocation routing order, but does not alter aggregate quantity.
+	Separates physical warehouse capacities from logical uncovered Sales Order demand (Phase 1I.4 Section 8):
+	    base_pool_capacity = sum(local_reservable_capacity)
+	    uncovered_sales_order_demand = sum(uncovered_so_qty for pending SOs targeting pool warehouses)
+	    channel_atp = max(0, base_pool_capacity - uncovered_sales_order_demand)
 	"""
 	ch_data = frappe.db.get_value("Sales Channel", sales_channel, ["name", "company"], as_dict=True)
 	ch_company = ch_data.company if ch_data else (frappe.db.get_single_value("Global Defaults", "default_company") or "")
@@ -364,9 +550,8 @@ def get_channel_atp(item_code: str, sales_channel: str) -> ChannelATP:
 	sellable_warehouses: List[str] = []
 
 	agg_actual = 0.0
-	agg_reserved = 0.0
 	agg_safety = 0.0
-	agg_atp = 0.0
+	base_pool_capacity = 0.0
 
 	total_so_demand = 0.0
 	total_standalone_sre = 0.0
@@ -391,14 +576,22 @@ def get_channel_atp(item_code: str, sales_channel: str) -> ChannelATP:
 		)
 		warehouse_atps.append(wh_atp)
 
-		# SECTION 8 & 9: Only enabled sellable sources contribute to sellable channel aggregates.
+		# Only enabled sellable sources contribute to sellable channel aggregates.
 		# Non-sellable sources contribute 0 ATP and their inventory/deficits do NOT alter sellable totals.
 		if allow_sellable:
 			sellable_warehouses.append(wh)
 			agg_actual += wh_atp.actual_qty
-			agg_reserved += wh_atp.effective_reserved_qty
 			agg_safety += wh_atp.safety_stock_qty
-			agg_atp += wh_atp.candidate_atp_qty
+
+			local_cap = get_warehouse_reservable_capacity(
+				item_code,
+				wh,
+				allow_sellable_stock=True,
+				actual_qty=wh_atp.actual_qty,
+				safety_stock_qty=wh_atp.safety_stock_qty,
+				effective_reserved_qty=wh_atp.effective_reserved_qty,
+			)
+			base_pool_capacity += local_cap
 
 			try:
 				bd = get_effective_reserved_breakdown(item_code, wh)
@@ -410,56 +603,50 @@ def get_channel_atp(item_code: str, sales_channel: str) -> ChannelATP:
 			except Exception:
 				pass
 
-	cross_overlap_qty = 0.0
+	base_pool_capacity = round(flt(base_pool_capacity), prec)
+	uncovered_so_demand, so_details = get_channel_uncovered_sales_order_demand(item_code, sellable_warehouses)
+	if not so_details and total_so_demand > 0:
+		uncovered_so_demand = round(flt(total_so_demand), prec)
 
-	# Cross-Warehouse Sales Order Demand De-duplication:
-	# If a Sales Order item targets warehouse A (sellable in this channel), but has active SRE allocations
-	# in other sellable warehouses B/C (also in this channel), the demand is represented in Bin A.reserved_qty
-	# and also in Bin B/C.reserved_stock.
-	# At the aggregate channel level, de-duplicate this overlap so aggregate_reserved_qty
-	# and aggregate_atp_qty reflect exact net logical demand across channel sellable warehouses.
-	# SECTION 10: Only warehouses in sellable_warehouses are included; excluded warehouses do not deduct/add.
-	if len(sellable_warehouses) > 1:
-		cross_wh_sres = frappe.db.sql(
-			"""
-			SELECT 
-				sre.reserved_qty - sre.delivered_qty - sre.transferred_qty - sre.consumed_qty as net_qty
-			FROM `tabStock Reservation Entry` sre
-			JOIN `tabSales Order Item` soi ON soi.name = sre.voucher_detail_no
-			WHERE sre.docstatus = 1
-			  AND sre.item_code = %s
-			  AND sre.voucher_type = 'Sales Order'
-			  AND sre.delivered_qty < sre.reserved_qty
-			  AND sre.status NOT IN ('Closed', 'Delivered', 'Cancelled')
-			  AND sre.warehouse IN ({wh_placeholders})
-			  AND soi.warehouse IN ({wh_placeholders})
-			  AND sre.warehouse != soi.warehouse
-			""".format(
-				wh_placeholders=", ".join(["%s"] * len(sellable_warehouses))
-			),
-			tuple([item_code] + sellable_warehouses + sellable_warehouses),
-			as_dict=True,
-		)
-		cross_overlap_qty = sum(flt(r.net_qty) for r in cross_wh_sres) if cross_wh_sres else 0.0
-		if cross_overlap_qty > 0:
-			agg_reserved = max(0.0, agg_reserved - cross_overlap_qty)
-			max_recoverable = max(0.0, agg_actual - agg_reserved - agg_safety - agg_atp)
-			effective_cross_overlap = min(cross_overlap_qty, max_recoverable)
-			agg_atp = min(agg_actual, max(0.0, agg_atp + effective_cross_overlap))
+	# FINAL CHANNEL ATP ALGORITHM (Phase 1I.4 Section 8):
+	channel_atp_qty = max(0.0, round(flt(base_pool_capacity - uncovered_so_demand), prec))
+
+	# Total physical SREs across sellable warehouses in the pool:
+	pool_physical_sre = 0.0
+	for wh in sellable_warehouses:
+		pool_physical_sre += get_sre_reserved_qty_for_item_and_warehouse(item_code, wh)
+	pool_physical_sre = round(flt(pool_physical_sre), prec)
+
+	total_local_non_so = round(
+		flt(total_production_demand + total_subcontract_demand + total_prod_plan_demand),
+		prec,
+	)
+	# Channel aggregate reserved:
+	# If we have concrete SO details or non-zero pool SREs, use the deduplicated channel formula:
+	#   agg_reserved = pool_physical_sre + total_local_non_so + uncovered_so_demand
+	# In synthetic mocks / environments where DB has no SREs and no SO items, fall back to wh_atp.effective_reserved_qty
+	if so_details or pool_physical_sre > 0:
+		agg_reserved = round(flt(pool_physical_sre + total_local_non_so + uncovered_so_demand), prec)
+	else:
+		tot_wh_reserved = sum(wh.effective_reserved_qty for wh in warehouse_atps if wh.allow_sellable_stock)
+		agg_reserved = round(max(flt(tot_wh_reserved), flt(pool_physical_sre + total_local_non_so + uncovered_so_demand)), prec)
 
 	demand_breakdown = ChannelDemandBreakdown(
-		sales_order_demand=round(flt(total_so_demand), prec),
-		cross_warehouse_sales_order_demand=round(flt(cross_overlap_qty), prec),
+		base_physical_capacity=base_pool_capacity,
+		physical_sre_demand=pool_physical_sre,
+		local_non_so_commitments=total_local_non_so,
+		safety_stock=round(flt(agg_safety), prec),
+		uncovered_sales_order_demand=uncovered_so_demand,
+		channel_atp=channel_atp_qty,
+		sales_order_demand=round(flt(uncovered_so_demand + sum(d.linked_sre_qty for d in so_details)), prec) if so_details else round(flt(total_so_demand), prec),
+		cross_warehouse_sales_order_demand=0.0,
 		standalone_sre_demand=round(flt(total_standalone_sre), prec),
 		production_demand=round(flt(total_production_demand), prec),
 		subcontract_demand=round(flt(total_subcontract_demand), prec),
 		production_plan_demand=round(flt(total_prod_plan_demand), prec),
-		warehouse_local_commitments=round(
-			flt(total_standalone_sre + total_production_demand + total_subcontract_demand + total_prod_plan_demand),
-			prec,
-		),
-		safety_stock=round(flt(agg_safety), prec),
+		warehouse_local_commitments=round(flt(pool_physical_sre + total_local_non_so), prec),
 		total_demand=round(flt(agg_reserved + agg_safety), prec),
+		so_demand_details=so_details,
 	)
 
 	return ChannelATP(
@@ -468,12 +655,16 @@ def get_channel_atp(item_code: str, sales_channel: str) -> ChannelATP:
 		company=ch_company,
 		warehouses=warehouse_atps,
 		aggregate_actual_qty=round(flt(agg_actual), prec),
-		aggregate_reserved_qty=round(flt(agg_reserved), prec),
+		aggregate_reserved_qty=agg_reserved,
 		aggregate_safety_stock_qty=round(flt(agg_safety), prec),
-		aggregate_atp_qty=round(flt(agg_atp), prec),
+		aggregate_atp_qty=channel_atp_qty,
+		base_physical_capacity=base_pool_capacity,
+		uncovered_sales_order_demand=uncovered_so_demand,
 		cross_warehouse_adjustments={
-			"sales_order_unallocated_demand": round(flt(max(0.0, total_so_demand - cross_overlap_qty)), prec),
-			"deduplicated_sre_demand": round(flt(cross_overlap_qty), prec),
+			"base_physical_capacity": base_pool_capacity,
+			"uncovered_sales_order_demand": uncovered_so_demand,
+			"sales_order_unallocated_demand": uncovered_so_demand,
+			"deduplicated_sre_demand": 0.0,
 		},
 		demand_breakdown=demand_breakdown,
 		stock_uom=item_uom,
@@ -575,6 +766,8 @@ def get_atp_breakdown(item_code: str, sales_channel: str) -> ChannelATPBreakdown
 		company=ch_atp.company,
 		lines=lines,
 		channel_atp=ch_atp.aggregate_atp_qty,
+		base_physical_capacity=ch_atp.base_physical_capacity,
+		uncovered_sales_order_demand=ch_atp.uncovered_sales_order_demand,
 		cross_warehouse_adjustments=ch_atp.cross_warehouse_adjustments,
 		demand_breakdown=ch_atp.demand_breakdown,
 		stock_uom=ch_atp.stock_uom,

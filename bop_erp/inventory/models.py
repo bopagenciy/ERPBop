@@ -115,9 +115,7 @@ class ChannelATP:
 	Typed Available-To-Promise (ATP) aggregate for an Item across enabled sellable warehouses for a Sales Channel.
 	INFORMATIONAL ONLY: Non-locking point-in-time informational read without holding locks.
 	Formula:
-	    aggregate_atp_qty = sum(warehouse.candidate_atp_qty for warehouse in sellable_warehouses)
-	Avoids cross-warehouse duplicate demand where Sales Orders specify one target warehouse
-	while SRE allocations are fulfilled from other warehouses in the channel.
+	    channel_atp = max(0, base_pool_capacity - uncovered_sales_order_demand)
 	"""
 	item_code: str
 	sales_channel: str
@@ -127,6 +125,8 @@ class ChannelATP:
 	aggregate_reserved_qty: float = 0.0
 	aggregate_safety_stock_qty: float = 0.0
 	aggregate_atp_qty: float = 0.0
+	base_physical_capacity: float = 0.0
+	uncovered_sales_order_demand: float = 0.0
 	cross_warehouse_adjustments: Dict[str, float] = field(default_factory=dict)
 	demand_breakdown: Optional[Any] = None
 	stock_uom: str = "Nos"
@@ -193,12 +193,31 @@ class ATPBreakdownWarehouse:
 	priority: int
 
 
+@dataclass(frozen=True)
+class SalesOrderDemandDetail:
+	"""
+	Audit detail for an individual Sales Order Item demand and linked SREs.
+	"""
+	sales_order: str
+	sales_order_item: str
+	target_warehouse: str
+	pending_qty: float
+	linked_sre_qty: float
+	uncovered_qty: float
+
+
 @dataclass
 class ChannelDemandBreakdown:
 	"""
 	Auditable channel-level model with strict single-ownership demand partitioning.
-	Prevents double-counting and avoids aggregate subtraction of clamped local quantities.
+	Separates physical warehouse capacities from logical uncovered Sales Order demand.
 	"""
+	base_physical_capacity: float = 0.0
+	physical_sre_demand: float = 0.0
+	local_non_so_commitments: float = 0.0
+	safety_stock: float = 0.0
+	uncovered_sales_order_demand: float = 0.0
+	channel_atp: float = 0.0
 	sales_order_demand: float = 0.0
 	cross_warehouse_sales_order_demand: float = 0.0
 	standalone_sre_demand: float = 0.0
@@ -206,8 +225,8 @@ class ChannelDemandBreakdown:
 	subcontract_demand: float = 0.0
 	production_plan_demand: float = 0.0
 	warehouse_local_commitments: float = 0.0
-	safety_stock: float = 0.0
 	total_demand: float = 0.0
+	so_demand_details: List[SalesOrderDemandDetail] = field(default_factory=list)
 	timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -221,6 +240,8 @@ class ChannelATPBreakdown:
 	company: str
 	lines: List[ATPBreakdownWarehouse] = field(default_factory=list)
 	channel_atp: float = 0.0
+	base_physical_capacity: float = 0.0
+	uncovered_sales_order_demand: float = 0.0
 	cross_warehouse_adjustments: Dict[str, float] = field(default_factory=dict)
 	demand_breakdown: Optional[ChannelDemandBreakdown] = None
 	stock_uom: str = "Nos"

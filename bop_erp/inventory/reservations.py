@@ -12,6 +12,7 @@ from bop_erp.inventory.availability import (
 	get_effective_reserved_qty,
 	get_stock_precision,
 	get_warehouse_atp,
+	get_warehouse_reservable_capacity,
 )
 from bop_erp.inventory.exceptions import (
 	InsufficientStockToReserveError,
@@ -455,31 +456,39 @@ def reserve_channel_stock(
 				is_idempotent_replay=True,
 			)
 
-	# 4. In-Transaction ATP Evaluation under lock
-	wh_atp_map = {}
-	total_atp = 0.0
-	for wh in candidate_warehouses:
-		atp = get_warehouse_atp(item_code, wh).candidate_atp_qty
-		wh_atp_map[wh] = atp
-		total_atp += atp
+	# 4. In-Transaction Channel ATP Evaluation under lock
+	ch_atp = get_channel_atp(item_code, sales_channel)
+	total_channel_atp = ch_atp.aggregate_atp_qty
 
-	if requested_qty > total_atp and not allow_partial:
-		raise InsufficientStockToReserveError(
-			_(
-				"All-or-Nothing check failed: Requested {0} units of {1}, but total channel ATP is only {2} across {3} sources."
-			).format(requested_qty, item_code, total_atp, len(candidate_warehouses))
-		)
+	if requested_qty > total_channel_atp:
+		if not allow_partial:
+			raise InsufficientStockToReserveError(
+				_(
+					"All-or-Nothing check failed: Requested {0} units of {1}, but total channel ATP is only {2} across {3} sources."
+				).format(requested_qty, item_code, total_channel_atp, len(candidate_warehouses))
+			)
+		alloc_limit = total_channel_atp
+		if alloc_limit <= 0:
+			raise InsufficientStockToReserveError(
+				_("No stock available to reserve for {0} in sales channel {1}.").format(
+					item_code, sales_channel
+				)
+			)
+	else:
+		alloc_limit = requested_qty
 
 	# 5. Sequential Priority Allocation with Savepoint Protection
 	sp_name = f"sp_chan_res_{frappe.generate_hash(length=8)}"
 	frappe.db.savepoint(sp_name)
 	try:
-		remaining_demand = requested_qty
+		remaining_demand = alloc_limit
 		allocations: List[ReservationAllocation] = []
 
 		for s in sources:
 			wh = s.warehouse
-			avail = wh_atp_map.get(wh, 0.0)
+			cap = get_warehouse_reservable_capacity(item_code, wh, allow_sellable_stock=True)
+			wh_atp = get_warehouse_atp(item_code, wh).candidate_atp_qty
+			avail = min(cap, wh_atp)
 			if avail <= 0:
 				continue
 

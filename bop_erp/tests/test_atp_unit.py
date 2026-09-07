@@ -15,6 +15,7 @@ from bop_erp.inventory.availability import (
 	get_warehouse_atp,
 )
 from bop_erp.inventory.models import (
+	ChannelATP,
 	ChannelDemandBreakdown,
 	EffectiveReservedBreakdown,
 	WarehouseATP,
@@ -919,5 +920,524 @@ class TestATPUnit(unittest.TestCase):
 			self.assertEqual(bd.demand_breakdown.safety_stock, 10.0)
 			self.assertIn("sales_order_unallocated_demand", bd.cross_warehouse_adjustments)
 			self.assertIn("deduplicated_sre_demand", bd.cross_warehouse_adjustments)
+
+	def test_24_critical_counterexample_uncovered_so_demand_must_not_return_six(self):
+		"""
+		CRITICAL COUNTEREXAMPLE (PHASE 1I.4 SECTION 1):
+		Sales Order pending qty = 10
+		Sales Order target warehouse = A
+		Warehouse A: actual = 0
+		Warehouse B: actual = 10
+		SRE linked to same Sales Order Item: warehouse B, remaining reserved qty = 4
+		Both A and B are eligible sellable channel sources.
+
+		Expected:
+		physical reservable capacity after SRE in B = 6
+		uncovered SO demand = 6
+		channel ATP = 0
+
+		The current Phase 1I.3 algorithm must NOT return 6.
+		"""
+		with patch("frappe.db.get_value") as mock_get_value, \
+			 patch("frappe.get_all") as mock_get_all, \
+			 patch("frappe.db.sql") as mock_sql, \
+			 patch("bop_erp.inventory.availability.get_warehouse_atp") as mock_wh_atp, \
+			 patch("bop_erp.inventory.availability.get_effective_reserved_breakdown") as mock_breakdown, \
+			 patch("bop_erp.inventory.availability.get_sre_reserved_qty_for_item_and_warehouse") as mock_sre:
+
+			mock_sre.side_effect = lambda ic, wh: 4.0 if wh == "Warehouse B" else 0.0
+			mock_get_all.return_value = [
+				{"warehouse": "Warehouse A", "priority": 10, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+				{"warehouse": "Warehouse B", "priority": 20, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+			]
+			mock_breakdown.return_value = EffectiveReservedBreakdown(
+				item_code="BOLT-001", warehouse="WH", sales_order_demand=0.0,
+				standalone_sre_demand=0.0, production_demand=0.0, subcontract_demand=0.0,
+				production_plan_demand=0.0, total_effective_reserved=0.0, native_reserved_stock=0.0,
+			)
+			def wh_mock(*a, **kw):
+				wh = kw.get("warehouse") or (a[1] if len(a) > 1 else (a[0] if a else "Warehouse A"))
+				ic = kw.get("item_code") or (a[0] if a else "BOLT-001")
+				return WarehouseATP(
+					item_code=ic, warehouse=wh, company="Industrial DP",
+					actual_qty=0.0 if wh == "Warehouse A" else 10.0,
+					native_reserved_qty=0.0 if wh == "Warehouse A" else 4.0,
+					effective_reserved_qty=0.0 if wh == "Warehouse A" else 4.0,
+					safety_stock_qty=0.0, candidate_atp_qty=0.0 if wh == "Warehouse A" else 6.0,
+					stock_uom="Nos",
+				)
+			mock_wh_atp.side_effect = wh_mock
+
+			def sql_side_effect(query, values=None, *args, **kwargs):
+				q_str = str(query)
+				if "tabSales Order Item" in q_str:
+					return [frappe._dict({
+						"sales_order": "SO-001",
+						"sales_order_item": "SOI-001",
+						"target_warehouse": "Warehouse A",
+						"stock_qty": 10.0,
+						"qty": 10.0,
+						"delivered_qty": 0.0,
+					})]
+				if "GROUP BY sre.voucher_detail_no" in q_str:
+					return [frappe._dict({"voucher_detail_no": "SOI-001", "linked_sre_qty": 4.0})]
+				if "GROUP BY voucher_type" in q_str:
+					if values and len(values) > 1 and values[1] == "Warehouse B":
+						return [frappe._dict({"voucher_type": "Sales Order", "net_qty": 4.0})]
+					return []
+				if "SUM(reserved_qty" in q_str:
+					if values and len(values) > 1 and values[1] == "Warehouse B":
+						return [(4.0,)]
+					return [(0.0,)]
+				return []
+
+			mock_sql.side_effect = sql_side_effect
+
+			def get_value_side_effect(doctype, filters, fieldname=None, *args, **kwargs):
+				if doctype == "Sales Channel":
+					return frappe._dict({"name": "TID", "company": "Industrial DP"})
+				if doctype == "Item":
+					return "Nos"
+				if doctype == "Bin":
+					wh = filters.get("warehouse") if isinstance(filters, dict) else None
+					if fieldname == "actual_qty":
+						return 10.0 if wh == "Warehouse B" else 0.0
+					if isinstance(fieldname, list):
+						return frappe._dict({"reserved_qty_for_production": 0.0, "reserved_qty_for_sub_contract": 0.0, "reserved_qty_for_production_plan": 0.0})
+				return None
+
+			mock_get_value.side_effect = get_value_side_effect
+
+			ch_atp = get_channel_atp("BOLT-001", "TID")
+			# Under Phase 1I.4:
+			# Warehouse B physical capacity = 10 - 4 = 6.0
+			# Uncovered SO demand = 10 - 4 = 6.0
+			# Channel ATP = max(0, 6.0 - 6.0) = 0.0!
+			self.assertEqual(ch_atp.base_physical_capacity, 6.0)
+			self.assertEqual(ch_atp.uncovered_sales_order_demand, 6.0)
+			self.assertEqual(ch_atp.aggregate_atp_qty, 0.0, "Channel ATP must be 0.0, but Phase 1I.3 returned 6.0!")
+
+	def test_25_so10_sre4_uncovered_six(self):
+		"""
+		SO pending = 10, SRE in pool = 4.
+		Physical capacity deducts 4, uncovered logical demand = 6, total demand = 10.
+		"""
+		with patch("frappe.db.get_value") as mock_get_value, \
+			 patch("frappe.get_all") as mock_get_all, \
+			 patch("frappe.db.sql") as mock_sql, \
+			 patch("bop_erp.inventory.availability.get_warehouse_atp") as mock_wh_atp, \
+			 patch("bop_erp.inventory.availability.get_effective_reserved_breakdown") as mock_breakdown, \
+			 patch("bop_erp.inventory.availability.get_sre_reserved_qty_for_item_and_warehouse") as mock_sre:
+
+			mock_sre.side_effect = lambda ic, wh: 4.0 if wh == "Warehouse B" else 0.0
+			mock_get_all.return_value = [
+				{"warehouse": "Warehouse A", "priority": 10, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+				{"warehouse": "Warehouse B", "priority": 20, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+			]
+			mock_breakdown.return_value = EffectiveReservedBreakdown(
+				item_code="BOLT-001", warehouse="WH", sales_order_demand=0.0,
+				standalone_sre_demand=0.0, production_demand=0.0, subcontract_demand=0.0,
+				production_plan_demand=0.0, total_effective_reserved=0.0, native_reserved_stock=0.0,
+			)
+			mock_wh_atp.side_effect = lambda item_code, warehouse, **kw: WarehouseATP(
+				item_code=item_code, warehouse=warehouse, company="Industrial DP",
+				actual_qty=10.0, native_reserved_qty=0.0 if warehouse == "Warehouse A" else 4.0,
+				effective_reserved_qty=0.0 if warehouse == "Warehouse A" else 4.0,
+				safety_stock_qty=0.0, candidate_atp_qty=10.0 if warehouse == "Warehouse A" else 6.0,
+				stock_uom="Nos",
+			)
+
+			def sql_side_effect(query, values=None, *args, **kwargs):
+				q_str = str(query)
+				if "tabSales Order Item" in q_str:
+					return [frappe._dict({
+						"sales_order": "SO-001", "sales_order_item": "SOI-001",
+						"target_warehouse": "Warehouse A", "stock_qty": 10.0, "qty": 10.0, "delivered_qty": 0.0,
+					})]
+				if "GROUP BY sre.voucher_detail_no" in q_str:
+					return [frappe._dict({"voucher_detail_no": "SOI-001", "linked_sre_qty": 4.0})]
+				if "SUM(reserved_qty" in q_str:
+					if values and len(values) > 1 and values[1] == "Warehouse B":
+						return [(4.0,)]
+					return [(0.0,)]
+				return []
+
+			mock_sql.side_effect = sql_side_effect
+			mock_get_value.side_effect = lambda dt, flt, fn=None, *args, **kwargs: (
+				frappe._dict({"name": "TID", "company": "Industrial DP"}) if dt == "Sales Channel"
+				else ("Nos" if dt == "Item" else None)
+			)
+
+			ch_atp = get_channel_atp("BOLT-001", "TID")
+			# A capacity = 10, B capacity = 6 => Base pool = 16.
+			# Uncovered SO demand = 10 - 4 = 6.
+			# Channel ATP = 16 - 6 = 10.0.
+			self.assertEqual(ch_atp.base_physical_capacity, 16.0)
+			self.assertEqual(ch_atp.uncovered_sales_order_demand, 6.0)
+			self.assertEqual(ch_atp.aggregate_atp_qty, 10.0)
+
+	def test_26_so10_sre10_uncovered_zero(self):
+		"""
+		Fully reserved SO: SO pending = 10, SRE = 10 => uncovered = 0.
+		Physical capacity accounts for all 10 SRE units.
+		"""
+		with patch("frappe.db.get_value") as mock_get_value, \
+			 patch("frappe.get_all") as mock_get_all, \
+			 patch("frappe.db.sql") as mock_sql, \
+			 patch("bop_erp.inventory.availability.get_warehouse_atp") as mock_wh_atp, \
+			 patch("bop_erp.inventory.availability.get_effective_reserved_breakdown") as mock_breakdown, \
+			 patch("bop_erp.inventory.availability.get_sre_reserved_qty_for_item_and_warehouse") as mock_sre:
+
+			mock_sre.side_effect = lambda ic, wh: 10.0 if wh == "Warehouse B" else 0.0
+			mock_get_all.return_value = [
+				{"warehouse": "Warehouse A", "priority": 10, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+				{"warehouse": "Warehouse B", "priority": 20, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+			]
+			mock_breakdown.return_value = EffectiveReservedBreakdown(
+				item_code="BOLT-001", warehouse="WH", sales_order_demand=0.0,
+				standalone_sre_demand=0.0, production_demand=0.0, subcontract_demand=0.0,
+				production_plan_demand=0.0, total_effective_reserved=0.0, native_reserved_stock=0.0,
+			)
+			mock_wh_atp.side_effect = lambda item_code, warehouse, **kw: WarehouseATP(
+				item_code=item_code, warehouse=warehouse, company="Industrial DP",
+				actual_qty=0.0 if warehouse == "Warehouse A" else 15.0,
+				native_reserved_qty=0.0 if warehouse == "Warehouse A" else 10.0,
+				effective_reserved_qty=0.0 if warehouse == "Warehouse A" else 10.0,
+				safety_stock_qty=0.0, candidate_atp_qty=0.0 if warehouse == "Warehouse A" else 5.0,
+				stock_uom="Nos",
+			)
+
+			def sql_side_effect(query, values=None, *args, **kwargs):
+				q_str = str(query)
+				if "tabSales Order Item" in q_str:
+					return [frappe._dict({
+						"sales_order": "SO-001", "sales_order_item": "SOI-001",
+						"target_warehouse": "Warehouse A", "stock_qty": 10.0, "qty": 10.0, "delivered_qty": 0.0,
+					})]
+				if "GROUP BY sre.voucher_detail_no" in q_str:
+					return [frappe._dict({"voucher_detail_no": "SOI-001", "linked_sre_qty": 10.0})]
+				if "SUM(reserved_qty" in q_str:
+					if values and len(values) > 1 and values[1] == "Warehouse B":
+						return [(10.0,)]
+					return [(0.0,)]
+				return []
+
+			mock_sql.side_effect = sql_side_effect
+			mock_get_value.side_effect = lambda dt, flt, fn=None, *args, **kwargs: (
+				frappe._dict({"name": "TID", "company": "Industrial DP"}) if dt == "Sales Channel"
+				else ("Nos" if dt == "Item" else None)
+			)
+
+			ch_atp = get_channel_atp("BOLT-001", "TID")
+			# B capacity = 15 - 10 = 5. Uncovered SO = 10 - 10 = 0. Channel ATP = 5.
+			self.assertEqual(ch_atp.base_physical_capacity, 5.0)
+			self.assertEqual(ch_atp.uncovered_sales_order_demand, 0.0)
+			self.assertEqual(ch_atp.aggregate_atp_qty, 5.0)
+
+	def test_27_so10_sre4_and_3_uncovered_three(self):
+		"""
+		Partial multi-warehouse SRE: SO pending = 10, target A.
+		SRE B = 4, SRE C = 3 => Uncovered = 3.
+		"""
+		with patch("frappe.db.get_value") as mock_get_value, \
+			 patch("frappe.get_all") as mock_get_all, \
+			 patch("frappe.db.sql") as mock_sql, \
+			 patch("bop_erp.inventory.availability.get_warehouse_atp") as mock_wh_atp, \
+			 patch("bop_erp.inventory.availability.get_effective_reserved_breakdown") as mock_breakdown, \
+			 patch("bop_erp.inventory.availability.get_sre_reserved_qty_for_item_and_warehouse") as mock_sre:
+
+			mock_sre.side_effect = lambda ic, wh: 4.0 if wh == "Warehouse B" else (3.0 if wh == "Warehouse C" else 0.0)
+			mock_get_all.return_value = [
+				{"warehouse": "Warehouse A", "priority": 10, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+				{"warehouse": "Warehouse B", "priority": 20, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+				{"warehouse": "Warehouse C", "priority": 30, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+			]
+			mock_breakdown.return_value = EffectiveReservedBreakdown(
+				item_code="BOLT-001", warehouse="WH", sales_order_demand=0.0,
+				standalone_sre_demand=0.0, production_demand=0.0, subcontract_demand=0.0,
+				production_plan_demand=0.0, total_effective_reserved=0.0, native_reserved_stock=0.0,
+			)
+
+			def wh_mock(item_code, warehouse, **kw):
+				actual = 0.0 if warehouse == "Warehouse A" else 10.0
+				res = 4.0 if warehouse == "Warehouse B" else (3.0 if warehouse == "Warehouse C" else 0.0)
+				return WarehouseATP(
+					item_code=item_code, warehouse=warehouse, company="Industrial DP",
+					actual_qty=actual, native_reserved_qty=res, effective_reserved_qty=res,
+					safety_stock_qty=0.0, candidate_atp_qty=max(0.0, actual - res),
+					stock_uom="Nos",
+				)
+			mock_wh_atp.side_effect = wh_mock
+
+			def sql_side_effect(query, values=None, *args, **kwargs):
+				q_str = str(query)
+				if "tabSales Order Item" in q_str:
+					return [frappe._dict({
+						"sales_order": "SO-001", "sales_order_item": "SOI-001",
+						"target_warehouse": "Warehouse A", "stock_qty": 10.0, "qty": 10.0, "delivered_qty": 0.0,
+					})]
+				if "GROUP BY sre.voucher_detail_no" in q_str:
+					return [frappe._dict({"voucher_detail_no": "SOI-001", "linked_sre_qty": 7.0})]
+				if "SUM(reserved_qty" in q_str:
+					if values and len(values) > 1:
+						if values[1] == "Warehouse B":
+							return [(4.0,)]
+						if values[1] == "Warehouse C":
+							return [(3.0,)]
+					return [(0.0,)]
+				return []
+
+			mock_sql.side_effect = sql_side_effect
+			mock_get_value.side_effect = lambda dt, flt, fn=None, *args, **kwargs: (
+				frappe._dict({"name": "TID", "company": "Industrial DP"}) if dt == "Sales Channel"
+				else ("Nos" if dt == "Item" else None)
+			)
+
+			ch_atp = get_channel_atp("BOLT-001", "TID")
+			# B cap = 6, C cap = 7 => Base pool = 13.
+			# Linked SRE = 7. Uncovered SO = 10 - 7 = 3.
+			# Channel ATP = 13 - 3 = 10.0.
+			self.assertEqual(ch_atp.base_physical_capacity, 13.0)
+			self.assertEqual(ch_atp.uncovered_sales_order_demand, 3.0)
+			self.assertEqual(ch_atp.aggregate_atp_qty, 10.0)
+
+	def test_28_sre_outside_pool_reduces_uncovered_demand(self):
+		"""
+		SO target A in channel pool, pending 10.
+		SRE in outside warehouse X = 4.
+		Uncovered demand burden on pool = 10 - 4 = 6.
+		Warehouse X capacity is NOT added to pool.
+		"""
+		with patch("frappe.db.get_value") as mock_get_value, \
+			 patch("frappe.get_all") as mock_get_all, \
+			 patch("frappe.db.sql") as mock_sql, \
+			 patch("bop_erp.inventory.availability.get_warehouse_atp") as mock_wh_atp, \
+			 patch("bop_erp.inventory.availability.get_effective_reserved_breakdown") as mock_breakdown, \
+			 patch("bop_erp.inventory.availability.get_sre_reserved_qty_for_item_and_warehouse") as mock_sre:
+
+			mock_sre.return_value = 0.0
+			mock_get_all.return_value = [
+				{"warehouse": "Warehouse A", "priority": 10, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+			]
+			mock_breakdown.return_value = EffectiveReservedBreakdown(
+				item_code="BOLT-001", warehouse="Warehouse A", sales_order_demand=0.0,
+				standalone_sre_demand=0.0, production_demand=0.0, subcontract_demand=0.0,
+				production_plan_demand=0.0, total_effective_reserved=0.0, native_reserved_stock=0.0,
+			)
+			mock_wh_atp.return_value = WarehouseATP(
+				item_code="BOLT-001", warehouse="Warehouse A", company="Industrial DP",
+				actual_qty=10.0, native_reserved_qty=0.0, effective_reserved_qty=0.0,
+				safety_stock_qty=0.0, candidate_atp_qty=10.0, stock_uom="Nos",
+			)
+
+			def sql_side_effect(query, values=None, *args, **kwargs):
+				q_str = str(query)
+				if "tabSales Order Item" in q_str:
+					return [frappe._dict({
+						"sales_order": "SO-001", "sales_order_item": "SOI-001",
+						"target_warehouse": "Warehouse A", "stock_qty": 10.0, "qty": 10.0, "delivered_qty": 0.0,
+					})]
+				if "GROUP BY sre.voucher_detail_no" in q_str:
+					# Linked SRE in outside warehouse X = 4
+					return [frappe._dict({"voucher_detail_no": "SOI-001", "linked_sre_qty": 4.0})]
+				return []
+
+			mock_sql.side_effect = sql_side_effect
+			mock_get_value.side_effect = lambda dt, flt, fn=None, *args, **kwargs: (
+				frappe._dict({"name": "TID", "company": "Industrial DP"}) if dt == "Sales Channel"
+				else ("Nos" if dt == "Item" else None)
+			)
+
+			ch_atp = get_channel_atp("BOLT-001", "TID")
+			# A capacity = 10. Uncovered burden = 10 - 4 = 6.
+			# Channel ATP = 10 - 6 = 4.0.
+			self.assertEqual(ch_atp.base_physical_capacity, 10.0)
+			self.assertEqual(ch_atp.uncovered_sales_order_demand, 6.0)
+			self.assertEqual(ch_atp.aggregate_atp_qty, 4.0)
+
+	def test_29_target_outside_pool_does_not_impose_uncovered_demand(self):
+		"""
+		SO target X outside pool, pending 10.
+		SRE in eligible warehouse B = 4.
+		B physical capacity loses 4. Unreserved demand on X does NOT consume channel pool.
+		Channel ATP = 6.0.
+		"""
+		with patch("frappe.db.get_value") as mock_get_value, \
+			 patch("frappe.get_all") as mock_get_all, \
+			 patch("frappe.db.sql") as mock_sql, \
+			 patch("bop_erp.inventory.availability.get_warehouse_atp") as mock_wh_atp, \
+			 patch("bop_erp.inventory.availability.get_effective_reserved_breakdown") as mock_breakdown, \
+			 patch("bop_erp.inventory.availability.get_sre_reserved_qty_for_item_and_warehouse") as mock_sre:
+
+			mock_sre.return_value = 4.0
+			mock_get_all.return_value = [
+				{"warehouse": "Warehouse B", "priority": 10, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+			]
+			mock_breakdown.return_value = EffectiveReservedBreakdown(
+				item_code="BOLT-001", warehouse="Warehouse B", sales_order_demand=0.0,
+				standalone_sre_demand=0.0, production_demand=0.0, subcontract_demand=0.0,
+				production_plan_demand=0.0, total_effective_reserved=0.0, native_reserved_stock=0.0,
+			)
+			mock_wh_atp.return_value = WarehouseATP(
+				item_code="BOLT-001", warehouse="Warehouse B", company="Industrial DP",
+				actual_qty=10.0, native_reserved_qty=4.0, effective_reserved_qty=4.0,
+				safety_stock_qty=0.0, candidate_atp_qty=6.0, stock_uom="Nos",
+			)
+
+			def sql_side_effect(query, values=None, *args, **kwargs):
+				q_str = str(query)
+				if "tabSales Order Item" in q_str:
+					# Target warehouse X is not in sellable_warehouses (Warehouse B)
+					return []
+				if "SUM(reserved_qty" in q_str:
+					return [(4.0,)]
+				return []
+
+			mock_sql.side_effect = sql_side_effect
+			mock_get_value.side_effect = lambda dt, flt, fn=None, *args, **kwargs: (
+				frappe._dict({"name": "TID", "company": "Industrial DP"}) if dt == "Sales Channel"
+				else ("Nos" if dt == "Item" else None)
+			)
+
+			ch_atp = get_channel_atp("BOLT-001", "TID")
+			# B capacity = 6. Uncovered SO demand = 0. Channel ATP = 6.0.
+			self.assertEqual(ch_atp.base_physical_capacity, 6.0)
+			self.assertEqual(ch_atp.uncovered_sales_order_demand, 0.0)
+			self.assertEqual(ch_atp.aggregate_atp_qty, 6.0)
+
+	def test_30_linked_sre_greater_than_pending_clamps_to_zero(self):
+		"""
+		Inconsistent/transitional state: linked active SRE = 12 > pending SO = 10.
+		Uncovered demand must clamp to 0.0 without creating negative demand or phantom credit.
+		"""
+		with patch("frappe.db.get_value") as mock_get_value, \
+			 patch("frappe.get_all") as mock_get_all, \
+			 patch("frappe.db.sql") as mock_sql, \
+			 patch("bop_erp.inventory.availability.get_warehouse_atp") as mock_wh_atp, \
+			 patch("bop_erp.inventory.availability.get_effective_reserved_breakdown") as mock_breakdown, \
+			 patch("bop_erp.inventory.availability.get_sre_reserved_qty_for_item_and_warehouse") as mock_sre:
+
+			mock_sre.return_value = 0.0
+			mock_get_all.return_value = [
+				{"warehouse": "Warehouse A", "priority": 10, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+			]
+			mock_breakdown.return_value = EffectiveReservedBreakdown(
+				item_code="BOLT-001", warehouse="Warehouse A", sales_order_demand=0.0,
+				standalone_sre_demand=0.0, production_demand=0.0, subcontract_demand=0.0,
+				production_plan_demand=0.0, total_effective_reserved=0.0, native_reserved_stock=0.0,
+			)
+			mock_wh_atp.return_value = WarehouseATP(
+				item_code="BOLT-001", warehouse="Warehouse A", company="Industrial DP",
+				actual_qty=10.0, native_reserved_qty=0.0, effective_reserved_qty=0.0,
+				safety_stock_qty=0.0, candidate_atp_qty=10.0, stock_uom="Nos",
+			)
+
+			def sql_side_effect(query, values=None, *args, **kwargs):
+				q_str = str(query)
+				if "tabSales Order Item" in q_str:
+					return [frappe._dict({
+						"sales_order": "SO-001", "sales_order_item": "SOI-001",
+						"target_warehouse": "Warehouse A", "stock_qty": 10.0, "qty": 10.0, "delivered_qty": 0.0,
+					})]
+				if "GROUP BY sre.voucher_detail_no" in q_str:
+					return [frappe._dict({"voucher_detail_no": "SOI-001", "linked_sre_qty": 12.0})]
+				return []
+
+			mock_sql.side_effect = sql_side_effect
+			mock_get_value.side_effect = lambda dt, flt, fn=None, *args, **kwargs: (
+				frappe._dict({"name": "TID", "company": "Industrial DP"}) if dt == "Sales Channel"
+				else ("Nos" if dt == "Item" else None)
+			)
+
+			ch_atp = get_channel_atp("BOLT-001", "TID")
+			# Clamps to 0.0
+			self.assertEqual(ch_atp.uncovered_sales_order_demand, 0.0)
+			self.assertEqual(ch_atp.aggregate_atp_qty, 10.0)
+
+	def test_31_product_bundle_atp_with_uncovered_demand(self):
+		"""
+		Product bundle with Component 1 (req 2) and Component 2 (req 1).
+		Comp 1 ATP = 10, Comp 2 ATP = 3 (due to uncovered demand).
+		Bundle ATP = min(10//2, 3//1) = min(5, 3) = 3.0.
+		"""
+		with patch("frappe.db.get_value") as mock_get_value, \
+			 patch("frappe.get_all") as mock_get_all, \
+			 patch("bop_erp.inventory.availability.get_channel_atp") as mock_chan_atp:
+
+			mock_get_value.return_value = frappe._dict({"name": "BUNDLE-01"})
+			mock_get_all.return_value = [
+				{"item_code": "COMP-01", "qty": 2.0},
+				{"item_code": "COMP-02", "qty": 1.0},
+			]
+
+			def atp_mock(item_code, sales_channel):
+				if item_code == "COMP-01":
+					return ChannelATP(
+						item_code="COMP-01", sales_channel="TID", company="Industrial DP",
+						aggregate_atp_qty=10.0,
+					)
+				return ChannelATP(
+					item_code="COMP-02", sales_channel="TID", company="Industrial DP",
+					aggregate_atp_qty=3.0,
+				)
+
+			mock_chan_atp.side_effect = atp_mock
+			bundle_atp = get_product_bundle_atp("BUNDLE-01", sales_channel="TID")
+			self.assertEqual(bundle_atp, 3.0)
+
+	def test_32_fractional_precision_uncovered_demand(self):
+		"""
+		Verifies fractional precision handling:
+		SO pending = 10.5, linked SRE = 3.25 => uncovered = 7.25.
+		Actual = 15.0, physical SRE = 3.25 => physical capacity = 11.75.
+		Channel ATP = 11.75 - 7.25 = 4.5.
+		"""
+		with patch("frappe.db.get_value") as mock_get_value, \
+			 patch("frappe.get_all") as mock_get_all, \
+			 patch("frappe.db.sql") as mock_sql, \
+			 patch("bop_erp.inventory.availability.get_warehouse_atp") as mock_wh_atp, \
+			 patch("bop_erp.inventory.availability.get_effective_reserved_breakdown") as mock_breakdown, \
+			 patch("bop_erp.inventory.availability.get_sre_reserved_qty_for_item_and_warehouse") as mock_sre:
+
+			mock_sre.return_value = 3.25
+			mock_get_all.return_value = [
+				{"warehouse": "Warehouse A", "priority": 10, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+			]
+			mock_breakdown.return_value = EffectiveReservedBreakdown(
+				item_code="BOLT-001", warehouse="Warehouse A", sales_order_demand=0.0,
+				standalone_sre_demand=0.0, production_demand=0.0, subcontract_demand=0.0,
+				production_plan_demand=0.0, total_effective_reserved=0.0, native_reserved_stock=0.0,
+			)
+			mock_wh_atp.return_value = WarehouseATP(
+				item_code="BOLT-001", warehouse="Warehouse A", company="Industrial DP",
+				actual_qty=15.0, native_reserved_qty=3.25, effective_reserved_qty=3.25,
+				safety_stock_qty=0.0, candidate_atp_qty=11.75, stock_uom="Nos",
+			)
+
+			def sql_side_effect(query, values=None, *args, **kwargs):
+				q_str = str(query)
+				if "tabSales Order Item" in q_str:
+					return [frappe._dict({
+						"sales_order": "SO-001", "sales_order_item": "SOI-001",
+						"target_warehouse": "Warehouse A", "stock_qty": 10.5, "qty": 10.5, "delivered_qty": 0.0,
+					})]
+				if "GROUP BY sre.voucher_detail_no" in q_str:
+					return [frappe._dict({"voucher_detail_no": "SOI-001", "linked_sre_qty": 3.25})]
+				if "SUM(reserved_qty" in q_str:
+					return [(3.25,)]
+				return []
+
+			mock_sql.side_effect = sql_side_effect
+			mock_get_value.side_effect = lambda dt, flt, fn=None, *args, **kwargs: (
+				frappe._dict({"name": "TID", "company": "Industrial DP"}) if dt == "Sales Channel"
+				else ("Nos" if dt == "Item" else None)
+			)
+
+			ch_atp = get_channel_atp("BOLT-001", "TID")
+			self.assertEqual(ch_atp.base_physical_capacity, 11.75)
+			self.assertEqual(ch_atp.uncovered_sales_order_demand, 7.25)
+			self.assertEqual(ch_atp.aggregate_atp_qty, 4.5)
+
+
 
 
