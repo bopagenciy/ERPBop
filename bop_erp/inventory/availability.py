@@ -14,7 +14,11 @@ from bop_erp.inventory.models import (
 	ATPBreakdownWarehouse,
 	ChannelATP,
 	ChannelATPBreakdown,
+	EffectiveReservedBreakdown,
 	WarehouseATP,
+)
+from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
+	get_sre_reserved_qty_for_item_and_warehouse,
 )
 
 
@@ -92,77 +96,178 @@ def get_safety_stock(warehouse: str, item_code: Optional[str] = None) -> float:
 	return 0.0
 
 
-def get_effective_reserved_qty(item_code: str, warehouse: str) -> float:
+def get_effective_reserved_breakdown(item_code: str, warehouse: str) -> EffectiveReservedBreakdown:
 	"""
-	Authoritatively derives effective reserved quantity for an item and warehouse.
-	Prevents double-counting by strictly partitioning reservations:
-	1. Active native Stock Reservation Entries (net of deliveries/transfers/consumption).
-	2. Unreserved Sales Order demand: max(0, Bin.reserved_qty - SRE_for_Sales_Orders).
-	   Since Bin.reserved_qty includes all open Sales Orders, subtracting SREs tied
-	   to Sales Orders guarantees that Sales Orders with active SREs are NOT counted twice.
-	3. Manufacturing & subcontract allocations tracked in Bin:
-	   (reserved_qty_for_production + reserved_qty_for_sub_contract + reserved_qty_for_production_plan).
+	Computes an auditable, mutually exclusive breakdown of effective reserved demand
+	for an item in a specific warehouse, mirroring native ERPNext v16.32.3 semantics.
 
-	Formula:
-	    effective_reserved_qty = net_sre_reserved + unreserved_so_qty + mfg_reserved
+	Buckets:
+	1. sales_order_demand:
+	   max(Bin.reserved_qty, SREs tied to Sales Orders for this warehouse)
+	2. standalone_sre_demand:
+	   Active SREs not tied to Sales Orders, Work Orders, Production Plans, or Subcontracting Orders.
+	3. production_demand:
+	   Bin.reserved_qty_for_production
+	4. subcontract_demand:
+	   Bin.reserved_qty_for_sub_contract
+	5. production_plan_demand:
+	   Bin.reserved_qty_for_production_plan
+
+	Their sum equals total_effective_reserved.
+	Also exposes native_reserved_stock (Bin.reserved_stock) for diagnostics/consistency checking.
 	"""
-	# 1. Active native Stock Reservation Entries (overall net)
-	net_sre_res = frappe.db.sql(
+	prec = get_stock_precision("Bin", "reserved_stock")
+
+	# 1. Native active SRE total for item and warehouse via ERPNext v16.32.3 helper
+	try:
+		native_sre_total = flt(get_sre_reserved_qty_for_item_and_warehouse(item_code, warehouse), prec)
+	except Exception:
+		# Fallback if QB context unavailable
+		sre_res = frappe.db.sql(
+			"""
+			SELECT SUM(reserved_qty - delivered_qty - transferred_qty - consumed_qty)
+			FROM `tabStock Reservation Entry`
+			WHERE docstatus = 1
+			  AND item_code = %s
+			  AND warehouse = %s
+			  AND delivered_qty < reserved_qty
+			  AND status NOT IN ('Closed', 'Delivered', 'Cancelled')
+			""",
+			(item_code, warehouse),
+		)
+		native_sre_total = flt(sre_res[0][0], prec) if sre_res and sre_res[0][0] is not None else 0.0
+
+	# 2. SRE breakdown by voucher_type and voucher_no
+	sre_voucher_rows = frappe.db.sql(
 		"""
-		SELECT SUM(reserved_qty - delivered_qty - transferred_qty - consumed_qty)
+		SELECT 
+			COALESCE(voucher_type, '') as voucher_type,
+			COALESCE(voucher_no, '') as voucher_no,
+			SUM(reserved_qty - delivered_qty - transferred_qty - consumed_qty) as net_qty
 		FROM `tabStock Reservation Entry`
 		WHERE docstatus = 1
 		  AND item_code = %s
 		  AND warehouse = %s
 		  AND delivered_qty < reserved_qty
 		  AND status NOT IN ('Closed', 'Delivered', 'Cancelled')
+		GROUP BY voucher_type, voucher_no
 		""",
 		(item_code, warehouse),
+		as_dict=True,
 	)
-	net_sre_reserved = flt(net_sre_res[0][0]) if net_sre_res and net_sre_res[0][0] is not None else 0.0
+	sre_for_so = 0.0
+	sre_for_wo = 0.0
+	sre_for_pp = 0.0
+	sre_for_sco = 0.0
+	standalone_sre_demand = 0.0
 
-	# 2. SO-specific active native SREs to prevent double-counting with Bin.reserved_qty
-	so_sre_res = frappe.db.sql(
-		"""
-		SELECT SUM(reserved_qty - delivered_qty - transferred_qty - consumed_qty)
-		FROM `tabStock Reservation Entry`
-		WHERE docstatus = 1
-		  AND item_code = %s
-		  AND warehouse = %s
-		  AND voucher_type = 'Sales Order'
-		  AND delivered_qty < reserved_qty
-		  AND status NOT IN ('Closed', 'Delivered', 'Cancelled')
-		""",
-		(item_code, warehouse),
-	)
-	sre_for_so = flt(so_sre_res[0][0]) if so_sre_res and so_sre_res[0][0] is not None else 0.0
+	known_demand_vouchers = {
+		"Sales Order",
+		"Work Order",
+		"Production Plan",
+		"Subcontracting Order",
+		"Subcontracting Inward Order",
+	}
 
-	# 3. Native Bin reservations (Sales Orders and Manufacturing)
+	if sre_voucher_rows:
+		for row in sre_voucher_rows:
+			if isinstance(row, dict):
+				vtype = row.get("voucher_type") or ""
+				vno = row.get("voucher_no") or ""
+				nqty = flt(row.get("net_qty"), prec)
+			elif isinstance(row, (list, tuple)):
+				vtype = row[0] if len(row) > 0 and row[0] else ""
+				vno = row[1] if len(row) > 1 and isinstance(row[1], str) else ""
+				nqty = flt(row[-1], prec) if len(row) > 1 else 0.0
+			else:
+				vtype = getattr(row, "voucher_type", "")
+				vno = getattr(row, "voucher_no", "")
+				nqty = flt(getattr(row, "net_qty", 0.0), prec)
+
+			# SREs with synthetic RES- voucher numbers or without native demand voucher
+			# represent standalone channel/Bop reservations.
+			if str(vno).startswith("RES-") or not vtype or vtype not in known_demand_vouchers:
+				standalone_sre_demand += nqty
+			elif vtype == "Sales Order":
+				sre_for_so += nqty
+			elif vtype == "Work Order":
+				sre_for_wo += nqty
+			elif vtype == "Production Plan":
+				sre_for_pp += nqty
+			elif vtype in ("Subcontracting Order", "Subcontracting Inward Order"):
+				sre_for_sco += nqty
+			else:
+				standalone_sre_demand += nqty
+
+	standalone_sre_demand = flt(standalone_sre_demand, prec)
+	sre_for_so = flt(sre_for_so, prec)
+	sre_for_wo = flt(sre_for_wo, prec)
+	sre_for_pp = flt(sre_for_pp, prec)
+	sre_for_sco = flt(sre_for_sco, prec)
+
+	# 3. Native Bin quantities
 	bin_data = frappe.db.get_value(
 		"Bin",
 		{"item_code": item_code, "warehouse": warehouse},
 		[
 			"reserved_qty",
+			"reserved_stock",
 			"reserved_qty_for_production",
 			"reserved_qty_for_sub_contract",
 			"reserved_qty_for_production_plan",
 		],
 		as_dict=True,
 	)
-	mfg_reserved = 0.0
-	unreserved_so_qty = 0.0
-	if bin_data:
-		mfg_reserved = (
-			flt(bin_data.reserved_qty_for_production)
-			+ flt(bin_data.reserved_qty_for_sub_contract)
-			+ flt(bin_data.reserved_qty_for_production_plan)
-		)
-		# Bin.reserved_qty tracks all open Sales Orders.
-		# Net out SREs already tied to Sales Orders to eliminate double-counting.
-		unreserved_so_qty = max(0.0, flt(bin_data.reserved_qty) - sre_for_so)
 
-	prec = get_stock_precision("Bin", "reserved_stock")
-	return flt(net_sre_reserved + unreserved_so_qty + mfg_reserved, prec)
+	bin_reserved_qty = flt(bin_data.reserved_qty, prec) if bin_data else 0.0
+	bin_reserved_stock = flt(bin_data.reserved_stock, prec) if bin_data else 0.0
+	bin_production_qty = flt(bin_data.reserved_qty_for_production, prec) if bin_data else 0.0
+	bin_subcontract_qty = flt(bin_data.reserved_qty_for_sub_contract, prec) if bin_data else 0.0
+	bin_pp_qty = flt(bin_data.reserved_qty_for_production_plan, prec) if bin_data else 0.0
+
+	# Reconcile native Bin demands with active SREs tied to those vouchers without double counting:
+	sales_order_demand = flt(max(bin_reserved_qty, sre_for_so), prec)
+	production_demand = flt(max(bin_production_qty, sre_for_wo), prec)
+	subcontract_demand = flt(max(bin_subcontract_qty, sre_for_sco), prec)
+	production_plan_demand = flt(max(bin_pp_qty, sre_for_pp), prec)
+
+	total_effective = flt(
+		sales_order_demand
+		+ standalone_sre_demand
+		+ production_demand
+		+ subcontract_demand
+		+ production_plan_demand,
+		prec,
+	)
+
+	return EffectiveReservedBreakdown(
+		item_code=item_code,
+		warehouse=warehouse,
+		sales_order_demand=sales_order_demand,
+		standalone_sre_demand=standalone_sre_demand,
+		production_demand=production_demand,
+		subcontract_demand=subcontract_demand,
+		production_plan_demand=production_plan_demand,
+		total_effective_reserved=total_effective,
+		native_reserved_stock=bin_reserved_stock,
+	)
+
+
+def get_effective_reserved_qty(item_code: str, warehouse: str) -> float:
+	"""
+	Authoritatively derives effective reserved quantity for an item and warehouse.
+	Prevents double-counting by strictly partitioning reservations:
+	1. sales_order_demand: max(Bin.reserved_qty, SREs tied to Sales Orders)
+	2. standalone_sre_demand: SREs not tied to native demand buckets
+	3. production_demand: Bin.reserved_qty_for_production
+	4. subcontract_demand: Bin.reserved_qty_for_sub_contract
+	5. production_plan_demand: Bin.reserved_qty_for_production_plan
+
+	Formula:
+	    effective_reserved_qty = sales_order_demand + standalone_sre_demand + production_demand + subcontract_demand + production_plan_demand
+	"""
+	breakdown = get_effective_reserved_breakdown(item_code, warehouse)
+	return breakdown.total_effective_reserved
 
 
 def get_warehouse_atp(
@@ -192,19 +297,23 @@ def get_warehouse_atp(
 	)
 	actual_qty = round(flt(bin_actual), prec) if bin_actual is not None else 0.0
 
-	sre_reserved = frappe.qb.DocType("Stock Reservation Entry")
-	sre_res = (
-		frappe.qb.from_(sre_reserved)
-		.select(Sum(sre_reserved.reserved_qty - sre_reserved.delivered_qty - sre_reserved.transferred_qty - sre_reserved.consumed_qty))
-		.where(
-			(sre_reserved.docstatus == 1)
-			& (sre_reserved.item_code == item_code)
-			& (sre_reserved.warehouse == warehouse)
-			& (sre_reserved.delivered_qty < sre_reserved.reserved_qty)
-			& (sre_reserved.status.notin(["Closed", "Delivered", "Cancelled"]))
+	try:
+		sre_res = get_sre_reserved_qty_for_item_and_warehouse(item_code, warehouse)
+	except Exception:
+		sre_res = frappe.db.sql(
+			"""
+			SELECT SUM(reserved_qty - delivered_qty - transferred_qty - consumed_qty)
+			FROM `tabStock Reservation Entry`
+			WHERE docstatus = 1
+			  AND item_code = %s
+			  AND warehouse = %s
+			  AND delivered_qty < reserved_qty
+			  AND status NOT IN ('Closed', 'Delivered', 'Cancelled')
+			""",
+			(item_code, warehouse),
 		)
-	).run()[0][0]
-	native_reserved_qty = round(flt(sre_res), prec) if sre_res is not None else 0.0
+		sre_res = flt(sre_res[0][0]) if sre_res and sre_res[0][0] is not None else 0.0
+	native_reserved_qty = round(flt(sre_res), prec)
 
 	effective_reserved_qty = round(flt(get_effective_reserved_qty(item_code, warehouse)), prec)
 	safety_stock_qty = round(flt(get_safety_stock(warehouse, item_code)), prec)
@@ -279,6 +388,39 @@ def get_channel_atp(item_code: str, sales_channel: str) -> ChannelATP:
 		agg_safety += wh_atp.safety_stock_qty
 		if wh_atp.allow_sellable_stock:
 			agg_atp += wh_atp.candidate_atp_qty
+
+	# Cross-Warehouse Sales Order Demand De-duplication:
+	# If a Sales Order item targets warehouse A (in this channel), but has active SRE allocations
+	# in other warehouses B/C (also in this channel), the demand is represented in Bin A.reserved_qty
+	# and also in Bin B/C.reserved_stock.
+	# At the aggregate channel level, de-duplicate this overlap so aggregate_reserved_qty
+	# and aggregate_atp_qty reflect exact net logical demand across channel warehouses.
+	if len(seen_warehouses) > 1:
+		wh_list = list(seen_warehouses)
+		cross_wh_sres = frappe.db.sql(
+			"""
+			SELECT 
+				sre.reserved_qty - sre.delivered_qty - sre.transferred_qty - sre.consumed_qty as net_qty
+			FROM `tabStock Reservation Entry` sre
+			JOIN `tabSales Order Item` soi ON soi.name = sre.voucher_detail_no
+			WHERE sre.docstatus = 1
+			  AND sre.item_code = %s
+			  AND sre.voucher_type = 'Sales Order'
+			  AND sre.delivered_qty < sre.reserved_qty
+			  AND sre.status NOT IN ('Closed', 'Delivered', 'Cancelled')
+			  AND sre.warehouse IN ({wh_placeholders})
+			  AND soi.warehouse IN ({wh_placeholders})
+			  AND sre.warehouse != soi.warehouse
+			""".format(
+				wh_placeholders=", ".join(["%s"] * len(wh_list))
+			),
+			tuple([item_code] + wh_list + wh_list),
+			as_dict=True,
+		)
+		cross_overlap_qty = sum(flt(r.net_qty) for r in cross_wh_sres)
+		if cross_overlap_qty > 0:
+			agg_reserved = max(0.0, agg_reserved - cross_overlap_qty)
+			agg_atp = min(agg_actual, max(0.0, agg_atp + cross_overlap_qty))
 
 	return ChannelATP(
 		item_code=item_code,

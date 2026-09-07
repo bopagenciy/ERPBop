@@ -68,10 +68,29 @@ class InventoryComparisonResult:
 
 
 @dataclass
+class EffectiveReservedBreakdown:
+	"""
+	Auditable breakdown of effective reserved demand components for an item in a warehouse.
+	All demand components are mutually exclusive and partition all native ERPNext reservation sources.
+	Their sum equals total_effective_reserved.
+	"""
+	item_code: str
+	warehouse: str
+	sales_order_demand: float = 0.0
+	standalone_sre_demand: float = 0.0
+	production_demand: float = 0.0
+	subcontract_demand: float = 0.0
+	production_plan_demand: float = 0.0
+	total_effective_reserved: float = 0.0
+	native_reserved_stock: float = 0.0
+	timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+@dataclass
 class WarehouseATP:
 	"""
 	Typed Available-To-Promise (ATP) snapshot for an Item in a specific Warehouse.
-	INFORMATIONAL ONLY: Point-in-time calculation without concurrency locks.
+	INFORMATIONAL ONLY: Non-locking point-in-time informational read without holding locks.
 	Formula:
 	    candidate_atp_qty = max(0, actual_qty - effective_reserved_qty - safety_stock_qty)
 	Only sellable warehouses contribute positive ATP.
@@ -94,9 +113,11 @@ class WarehouseATP:
 class ChannelATP:
 	"""
 	Typed Available-To-Promise (ATP) aggregate for an Item across enabled sellable warehouses for a Sales Channel.
-	INFORMATIONAL ONLY: Point-in-time calculation without concurrency locks.
+	INFORMATIONAL ONLY: Non-locking point-in-time informational read without holding locks.
 	Formula:
 	    aggregate_atp_qty = sum(warehouse.candidate_atp_qty for warehouse in sellable_warehouses)
+	Avoids cross-warehouse duplicate demand where Sales Orders specify one target warehouse
+	while SRE allocations are fulfilled from other warehouses in the channel.
 	"""
 	item_code: str
 	sales_channel: str

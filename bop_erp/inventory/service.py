@@ -9,6 +9,7 @@ from frappe.utils import flt
 from bop_erp.inventory.availability import (
 	get_atp_breakdown,
 	get_channel_atp,
+	get_effective_reserved_breakdown,
 	get_effective_reserved_qty,
 	get_product_bundle_atp,
 	get_safety_stock,
@@ -19,6 +20,7 @@ from bop_erp.inventory.models import (
 	ChannelATP,
 	ChannelATPBreakdown,
 	ChannelInventorySnapshot,
+	EffectiveReservedBreakdown,
 	InventoryComparisonResult,
 	ReservationResult,
 	ReservationSnapshot,
@@ -191,6 +193,11 @@ class InventoryService:
 	def get_effective_reserved_qty(item_code: str, warehouse: str) -> float:
 		"""Calculates net effective reserved quantity without double-counting."""
 		return get_effective_reserved_qty(item_code, warehouse)
+
+	@staticmethod
+	def get_effective_reserved_breakdown(item_code: str, warehouse: str) -> EffectiveReservedBreakdown:
+		"""Returns auditable breakdown of effective reserved demand components."""
+		return get_effective_reserved_breakdown(item_code, warehouse)
 
 	@staticmethod
 	def get_warehouse_atp(

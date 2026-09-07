@@ -432,12 +432,15 @@ class TestATPUnit(unittest.TestCase):
 		"""
 		# Case 2 simulation: SO=10, SRE=10 for SO -> must equal 10 (NOT 20!)
 		def fake_sql_c2(query, values=None, as_list=0, *args, **kwargs):
+			if "GROUP BY voucher_type" in query:
+				return [{"voucher_type": "Sales Order", "net_qty": 10.0}]
 			return [[10.0]]
 
 		def fake_get_value_c2(doctype, filters, fieldname=None, *args, **kwargs):
 			if doctype == "Bin":
 				return frappe._dict({
 					"reserved_qty": 10.0,
+					"reserved_stock": 10.0,
 					"reserved_qty_for_production": 0.0,
 					"reserved_qty_for_sub_contract": 0.0,
 					"reserved_qty_for_production_plan": 0.0,
@@ -450,14 +453,17 @@ class TestATPUnit(unittest.TestCase):
 			res = get_effective_reserved_qty("BOLT-001", "Miami Main")
 			self.assertEqual(res, 10.0)
 
-		# Case 3 simulation: SO=10, SRE=4 for SO -> 4 SRE + 6 unreserved SO = 10
+		# Case 3 simulation: SO=10, SRE=4 for SO -> max(10, 4) = 10
 		def fake_sql_c3(query, values=None, as_list=0, *args, **kwargs):
+			if "GROUP BY voucher_type" in query:
+				return [{"voucher_type": "Sales Order", "net_qty": 4.0}]
 			return [[4.0]]
 
 		def fake_get_value_c3(doctype, filters, fieldname=None, *args, **kwargs):
 			if doctype == "Bin":
 				return frappe._dict({
 					"reserved_qty": 10.0,
+					"reserved_stock": 4.0,
 					"reserved_qty_for_production": 0.0,
 					"reserved_qty_for_sub_contract": 0.0,
 					"reserved_qty_for_production_plan": 0.0,
@@ -472,12 +478,13 @@ class TestATPUnit(unittest.TestCase):
 
 		# Case 5 simulation: SO=0, SRE=0, manufacturing=10 -> 10
 		def fake_sql_c5(query, values=None, as_list=0, *args, **kwargs):
-			return [[0.0]]
+			return []
 
 		def fake_get_value_c5(doctype, filters, fieldname=None, *args, **kwargs):
 			if doctype == "Bin":
 				return frappe._dict({
 					"reserved_qty": 0.0,
+					"reserved_stock": 0.0,
 					"reserved_qty_for_production": 5.0,
 					"reserved_qty_for_sub_contract": 3.0,
 					"reserved_qty_for_production_plan": 2.0,

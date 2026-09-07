@@ -10,6 +10,7 @@ from frappe.utils import flt
 from bop_erp.inventory.availability import (
 	get_atp_breakdown,
 	get_channel_atp,
+	get_effective_reserved_breakdown,
 	get_effective_reserved_qty,
 	get_product_bundle_atp,
 	get_safety_stock,
@@ -311,6 +312,10 @@ class TestReservationsATPLive(unittest.TestCase):
 		reco.insert(ignore_permissions=True)
 		reco.submit()
 		return reco.name
+
+	def _setup_stock(self, warehouse, qty, valuation_rate=10.0):
+		"""Convenience helper to set stock for default self.item_code."""
+		return self._set_physical_stock(self.item_code, warehouse, qty, valuation_rate=valuation_rate)
 
 	def _set_serialized_stock(self, item_code, warehouse, serial_nos, valuation_rate=10.0):
 		"""Helper to adjust physical stock for serialized items."""
@@ -1193,6 +1198,492 @@ class TestReservationsATPLive(unittest.TestCase):
 			self._cleanup_stock([reco_ser, reco_bat])
 			frappe.db.set_single_value("Stock Settings", "auto_reserve_serial_and_batch", orig_auto_res)
 			frappe.db.commit()
+
+	def test_16_native_sre_remaining_qty_formula_and_bin_consistency(self):
+		"""
+		VERIFIES ERPNext v16.32.3 NATIVE SRE REMAINING-QTY SEMANTICS AND BIN CONSISTENCY:
+		1. Net SRE remaining quantity formula:
+		   reserved_qty - delivered_qty - transferred_qty - consumed_qty.
+		2. Verified that native helper get_sre_reserved_qty_for_item_and_warehouse
+		   equals Bin.reserved_stock after native SRE lifecycle events.
+		"""
+		from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
+			get_sre_reserved_qty_for_item_and_warehouse,
+		)
+		reco = self._setup_stock(self.wh_miami, 50.0)
+		sre_name = None
+		try:
+			res = reserve_stock(
+				item_code=self.item_code,
+				warehouse=self.wh_miami,
+				requested_qty=20.0,
+				idempotency_key="TEST-16-NATIVE-SRE",
+			)
+			self.assertTrue(res.success)
+			sre_name = res.allocations[0].stock_reservation_entry
+
+			# Check native SRE helper and Bin.reserved_stock consistency
+			helper_qty = get_sre_reserved_qty_for_item_and_warehouse(self.item_code, self.wh_miami)
+			bin_res_stock = frappe.db.get_value("Bin", {"item_code": self.item_code, "warehouse": self.wh_miami}, "reserved_stock")
+			self.assertEqual(flt(helper_qty), 20.0)
+			self.assertEqual(flt(bin_res_stock), 20.0)
+			self.assertEqual(flt(helper_qty), flt(bin_res_stock))
+
+			# Simulate native transfer (transferred_qty = 5.0)
+			frappe.db.set_value("Stock Reservation Entry", sre_name, "transferred_qty", 5.0)
+			sre_doc = frappe.get_doc("Stock Reservation Entry", sre_name)
+			sre_doc.update_status()
+			sre_doc.update_reserved_stock_in_bin()
+
+			helper_qty_trans = get_sre_reserved_qty_for_item_and_warehouse(self.item_code, self.wh_miami)
+			bin_res_stock_trans = frappe.db.get_value("Bin", {"item_code": self.item_code, "warehouse": self.wh_miami}, "reserved_stock")
+			self.assertEqual(flt(helper_qty_trans), 15.0)
+			self.assertEqual(flt(bin_res_stock_trans), 15.0)
+			self.assertEqual(flt(helper_qty_trans), flt(bin_res_stock_trans))
+
+			# Simulate consumption (consumed_qty = 3.0)
+			frappe.db.set_value("Stock Reservation Entry", sre_name, "consumed_qty", 3.0)
+			sre_doc.reload()
+			sre_doc.update_status()
+			sre_doc.update_reserved_stock_in_bin()
+
+			helper_qty_cons = get_sre_reserved_qty_for_item_and_warehouse(self.item_code, self.wh_miami)
+			bin_res_stock_cons = frappe.db.get_value("Bin", {"item_code": self.item_code, "warehouse": self.wh_miami}, "reserved_stock")
+			self.assertEqual(flt(helper_qty_cons), 12.0)
+			self.assertEqual(flt(bin_res_stock_cons), 12.0)
+			self.assertEqual(flt(helper_qty_cons), flt(bin_res_stock_cons))
+
+			# Effective reserved breakdown reflects 12.0
+			bd = get_effective_reserved_breakdown(self.item_code, self.wh_miami)
+			self.assertEqual(bd.standalone_sre_demand, 12.0)
+			self.assertEqual(bd.total_effective_reserved, 12.0)
+			self.assertEqual(bd.native_reserved_stock, 12.0)
+
+		finally:
+			if sre_name:
+				try:
+					release_stock_reservation(sre_name)
+					frappe.delete_doc("Stock Reservation Entry", sre_name, force=True, ignore_permissions=True)
+				except Exception:
+					pass
+			self._cleanup_stock([reco])
+
+	def test_17_standalone_sre_reduces_atp_once(self):
+		"""
+		VERIFIES STANDALONE SRE (Bop / Channel Reservation):
+		Actual = 20, standalone SRE = 5, other demand = 0 => effective_reserved = 5, ATP = 15.
+		"""
+		reco = self._setup_stock(self.wh_miami, 20.0)
+		sre_name = None
+		try:
+			res = reserve_stock(
+				item_code=self.item_code,
+				warehouse=self.wh_miami,
+				requested_qty=5.0,
+				idempotency_key="TEST-17-STANDALONE",
+			)
+			self.assertTrue(res.success)
+			sre_name = res.allocations[0].stock_reservation_entry
+
+			bd = get_effective_reserved_breakdown(self.item_code, self.wh_miami)
+			self.assertEqual(bd.standalone_sre_demand, 5.0)
+			self.assertEqual(bd.sales_order_demand, 0.0)
+			self.assertEqual(bd.production_demand, 0.0)
+			self.assertEqual(bd.total_effective_reserved, 5.0)
+
+			atp = get_warehouse_atp(self.item_code, self.wh_miami)
+			self.assertEqual(atp.actual_qty, 20.0)
+			self.assertEqual(atp.effective_reserved_qty, 5.0)
+			self.assertEqual(atp.candidate_atp_qty, 15.0)
+
+		finally:
+			if sre_name:
+				try:
+					release_stock_reservation(sre_name)
+					frappe.delete_doc("Stock Reservation Entry", sre_name, force=True, ignore_permissions=True)
+				except Exception:
+					pass
+			self._cleanup_stock([reco])
+
+	def test_18_work_order_and_manufacturing_overlap_no_double_count(self):
+		"""
+		VERIFIES MANUFACTURING DEMAND OVERLAP PREVENTION:
+		Work Order: native production reservation = 10, SRE against same Work Order demand = 10.
+		Effective reserved must represent 10 demand, NOT 20.
+		"""
+		reco = self._setup_stock(self.wh_miami, 50.0)
+		sre_name = None
+		try:
+			# Set native Bin.reserved_qty_for_production = 10.0
+			frappe.db.set_value("Bin", {"item_code": self.item_code, "warehouse": self.wh_miami}, "reserved_qty_for_production", 10.0)
+
+			# Create SRE tied to voucher_type='Work Order' for 10.0
+			res = reserve_stock(
+				item_code=self.item_code,
+				warehouse=self.wh_miami,
+				requested_qty=10.0,
+				voucher_type="Work Order",
+				voucher_no="WO-SYNTHETIC-001",
+				voucher_detail_no="WO-ITEM-001",
+				idempotency_key="TEST-18-WO-SRE",
+			)
+			self.assertTrue(res.success)
+			sre_name = res.allocations[0].stock_reservation_entry
+
+			bd = get_effective_reserved_breakdown(self.item_code, self.wh_miami)
+			self.assertEqual(bd.production_demand, 10.0)
+			self.assertEqual(bd.standalone_sre_demand, 0.0)  # Tied to Work Order, not counted as standalone
+			self.assertEqual(bd.sales_order_demand, 0.0)
+			self.assertEqual(bd.total_effective_reserved, 10.0)  # NOT 20!
+
+			atp = get_warehouse_atp(self.item_code, self.wh_miami)
+			self.assertEqual(atp.effective_reserved_qty, 10.0)
+			self.assertEqual(atp.candidate_atp_qty, 40.0)
+
+		finally:
+			if sre_name:
+				try:
+					release_stock_reservation(sre_name)
+					frappe.delete_doc("Stock Reservation Entry", sre_name, force=True, ignore_permissions=True)
+				except Exception:
+					pass
+			# Reset bin field
+			frappe.db.set_value("Bin", {"item_code": self.item_code, "warehouse": self.wh_miami}, "reserved_qty_for_production", 0.0)
+			self._cleanup_stock([reco])
+
+	def test_19_production_plan_overlap_no_double_count(self):
+		"""
+		VERIFIES PRODUCTION PLAN DEMAND OVERLAP PREVENTION:
+		Native production plan reservation = 10, SRE against same underlying demand = 10.
+		No double count: total effective reserved = 10.0.
+		"""
+		reco = self._setup_stock(self.wh_miami, 50.0)
+		sre_name = None
+		try:
+			frappe.db.set_value("Bin", {"item_code": self.item_code, "warehouse": self.wh_miami}, "reserved_qty_for_production_plan", 10.0)
+
+			res = reserve_stock(
+				item_code=self.item_code,
+				warehouse=self.wh_miami,
+				requested_qty=10.0,
+				voucher_type="Production Plan",
+				voucher_no="PP-SYNTHETIC-001",
+				voucher_detail_no="PP-ITEM-001",
+				idempotency_key="TEST-19-PP-SRE",
+			)
+			self.assertTrue(res.success)
+			sre_name = res.allocations[0].stock_reservation_entry
+
+			bd = get_effective_reserved_breakdown(self.item_code, self.wh_miami)
+			self.assertEqual(bd.production_plan_demand, 10.0)
+			self.assertEqual(bd.standalone_sre_demand, 0.0)
+			self.assertEqual(bd.total_effective_reserved, 10.0)  # NOT 20!
+
+			atp = get_warehouse_atp(self.item_code, self.wh_miami)
+			self.assertEqual(atp.effective_reserved_qty, 10.0)
+			self.assertEqual(atp.candidate_atp_qty, 40.0)
+
+		finally:
+			if sre_name:
+				try:
+					release_stock_reservation(sre_name)
+					frappe.delete_doc("Stock Reservation Entry", sre_name, force=True, ignore_permissions=True)
+				except Exception:
+					pass
+			frappe.db.set_value("Bin", {"item_code": self.item_code, "warehouse": self.wh_miami}, "reserved_qty_for_production_plan", 0.0)
+			self._cleanup_stock([reco])
+
+	def test_20_subcontract_overlap_no_double_count(self):
+		"""
+		VERIFIES SUBCONTRACTING DEMAND OVERLAP PREVENTION:
+		Native subcontract reservation = 10, SRE against same demand = 10.
+		No double count: total effective reserved = 10.0.
+		"""
+		reco = self._setup_stock(self.wh_miami, 50.0)
+		sre_name = None
+		try:
+			frappe.db.set_value("Bin", {"item_code": self.item_code, "warehouse": self.wh_miami}, "reserved_qty_for_sub_contract", 10.0)
+
+			res = reserve_stock(
+				item_code=self.item_code,
+				warehouse=self.wh_miami,
+				requested_qty=10.0,
+				voucher_type="Subcontracting Order",
+				voucher_no="SCO-SYNTHETIC-001",
+				voucher_detail_no="SCO-ITEM-001",
+				idempotency_key="TEST-20-SCO-SRE",
+			)
+			self.assertTrue(res.success)
+			sre_name = res.allocations[0].stock_reservation_entry
+
+			bd = get_effective_reserved_breakdown(self.item_code, self.wh_miami)
+			self.assertEqual(bd.subcontract_demand, 10.0)
+			self.assertEqual(bd.standalone_sre_demand, 0.0)
+			self.assertEqual(bd.total_effective_reserved, 10.0)  # NOT 20!
+
+			atp = get_warehouse_atp(self.item_code, self.wh_miami)
+			self.assertEqual(atp.effective_reserved_qty, 10.0)
+			self.assertEqual(atp.candidate_atp_qty, 40.0)
+
+		finally:
+			if sre_name:
+				try:
+					release_stock_reservation(sre_name)
+					frappe.delete_doc("Stock Reservation Entry", sre_name, force=True, ignore_permissions=True)
+				except Exception:
+					pass
+			frappe.db.set_value("Bin", {"item_code": self.item_code, "warehouse": self.wh_miami}, "reserved_qty_for_sub_contract", 0.0)
+			self._cleanup_stock([reco])
+
+	def test_21_cross_warehouse_so_and_sre_channel_deduplication(self):
+		"""
+		VERIFIES SALES ORDER CROSS-WAREHOUSE SEMANTICS:
+		Sales Order target warehouse = Warehouse Miami (demand = 10.0).
+		Stock Reservation Entry for that SO item allocated at Warehouse Orlando (qty = 4.0).
+		Across channel warehouses Miami + Orlando:
+		The same Sales Order demand MUST NOT reduce channel ATP twice!
+		Demand must total exactly 10.0 (not 14.0).
+		"""
+		reco_m = self._setup_stock(self.wh_miami, 20.0)
+		reco_o = self._setup_stock(self.wh_orlando, 20.0)
+		so = None
+		sre = None
+		try:
+			cust = frappe.db.get_value("Customer", {"disabled": 0}, "name")
+			if not cust:
+				cust = frappe.get_doc({"doctype": "Customer", "customer_name": "Test Cust Cross"}).insert(ignore_permissions=True).name
+
+			so = frappe.get_doc({
+				"doctype": "Sales Order",
+				"company": self.company,
+				"customer": cust,
+				"delivery_date": frappe.utils.nowdate(),
+				"items": [
+					{
+						"item_code": self.item_code,
+						"warehouse": self.wh_miami,
+						"qty": 10.0,
+						"rate": 25.0,
+					}
+				],
+			}).insert(ignore_permissions=True)
+			so.submit()
+
+			# Create SRE for 4.0 against SO item, allocated at Orlando
+			sre = frappe.get_doc({
+				"doctype": "Stock Reservation Entry",
+				"item_code": self.item_code,
+				"warehouse": self.wh_orlando,
+				"voucher_type": "Sales Order",
+				"voucher_no": so.name,
+				"voucher_detail_no": so.items[0].name,
+				"voucher_qty": 10.0,
+				"available_qty": 20.0,
+				"reserved_qty": 4.0,
+				"company": self.company,
+				"stock_uom": "Nos",
+			}).insert(ignore_permissions=True)
+			sre.submit()
+
+			# Local Warehouse ATP:
+			# Miami: Actual 20.0, Reserved 10.0 (SO) => ATP 10.0
+			atp_m = get_warehouse_atp(self.item_code, self.wh_miami)
+			self.assertEqual(atp_m.actual_qty, 20.0)
+			self.assertEqual(atp_m.effective_reserved_qty, 10.0)
+			self.assertEqual(atp_m.candidate_atp_qty, 10.0)
+
+			# Orlando: Actual 20.0, Reserved 4.0 (SRE) => ATP 16.0
+			atp_o = get_warehouse_atp(self.item_code, self.wh_orlando)
+			self.assertEqual(atp_o.actual_qty, 20.0)
+			self.assertEqual(atp_o.effective_reserved_qty, 4.0)
+			self.assertEqual(atp_o.candidate_atp_qty, 16.0)
+
+			# Channel ATP across Miami + Orlando:
+			# Total Actual = 40.0. Total logical demand = 10.0 (4 at Orlando + 6 unreserved at Miami).
+			# Without deduplication, naive sum is 10 + 4 = 14.
+			# With deduplication, channel aggregate reserved = 10.0, channel ATP = 30.0!
+			ch_atp = get_channel_atp(self.item_code, self.channel)
+			self.assertEqual(ch_atp.aggregate_actual_qty, 40.0)
+			self.assertEqual(ch_atp.aggregate_reserved_qty, 10.0)
+			self.assertEqual(ch_atp.aggregate_atp_qty, 30.0)
+
+		finally:
+			if sre:
+				try:
+					sre.reload()
+					sre.cancel()
+					frappe.delete_doc("Stock Reservation Entry", sre.name, force=True, ignore_permissions=True)
+				except Exception:
+					pass
+			if so:
+				try:
+					so.reload()
+					so.cancel()
+					frappe.delete_doc("Sales Order", so.name, force=True, ignore_permissions=True)
+				except Exception:
+					pass
+			self._cleanup_stock([reco_m, reco_o])
+
+	def test_22_partial_cross_warehouse_multi_warehouse_so_reservation(self):
+		"""
+		VERIFIES PARTIAL MULTI-ALLOCATION SALES ORDER RESERVATIONS:
+		Sales Order demand = 10.0 at Warehouse Miami.
+		SRE allocations: Orlando = 4.0, Miami = 3.0.
+		Remaining unreserved SO demand = 3.0 at Miami.
+		Across channel warehouses Miami + Orlando:
+		Total logical demand must total exactly 10.0, not 17.0.
+		"""
+		reco_m = self._setup_stock(self.wh_miami, 20.0)
+		reco_o = self._setup_stock(self.wh_orlando, 20.0)
+		so = None
+		sre_o = None
+		sre_m = None
+		try:
+			cust = frappe.db.get_value("Customer", {"disabled": 0}, "name")
+			if not cust:
+				cust = frappe.get_doc({"doctype": "Customer", "customer_name": "Test Cust MultiCross"}).insert(ignore_permissions=True).name
+
+			so = frappe.get_doc({
+				"doctype": "Sales Order",
+				"company": self.company,
+				"customer": cust,
+				"delivery_date": frappe.utils.nowdate(),
+				"items": [
+					{
+						"item_code": self.item_code,
+						"warehouse": self.wh_miami,
+						"qty": 10.0,
+						"rate": 25.0,
+					}
+				],
+			}).insert(ignore_permissions=True)
+			so.submit()
+
+			# SRE 1 at Orlando (4.0)
+			sre_o = frappe.get_doc({
+				"doctype": "Stock Reservation Entry",
+				"item_code": self.item_code,
+				"warehouse": self.wh_orlando,
+				"voucher_type": "Sales Order",
+				"voucher_no": so.name,
+				"voucher_detail_no": so.items[0].name,
+				"voucher_qty": 10.0,
+				"available_qty": 20.0,
+				"reserved_qty": 4.0,
+				"company": self.company,
+				"stock_uom": "Nos",
+			}).insert(ignore_permissions=True)
+			sre_o.submit()
+
+			# SRE 2 at Miami (3.0)
+			sre_m = frappe.get_doc({
+				"doctype": "Stock Reservation Entry",
+				"item_code": self.item_code,
+				"warehouse": self.wh_miami,
+				"voucher_type": "Sales Order",
+				"voucher_no": so.name,
+				"voucher_detail_no": so.items[0].name,
+				"voucher_qty": 10.0,
+				"available_qty": 20.0,
+				"reserved_qty": 3.0,
+				"company": self.company,
+				"stock_uom": "Nos",
+			}).insert(ignore_permissions=True)
+			sre_m.submit()
+
+			# Across channel warehouses (Miami, Orlando both in channel):
+			# Total actual = 40.0. Total logical reserved = 10.0.
+			# Aggregate ATP = 30.0.
+			ch_atp = get_channel_atp(self.item_code, self.channel)
+			self.assertEqual(ch_atp.aggregate_actual_qty, 40.0)
+			self.assertEqual(ch_atp.aggregate_reserved_qty, 10.0)
+			self.assertEqual(ch_atp.aggregate_atp_qty, 30.0)
+
+		finally:
+			if sre_o:
+				try:
+					sre_o.reload()
+					sre_o.cancel()
+					frappe.delete_doc("Stock Reservation Entry", sre_o.name, force=True, ignore_permissions=True)
+				except Exception:
+					pass
+			if sre_m:
+				try:
+					sre_m.reload()
+					sre_m.cancel()
+					frappe.delete_doc("Stock Reservation Entry", sre_m.name, force=True, ignore_permissions=True)
+				except Exception:
+					pass
+			if so:
+				try:
+					so.reload()
+					so.cancel()
+					frappe.delete_doc("Sales Order", so.name, force=True, ignore_permissions=True)
+				except Exception:
+					pass
+			self._cleanup_stock([reco_m, reco_o])
+
+	def test_23_partially_used_transferred_consumed_and_closed_states(self):
+		"""
+		VERIFIES SRE PARTIALLY USED, TRANSFERRED, CONSUMED, AND CLOSED STATUS LIFECYCLE:
+		1. reserved_qty = 10, transferred_qty = 4 => status='Partially Used', remaining = 6.
+		2. transferred_qty = 10 => status='Closed', remaining = 0.
+		3. Delivered / Cancelled states excluded completely.
+		"""
+		from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
+			get_sre_reserved_qty_for_item_and_warehouse,
+		)
+		reco = self._setup_stock(self.wh_miami, 50.0)
+		sre_name = None
+		try:
+			res = reserve_stock(
+				item_code=self.item_code,
+				warehouse=self.wh_miami,
+				requested_qty=10.0,
+				idempotency_key="TEST-23-STATUS-CYCLE",
+			)
+			self.assertTrue(res.success)
+			sre_name = res.allocations[0].stock_reservation_entry
+
+			sre_doc = frappe.get_doc("Stock Reservation Entry", sre_name)
+			self.assertEqual(sre_doc.status, "Reserved")
+
+			# Step 1: Set transferred_qty = 4.0
+			frappe.db.set_value("Stock Reservation Entry", sre_name, "transferred_qty", 4.0)
+			sre_doc.reload()
+			sre_doc.update_status()
+			sre_doc.update_reserved_stock_in_bin()
+			sre_doc.reload()
+			self.assertEqual(sre_doc.status, "Partially Used")
+
+			helper_qty = get_sre_reserved_qty_for_item_and_warehouse(self.item_code, self.wh_miami)
+			self.assertEqual(helper_qty, 6.0)
+			atp = get_warehouse_atp(self.item_code, self.wh_miami)
+			self.assertEqual(atp.effective_reserved_qty, 6.0)
+			self.assertEqual(atp.candidate_atp_qty, 44.0)
+
+			# Step 2: Set transferred_qty = 10.0
+			frappe.db.set_value("Stock Reservation Entry", sre_name, "transferred_qty", 10.0)
+			sre_doc.reload()
+			sre_doc.update_status()
+			sre_doc.update_reserved_stock_in_bin()
+			sre_doc.reload()
+			self.assertEqual(sre_doc.status, "Closed")
+
+			helper_closed = get_sre_reserved_qty_for_item_and_warehouse(self.item_code, self.wh_miami)
+			self.assertEqual(helper_closed, 0.0)
+			atp_closed = get_warehouse_atp(self.item_code, self.wh_miami)
+			self.assertEqual(atp_closed.effective_reserved_qty, 0.0)
+			self.assertEqual(atp_closed.candidate_atp_qty, 50.0)
+
+		finally:
+			if sre_name:
+				try:
+					release_stock_reservation(sre_name)
+					frappe.delete_doc("Stock Reservation Entry", sre_name, force=True, ignore_permissions=True)
+				except Exception:
+					pass
+			self._cleanup_stock([reco])
 
 	def test_99_safety_invariance_restoration(self):
 		"""
