@@ -100,11 +100,19 @@ class PrestaShopClient:
 				sensitive_token=self._api_key,
 			)
 		if status == 429:
+			retry_after = None
+			ra_hdr = resp.headers.get("Retry-After")
+			if ra_hdr:
+				try:
+					retry_after = int(ra_hdr)
+				except (ValueError, TypeError):
+					pass
 			raise PrestaShopRateLimitError(
 				f"Rate limit exceeded (429) at PrestaShop endpoint {safe_url}",
 				status_code=status,
 				response_body=resp.text,
 				sensitive_token=self._api_key,
+				retry_after=retry_after,
 			)
 		if status in (400, 422):
 			raise PrestaShopValidationError(
@@ -291,6 +299,7 @@ class PrestaShopClient:
 		quantity: int,
 		expected_product_id: int,
 		expected_variant_id: Optional[int] = None,
+		pre_put_hook: Optional[Any] = None,
 	) -> Dict[str, Any]:
 		"""
 		Safely updates the quantity of a stock_available record in PrestaShop.
@@ -302,8 +311,9 @@ class PrestaShopClient:
 		5. Delta detection (NO-OP if remote quantity already equals desired quantity).
 		6. Read-Modify-Write XML: preserves id_product, id_product_attribute, id_shop, out_of_stock,
 		   depends_on_stock, location, and mutates ONLY the <quantity> element.
-		7. Executes PUT with Content-Type: text/xml.
-		8. Verifies update response.
+		7. Executes optional pre_put_hook immediately before outbound mutation.
+		8. Executes PUT with Content-Type: text/xml.
+		9. Verifies update response.
 		"""
 		import xml.etree.ElementTree as ET
 		from bop_erp.safety import assert_safe_write_target
@@ -370,7 +380,11 @@ class PrestaShopClient:
 		qty_elem.text = str(target_qty)
 		put_body = ET.tostring(root, encoding="utf-8")
 
-		# 7. Execute PUT
+		# 7. Immediate pre-PUT freshness check hook
+		if pre_put_hook is not None:
+			pre_put_hook()
+
+		# 8. Execute PUT
 		url = self._build_url(f"stock_availables/{stock_available_id}")
 		headers = {
 			"Content-Type": "text/xml",
@@ -416,11 +430,19 @@ class PrestaShopClient:
 				sensitive_token=self._api_key,
 			)
 		if status == 429:
+			retry_after = None
+			ra_hdr = resp.headers.get("Retry-After")
+			if ra_hdr:
+				try:
+					retry_after = int(ra_hdr)
+				except (ValueError, TypeError):
+					pass
 			raise PrestaShopRateLimitError(
 				f"Rate limit exceeded (429) at PUT {safe_url}",
 				status_code=status,
 				response_body=resp.text,
 				sensitive_token=self._api_key,
+				retry_after=retry_after,
 			)
 		if status in (400, 422):
 			raise PrestaShopValidationError(

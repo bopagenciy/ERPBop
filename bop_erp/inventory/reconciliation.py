@@ -130,3 +130,38 @@ def get_channel_inventory_reconciliation(
 			})
 
 	return report_rows
+
+
+def repair_channel_inventory_drift(
+	sales_channel: str,
+	item_codes: Optional[List[str]] = None,
+	limit: int = 100,
+	client: Optional[PrestaShopClient] = None,
+) -> List[Dict[str, Any]]:
+	"""
+	Identifies items suffering inventory drift between ERP ATP and remote PrestaShop stock,
+	and safely republishes authoritative ERP inventory through the standard publish_item_inventory service.
+	Guarantees ZERO bypass: all repairs pass through the hard host guard, mapping validation,
+	fresh ATP calculation, identity validation, and DB publication fencing.
+	"""
+	from bop_erp.inventory.publication import publish_item_inventory
+
+	reconciliation_rows = get_channel_inventory_reconciliation(
+		sales_channel=sales_channel,
+		item_codes=item_codes,
+		limit=limit,
+		client=client,
+	)
+
+	repair_results = []
+	for row in reconciliation_rows:
+		if row.get("stock_status") == "DRIFT":
+			ic = row["item_code"]
+			res = publish_item_inventory(
+				sales_channel=sales_channel,
+				item_code=ic,
+				client=client,
+			)
+			repair_results.append(res)
+
+	return repair_results

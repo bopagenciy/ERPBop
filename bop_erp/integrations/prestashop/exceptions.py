@@ -48,6 +48,14 @@ class PrestaShopNotFoundError(PrestaShopError):
 
 class PrestaShopRateLimitError(PrestaShopError):
 	"""Rate limit exceeded (429)."""
+
+	def __init__(self, message, status_code=None, response_body=None, sensitive_token=None, retry_after=None):
+		super().__init__(message, status_code=status_code, response_body=response_body, sensitive_token=sensitive_token)
+		self.retry_after = retry_after
+
+
+class PrestaShopStalePublicationError(PrestaShopError):
+	"""Raised when a publication intent is superseded or stale before or during outbound execution."""
 	pass
 
 

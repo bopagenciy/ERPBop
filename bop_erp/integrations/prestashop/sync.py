@@ -29,6 +29,7 @@ from bop_erp.integrations.prestashop.exceptions import (
 	PrestaShopServerError,
 	PrestaShopTransientError,
 	PrestaShopMalformedResponseError,
+	PrestaShopStalePublicationError,
 )
 from bop_erp.integrations.prestashop.adapters.normalizers import (
 	normalize_category,
@@ -58,6 +59,8 @@ def map_prestashop_exception_to_error_category(exc: Exception) -> Tuple[str, str
 		return (ErrorCategory.TRANSIENT, "PS_NETWORK_TIMEOUT")
 	if isinstance(exc, PrestaShopMalformedResponseError):
 		return (ErrorCategory.INTERNAL_ERROR, "PS_MALFORMED_RESPONSE")
+	if isinstance(exc, PrestaShopStalePublicationError):
+		return (ErrorCategory.NON_RETRYABLE, "PS_STALE_SUPERSEDED")
 	return (ErrorCategory.INTERNAL_ERROR, "PS_UNHANDLED_EXCEPTION")
 
 

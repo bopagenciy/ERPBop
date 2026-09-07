@@ -189,7 +189,7 @@ class IntegrationEvent(Document):
 			self.response_metadata = sanitize_metadata(response_metadata)
 		self.save()
 
-	def mark_failed(self, processing_token, error_code, error_message, error_category=None):
+	def mark_failed(self, processing_token, error_code, error_message, error_category=None, delay_seconds=None):
 		self._verify_processing_lease(processing_token)
 		now = now_datetime()
 		self.last_error_code = error_code
@@ -202,19 +202,19 @@ class IntegrationEvent(Document):
 		can_retry = is_retryable and (self.attempt_count < self.max_attempts)
 
 		if can_retry:
-			self._schedule_retry_internal(error_code, error_message)
+			self._schedule_retry_internal(error_code, error_message, delay_seconds=delay_seconds)
 		else:
 			self._mark_dead_letter_internal(error_code, error_message)
 
-	def schedule_retry(self, processing_token, error_code, error_message):
+	def schedule_retry(self, processing_token, error_code, error_message, delay_seconds=None):
 		self._verify_processing_lease(processing_token)
-		self._schedule_retry_internal(error_code, error_message)
+		self._schedule_retry_internal(error_code, error_message, delay_seconds=delay_seconds)
 
 	def mark_dead_letter(self, processing_token, error_code, error_message):
 		self._verify_processing_lease(processing_token)
 		self._mark_dead_letter_internal(error_code, error_message)
 
-	def _schedule_retry_internal(self, error_code, error_message):
+	def _schedule_retry_internal(self, error_code, error_message, delay_seconds=None):
 		now = now_datetime()
 		self.last_error_code = error_code
 		self.last_error_message = error_message
@@ -224,13 +224,14 @@ class IntegrationEvent(Document):
 		self.processing_token = None
 		self.lease_expires_at = None
 
-		try:
-			settings = get_settings()
-			delay_seconds = settings.get_backoff_delay(self.attempt_count)
-		except Exception:
-			delay_seconds = 60
+		if delay_seconds is None:
+			try:
+				settings = get_settings()
+				delay_seconds = settings.get_backoff_delay(self.attempt_count)
+			except Exception:
+				delay_seconds = 60
 
-		self.next_retry_at = now + timedelta(seconds=delay_seconds)
+		self.next_retry_at = now + timedelta(seconds=int(delay_seconds))
 		self.save()
 
 	def _mark_dead_letter_internal(self, error_code, error_message):

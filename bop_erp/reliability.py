@@ -400,6 +400,27 @@ def process_integration_event(event_name, handler=None):
 	try:
 		if handler:
 			result = handler(doc)
+		elif doc.direction == IntegrationDirection.OUTBOUND and doc.entity_type == ExternalEntityType.INVENTORY:
+			from bop_erp.inventory.publication import publish_item_inventory
+			payload = {}
+			raw_meta = doc.request_metadata or getattr(doc, "request_payload", None)
+			if raw_meta:
+				try:
+					payload = json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
+				except Exception:
+					pass
+			result = publish_item_inventory(
+				sales_channel=payload.get("sales_channel") or doc.sales_channel,
+				item_code=payload.get("item_code") or doc.erp_document,
+				intended_atp=payload.get("intended_atp"),
+				publication_version=payload.get("publication_version"),
+				event_doc=doc,
+				processing_token=processing_token,
+				worker_id=worker_id,
+			)
+			status_str = result.get("status") if isinstance(result, dict) else None
+			if status_str in ("STALE_SUPERSEDED", "SUPERSEDED_PRE_PUT", "SUPERSEDED_FENCED"):
+				result = {"action": "SUPERSEDED", "details": result}
 		else:
 			# Default no-op deterministic success
 			result = {"success": True}
@@ -407,7 +428,14 @@ def process_integration_event(event_name, handler=None):
 		doc.mark_succeeded(processing_token=processing_token, response_metadata=result)
 		return True
 	except Exception as e:
-		error_category = getattr(e, "error_category", ErrorCategory.INTERNAL_ERROR)
+		delay_seconds = getattr(e, "retry_after", None)
+		error_category = getattr(e, "error_category", None)
+		if not error_category:
+			if hasattr(e, "status_code"):
+				from bop_erp.integrations.prestashop.sync import map_prestashop_exception_to_error_category
+				error_category, _ = map_prestashop_exception_to_error_category(e)
+			else:
+				error_category = ErrorCategory.INTERNAL_ERROR
 		error_code = getattr(e, "error_code", "EXECUTION_ERROR")
 		error_message = str(e)
 		doc.mark_failed(
@@ -415,6 +443,7 @@ def process_integration_event(event_name, handler=None):
 			error_code=error_code,
 			error_message=error_message,
 			error_category=error_category,
+			delay_seconds=delay_seconds,
 		)
 		return False
 
