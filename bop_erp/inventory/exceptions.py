@@ -22,3 +22,28 @@ class WarehouseNotFoundError(InventoryError):
 class DuplicateInventorySourceError(frappe.DuplicateEntryError):
 	"""Raised when an active channel inventory source already exists for the channel and warehouse."""
 	pass
+
+
+class InsufficientStockToReserveError(InventoryError):
+	"""Raised when requested reservation exceeds available ATP."""
+	pass
+
+
+class ReservationConflictError(InventoryError):
+	"""Raised when a concurrent reservation race condition or locking conflict occurs."""
+	pass
+
+
+class ReservationNotFoundError(InventoryError):
+	"""Raised when a requested Stock Reservation Entry cannot be found."""
+	pass
+
+
+class InvalidReservationRequestError(InventoryError):
+	"""Raised when reservation parameters are malformed or invalid."""
+	pass
+
+
+class PolicyValidationError(InventoryError):
+	"""Raised when an Inventory Availability Policy is invalid."""
+	pass

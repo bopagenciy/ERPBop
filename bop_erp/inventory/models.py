@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -64,4 +64,115 @@ class InventoryComparisonResult:
 	delta_projected: float
 	external_source: str = "SOURCE EXTERNAL"
 	erp_source: str = "SOURCE ERP"
+	timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
+class WarehouseATP:
+	"""
+	Typed Available-To-Promise (ATP) snapshot for an Item in a specific Warehouse.
+	Formula:
+	    candidate_atp_qty = max(0, actual_qty - effective_reserved_qty - safety_stock_qty)
+	Only sellable warehouses contribute positive ATP.
+	"""
+	item_code: str
+	warehouse: str
+	company: str
+	actual_qty: float
+	native_reserved_qty: float
+	effective_reserved_qty: float
+	safety_stock_qty: float
+	candidate_atp_qty: float
+	stock_uom: str
+	allow_sellable_stock: bool = True
+	allow_fulfillment: bool = True
+	timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
+class ChannelATP:
+	"""
+	Typed Available-To-Promise (ATP) aggregate for an Item across enabled sellable warehouses for a Sales Channel.
+	Formula:
+	    aggregate_atp_qty = sum(warehouse.candidate_atp_qty for warehouse in sellable_warehouses)
+	"""
+	item_code: str
+	sales_channel: str
+	company: str
+	warehouses: List[WarehouseATP] = field(default_factory=list)
+	aggregate_actual_qty: float = 0.0
+	aggregate_reserved_qty: float = 0.0
+	aggregate_safety_stock_qty: float = 0.0
+	aggregate_atp_qty: float = 0.0
+	stock_uom: str = "Nos"
+	timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
+class ReservationSnapshot:
+	"""
+	Detailed audit snapshot of active Stock Reservation Entries for an item and warehouse.
+	"""
+	item_code: str
+	warehouse: str
+	company: str
+	total_reserved_qty: float
+	total_delivered_qty: float
+	net_reserved_qty: float
+	stock_uom: str
+	active_reservations: List[Dict[str, Any]] = field(default_factory=list)
+	timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
+class ReservationAllocation:
+	"""
+	Individual warehouse reservation allocation record.
+	"""
+	warehouse: str
+	allocated_qty: float
+	stock_reservation_entry: str
+	idempotency_key: Optional[str] = None
+
+
+@dataclass
+class ReservationResult:
+	"""
+	Result of a stock reservation operation.
+	"""
+	success: bool
+	item_code: str
+	requested_qty: float
+	reserved_qty: float
+	allocations: List[ReservationAllocation] = field(default_factory=list)
+	idempotency_key: Optional[str] = None
+	is_idempotent_replay: bool = False
+	timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+@dataclass
+class ATPBreakdownWarehouse:
+	"""
+	Individual warehouse breakdown line for explainability.
+	"""
+	warehouse: str
+	actual_qty: float
+	reserved_qty: float
+	safety_stock_qty: float
+	atp_qty: float
+	allow_sellable_stock: bool
+	priority: int
+
+
+@dataclass
+class ChannelATPBreakdown:
+	"""
+	Auditable explanation breakdown of Channel ATP calculation.
+	"""
+	item_code: str
+	sales_channel: str
+	company: str
+	lines: List[ATPBreakdownWarehouse] = field(default_factory=list)
+	channel_atp: float = 0.0
+	stock_uom: str = "Nos"
 	timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())

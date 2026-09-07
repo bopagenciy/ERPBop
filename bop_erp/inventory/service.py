@@ -1,25 +1,50 @@
 # Copyright (c) 2026, Bop Agency and Contributors
 # See license.txt
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import frappe
-from frappe.utils import flt
 from frappe.model.meta import get_field_precision
+from frappe.utils import flt
 
+from bop_erp.inventory.availability import (
+	get_atp_breakdown,
+	get_channel_atp,
+	get_effective_reserved_qty,
+	get_product_bundle_atp,
+	get_safety_stock,
+	get_warehouse_atp,
+)
 from bop_erp.inventory.exceptions import WarehouseNotFoundError
 from bop_erp.inventory.models import (
-	WarehouseInventorySnapshot,
+	ChannelATP,
+	ChannelATPBreakdown,
 	ChannelInventorySnapshot,
 	InventoryComparisonResult,
+	ReservationResult,
+	ReservationSnapshot,
+	WarehouseATP,
+	WarehouseInventorySnapshot,
+)
+from bop_erp.inventory.reservations import (
+	get_reservation_snapshot,
+	release_stock_reservation,
+	reserve_channel_stock,
+	reserve_stock,
 )
 
 
 class InventoryService:
 	"""
-	Read-only Bop ERP inventory service abstraction.
-	Provides safe, point-in-time native inventory snapshots per Warehouse and per Sales Channel.
-	Strictly adheres to ERPNext v16.32.3 native quantity semantics without inventing arbitrary ATS formulas.
+	Authoritative Bop ERP inventory service abstraction.
+	Provides:
+	1. Safe point-in-time native inventory snapshots (Warehouse & Channel).
+	2. Formal Available-To-Promise (ATP) calculation layer with safety stock policy.
+	3. Anti-overselling, concurrency-safe native Stock Reservation Entry lifecycle.
+	4. Read-only external diagnostic comparison.
+	Strictly adheres to ERPNext v16.32.3 native quantity semantics.
 	"""
+
+	# --- Native Point-In-Time Snapshots ---
 
 	@staticmethod
 	def get_warehouse_inventory(item_code: str, warehouse: str) -> WarehouseInventorySnapshot:
@@ -155,6 +180,121 @@ class InventoryService:
 			aggregate_projected_qty=flt(agg_projected, prec),
 		)
 
+	# --- Available-To-Promise (ATP) Layer ---
+
+	@staticmethod
+	def get_safety_stock(warehouse: str, item_code: Optional[str] = None) -> float:
+		"""Resolves safety stock from Inventory Availability Policy hierarchy."""
+		return get_safety_stock(warehouse, item_code)
+
+	@staticmethod
+	def get_effective_reserved_qty(item_code: str, warehouse: str) -> float:
+		"""Calculates net effective reserved quantity without double-counting."""
+		return get_effective_reserved_qty(item_code, warehouse)
+
+	@staticmethod
+	def get_warehouse_atp(
+		item_code: str,
+		warehouse: str,
+		allow_sellable_stock: bool = True,
+		allow_fulfillment: bool = True,
+	) -> WarehouseATP:
+		"""Calculates point-in-time Warehouse ATP."""
+		return get_warehouse_atp(item_code, warehouse, allow_sellable_stock, allow_fulfillment)
+
+	@staticmethod
+	def get_channel_atp(item_code: str, sales_channel: str) -> ChannelATP:
+		"""Calculates Channel ATP across enabled sellable sources."""
+		return get_channel_atp(item_code, sales_channel)
+
+	@staticmethod
+	def get_product_bundle_atp(
+		bundle_item_code: str,
+		sales_channel: Optional[str] = None,
+		warehouse: Optional[str] = None,
+	) -> float:
+		"""Calculates read-only Product Bundle kit ATP."""
+		return get_product_bundle_atp(bundle_item_code, sales_channel, warehouse)
+
+	@staticmethod
+	def get_atp_breakdown(item_code: str, sales_channel: str) -> ChannelATPBreakdown:
+		"""Returns auditable explanation breakdown for Channel ATP."""
+		return get_atp_breakdown(item_code, sales_channel)
+
+	# --- Reservation Lifecycle & Concurrency ---
+
+	@staticmethod
+	def reserve_stock(
+		item_code: str,
+		warehouse: str,
+		requested_qty: float,
+		voucher_type: str = "Sales Order",
+		voucher_no: Optional[str] = None,
+		voucher_detail_no: Optional[str] = None,
+		idempotency_key: Optional[str] = None,
+		source_doctype: Optional[str] = None,
+		source_document: Optional[str] = None,
+		source_document_item: Optional[str] = None,
+	) -> ReservationResult:
+		"""Reserves stock concurrency-safely in a single warehouse."""
+		return reserve_stock(
+			item_code=item_code,
+			warehouse=warehouse,
+			requested_qty=requested_qty,
+			voucher_type=voucher_type,
+			voucher_no=voucher_no,
+			voucher_detail_no=voucher_detail_no,
+			idempotency_key=idempotency_key,
+			source_doctype=source_doctype,
+			source_document=source_document,
+			source_document_item=source_document_item,
+		)
+
+	@staticmethod
+	def reserve_channel_stock(
+		item_code: str,
+		sales_channel: str,
+		requested_qty: float,
+		voucher_type: str = "Sales Order",
+		voucher_no: Optional[str] = None,
+		voucher_detail_no: Optional[str] = None,
+		allow_partial: bool = False,
+		idempotency_key: Optional[str] = None,
+		source_doctype: Optional[str] = None,
+		source_document: Optional[str] = None,
+		source_document_item: Optional[str] = None,
+	) -> ReservationResult:
+		"""Reserves stock across enabled channel sources with deterministic locking & priority allocation."""
+		return reserve_channel_stock(
+			item_code=item_code,
+			sales_channel=sales_channel,
+			requested_qty=requested_qty,
+			voucher_type=voucher_type,
+			voucher_no=voucher_no,
+			voucher_detail_no=voucher_detail_no,
+			allow_partial=allow_partial,
+			idempotency_key=idempotency_key,
+			source_doctype=source_doctype,
+			source_document=source_document,
+			source_document_item=source_document_item,
+		)
+
+	@staticmethod
+	def release_stock_reservation(
+		reservation_entry_name: str,
+		qty: Optional[float] = None,
+		reason: Optional[str] = None,
+	) -> bool:
+		"""Releases an active Stock Reservation Entry and restores ATP."""
+		return release_stock_reservation(reservation_entry_name, qty, reason)
+
+	@staticmethod
+	def get_reservation_snapshot(item_code: str, warehouse: str) -> ReservationSnapshot:
+		"""Returns full audit snapshot of active reservations for item and warehouse."""
+		return get_reservation_snapshot(item_code, warehouse)
+
+	# --- Read-Only Diagnostic Comparison ---
+
 	@classmethod
 	def compare_channel_inventory_with_external(
 		cls,
@@ -184,3 +324,34 @@ class InventoryService:
 			delta_actual=flt(ext_val - actual_val, prec),
 			delta_projected=flt(ext_val - proj_val, prec),
 		)
+
+	@classmethod
+	def compare_channel_atp_with_external(
+		cls,
+		item_code: str,
+		sales_channel: str,
+		external_qty: float,
+	) -> Dict[str, Any]:
+		"""
+		Read-only comparison between external reported stock and ERP Available-To-Promise (ATP).
+		Does NOT reconcile or mutate either system.
+		"""
+		atp = cls.get_channel_atp(item_code, sales_channel)
+		meta = frappe.get_meta("Bin")
+		field = meta.get_field("actual_qty")
+		prec = get_field_precision(field) if field else (frappe.db.get_default("float_precision") or 3)
+
+		ext_val = flt(external_qty, prec)
+		atp_val = flt(atp.aggregate_atp_qty, prec)
+		delta = flt(ext_val - atp_val, prec)
+
+		return {
+			"item_code": item_code,
+			"sales_channel": sales_channel,
+			"external_qty": ext_val,
+			"erp_atp_qty": atp_val,
+			"delta": delta,
+			"external_source": "SOURCE EXTERNAL",
+			"erp_source": "SOURCE ERP",
+			"timestamp": atp.timestamp,
+		}
