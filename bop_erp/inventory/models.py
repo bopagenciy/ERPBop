@@ -2,7 +2,7 @@
 # See license.txt
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 
@@ -24,7 +24,7 @@ class WarehouseInventorySnapshot:
 	projected_qty: float = 0.0
 	allow_sellable_stock: bool = True
 	allow_fulfillment: bool = True
-	timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+	timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 	source: str = "SOURCE ERP"
 
 
@@ -45,7 +45,7 @@ class ChannelInventorySnapshot:
 	aggregate_indented_qty: float = 0.0
 	aggregate_planned_qty: float = 0.0
 	aggregate_projected_qty: float = 0.0
-	timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+	timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 	source: str = "SOURCE ERP"
 
 
@@ -64,13 +64,14 @@ class InventoryComparisonResult:
 	delta_projected: float
 	external_source: str = "SOURCE EXTERNAL"
 	erp_source: str = "SOURCE ERP"
-	timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+	timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 @dataclass
 class WarehouseATP:
 	"""
 	Typed Available-To-Promise (ATP) snapshot for an Item in a specific Warehouse.
+	INFORMATIONAL ONLY: Point-in-time calculation without concurrency locks.
 	Formula:
 	    candidate_atp_qty = max(0, actual_qty - effective_reserved_qty - safety_stock_qty)
 	Only sellable warehouses contribute positive ATP.
@@ -86,13 +87,14 @@ class WarehouseATP:
 	stock_uom: str
 	allow_sellable_stock: bool = True
 	allow_fulfillment: bool = True
-	timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+	timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 @dataclass
 class ChannelATP:
 	"""
 	Typed Available-To-Promise (ATP) aggregate for an Item across enabled sellable warehouses for a Sales Channel.
+	INFORMATIONAL ONLY: Point-in-time calculation without concurrency locks.
 	Formula:
 	    aggregate_atp_qty = sum(warehouse.candidate_atp_qty for warehouse in sellable_warehouses)
 	"""
@@ -105,7 +107,7 @@ class ChannelATP:
 	aggregate_safety_stock_qty: float = 0.0
 	aggregate_atp_qty: float = 0.0
 	stock_uom: str = "Nos"
-	timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+	timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 @dataclass
@@ -121,7 +123,7 @@ class ReservationSnapshot:
 	net_reserved_qty: float
 	stock_uom: str
 	active_reservations: List[Dict[str, Any]] = field(default_factory=list)
-	timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+	timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 @dataclass
@@ -139,15 +141,18 @@ class ReservationAllocation:
 class ReservationResult:
 	"""
 	Result of a stock reservation operation.
+	TRANSACTIONAL GUARANTEE: Produced exclusively under exclusive row-level locking
+	on tabBin and validated against active in-transaction ATP.
 	"""
 	success: bool
 	item_code: str
 	requested_qty: float
 	reserved_qty: float
+	unfulfilled_qty: float = 0.0
 	allocations: List[ReservationAllocation] = field(default_factory=list)
 	idempotency_key: Optional[str] = None
 	is_idempotent_replay: bool = False
-	timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+	timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 @dataclass
@@ -175,4 +180,4 @@ class ChannelATPBreakdown:
 	lines: List[ATPBreakdownWarehouse] = field(default_factory=list)
 	channel_atp: float = 0.0
 	stock_uom: str = "Nos"
-	timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+	timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())

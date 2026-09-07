@@ -95,32 +95,54 @@ def get_safety_stock(warehouse: str, item_code: Optional[str] = None) -> float:
 def get_effective_reserved_qty(item_code: str, warehouse: str) -> float:
 	"""
 	Authoritatively derives effective reserved quantity for an item and warehouse.
-	Prevents double-counting by strictly using active Stock Reservation Entries
-	(net of deliveries/transfers/consumption) plus manufacturing/subcontract
-	allocations tracked in Bin.
-	Does NOT double-count Bin.reserved_qty (legacy open sales orders) when Stock Reservation Entries exist.
-	"""
-	# Active native Stock Reservation Entries
-	sre = frappe.qb.DocType("Stock Reservation Entry")
-	query = (
-		frappe.qb.from_(sre)
-		.select(Sum(sre.reserved_qty - sre.delivered_qty - sre.transferred_qty - sre.consumed_qty))
-		.where(
-			(sre.docstatus == 1)
-			& (sre.item_code == item_code)
-			& (sre.warehouse == warehouse)
-			& (sre.delivered_qty < sre.reserved_qty)
-			& (sre.status.notin(["Closed", "Delivered", "Cancelled"]))
-		)
-	)
-	res = query.run()[0][0]
-	net_sre_reserved = flt(res) if res is not None else 0.0
+	Prevents double-counting by strictly partitioning reservations:
+	1. Active native Stock Reservation Entries (net of deliveries/transfers/consumption).
+	2. Unreserved Sales Order demand: max(0, Bin.reserved_qty - SRE_for_Sales_Orders).
+	   Since Bin.reserved_qty includes all open Sales Orders, subtracting SREs tied
+	   to Sales Orders guarantees that Sales Orders with active SREs are NOT counted twice.
+	3. Manufacturing & subcontract allocations tracked in Bin:
+	   (reserved_qty_for_production + reserved_qty_for_sub_contract + reserved_qty_for_production_plan).
 
-	# Manufacturing & subcontract allocations from Bin
+	Formula:
+	    effective_reserved_qty = net_sre_reserved + unreserved_so_qty + mfg_reserved
+	"""
+	# 1. Active native Stock Reservation Entries (overall net)
+	net_sre_res = frappe.db.sql(
+		"""
+		SELECT SUM(reserved_qty - delivered_qty - transferred_qty - consumed_qty)
+		FROM `tabStock Reservation Entry`
+		WHERE docstatus = 1
+		  AND item_code = %s
+		  AND warehouse = %s
+		  AND delivered_qty < reserved_qty
+		  AND status NOT IN ('Closed', 'Delivered', 'Cancelled')
+		""",
+		(item_code, warehouse),
+	)
+	net_sre_reserved = flt(net_sre_res[0][0]) if net_sre_res and net_sre_res[0][0] is not None else 0.0
+
+	# 2. SO-specific active native SREs to prevent double-counting with Bin.reserved_qty
+	so_sre_res = frappe.db.sql(
+		"""
+		SELECT SUM(reserved_qty - delivered_qty - transferred_qty - consumed_qty)
+		FROM `tabStock Reservation Entry`
+		WHERE docstatus = 1
+		  AND item_code = %s
+		  AND warehouse = %s
+		  AND voucher_type = 'Sales Order'
+		  AND delivered_qty < reserved_qty
+		  AND status NOT IN ('Closed', 'Delivered', 'Cancelled')
+		""",
+		(item_code, warehouse),
+	)
+	sre_for_so = flt(so_sre_res[0][0]) if so_sre_res and so_sre_res[0][0] is not None else 0.0
+
+	# 3. Native Bin reservations (Sales Orders and Manufacturing)
 	bin_data = frappe.db.get_value(
 		"Bin",
 		{"item_code": item_code, "warehouse": warehouse},
 		[
+			"reserved_qty",
 			"reserved_qty_for_production",
 			"reserved_qty_for_sub_contract",
 			"reserved_qty_for_production_plan",
@@ -128,15 +150,19 @@ def get_effective_reserved_qty(item_code: str, warehouse: str) -> float:
 		as_dict=True,
 	)
 	mfg_reserved = 0.0
+	unreserved_so_qty = 0.0
 	if bin_data:
 		mfg_reserved = (
 			flt(bin_data.reserved_qty_for_production)
 			+ flt(bin_data.reserved_qty_for_sub_contract)
 			+ flt(bin_data.reserved_qty_for_production_plan)
 		)
+		# Bin.reserved_qty tracks all open Sales Orders.
+		# Net out SREs already tied to Sales Orders to eliminate double-counting.
+		unreserved_so_qty = max(0.0, flt(bin_data.reserved_qty) - sre_for_so)
 
 	prec = get_stock_precision("Bin", "reserved_stock")
-	return flt(net_sre_reserved + mfg_reserved, prec)
+	return flt(net_sre_reserved + unreserved_so_qty + mfg_reserved, prec)
 
 
 def get_warehouse_atp(

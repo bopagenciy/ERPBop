@@ -106,6 +106,7 @@ def reserve_stock(
 	voucher_type: str = "Sales Order",
 	voucher_no: Optional[str] = None,
 	voucher_detail_no: Optional[str] = None,
+	allow_partial: bool = False,
 	idempotency_key: Optional[str] = None,
 	source_doctype: Optional[str] = None,
 	source_document: Optional[str] = None,
@@ -123,7 +124,7 @@ def reserve_stock(
 	if requested_qty <= 0:
 		raise InvalidReservationRequestError(_("Requested reservation quantity must be greater than 0."))
 
-	# 1. Check Idempotency before locking
+	# 1. Fast idempotency check before locking (if already committed by prior request)
 	if idempotency_key:
 		existing_ref = frappe.db.get_value(
 			"Inventory Reservation Reference",
@@ -132,15 +133,17 @@ def reserve_stock(
 			as_dict=True,
 		)
 		if existing_ref and existing_ref.status in ("Reserved", "Partially Released"):
+			res_qty = flt(existing_ref.reserved_qty, prec)
 			return ReservationResult(
 				success=True,
 				item_code=item_code,
 				requested_qty=requested_qty,
-				reserved_qty=flt(existing_ref.reserved_qty, prec),
+				reserved_qty=res_qty,
+				unfulfilled_qty=max(0.0, flt(requested_qty - res_qty, prec)),
 				allocations=[
 					ReservationAllocation(
 						warehouse=existing_ref.warehouse,
-						allocated_qty=flt(existing_ref.reserved_qty, prec),
+						allocated_qty=res_qty,
 						stock_reservation_entry=existing_ref.stock_reservation_entry,
 						idempotency_key=idempotency_key,
 					)
@@ -150,24 +153,96 @@ def reserve_stock(
 			)
 
 	# 2. Acquire exclusive DB row lock on (item_code, warehouse)
-	lock_inventory_scope(item_code, [warehouse])
+	try:
+		lock_inventory_scope(item_code, [warehouse])
+	except (frappe.QueryDeadlockError, Exception):
+		if idempotency_key:
+			frappe.db.rollback()
+			existing_ref = frappe.db.get_value(
+				"Inventory Reservation Reference",
+				{"idempotency_key": idempotency_key},
+				["name", "stock_reservation_entry", "reserved_qty", "warehouse", "status"],
+				as_dict=True,
+			)
+			if existing_ref and existing_ref.status in ("Reserved", "Partially Released"):
+				res_qty = flt(existing_ref.reserved_qty, prec)
+				return ReservationResult(
+					success=True,
+					item_code=item_code,
+					requested_qty=requested_qty,
+					reserved_qty=res_qty,
+					unfulfilled_qty=max(0.0, flt(requested_qty - res_qty, prec)),
+					allocations=[
+						ReservationAllocation(
+							warehouse=existing_ref.warehouse,
+							allocated_qty=res_qty,
+							stock_reservation_entry=existing_ref.stock_reservation_entry,
+							idempotency_key=idempotency_key,
+						)
+					],
+					idempotency_key=idempotency_key,
+					is_idempotent_replay=True,
+				)
+		raise
+
+	# 2b. CRITICAL CONCURRENCY HARDENING: Re-check idempotency UNDER LOCK
+	# If a concurrent worker with the exact same idempotency_key committed while we waited for the lock,
+	# converge cleanly to that winning reservation outcome instead of duplicating.
+	if idempotency_key:
+		existing_ref = frappe.db.get_value(
+			"Inventory Reservation Reference",
+			{"idempotency_key": idempotency_key},
+			["name", "stock_reservation_entry", "reserved_qty", "warehouse", "status"],
+			as_dict=True,
+		)
+		if existing_ref and existing_ref.status in ("Reserved", "Partially Released"):
+			res_qty = flt(existing_ref.reserved_qty, prec)
+			return ReservationResult(
+				success=True,
+				item_code=item_code,
+				requested_qty=requested_qty,
+				reserved_qty=res_qty,
+				unfulfilled_qty=max(0.0, flt(requested_qty - res_qty, prec)),
+				allocations=[
+					ReservationAllocation(
+						warehouse=existing_ref.warehouse,
+						allocated_qty=res_qty,
+						stock_reservation_entry=existing_ref.stock_reservation_entry,
+						idempotency_key=idempotency_key,
+					)
+				],
+				idempotency_key=idempotency_key,
+				is_idempotent_replay=True,
+			)
 
 	# 3. In-Transaction ATP Check under lock
 	wh_atp = get_warehouse_atp(item_code, warehouse)
 	if requested_qty > wh_atp.candidate_atp_qty:
-		raise InsufficientStockToReserveError(
-			_(
-				"Cannot reserve {0} units of {1} in warehouse {2}. Available ATP is {3} (Actual: {4}, Effective Reserved: {5}, Safety Stock: {6})."
-			).format(
-				requested_qty,
-				item_code,
-				warehouse,
-				wh_atp.candidate_atp_qty,
-				wh_atp.actual_qty,
-				wh_atp.effective_reserved_qty,
-				wh_atp.safety_stock_qty,
+		if not allow_partial:
+			raise InsufficientStockToReserveError(
+				_(
+					"Cannot reserve {0} units of {1} in warehouse {2}. Available ATP is {3} (Actual: {4}, Effective Reserved: {5}, Safety Stock: {6})."
+				).format(
+					requested_qty,
+					item_code,
+					warehouse,
+					wh_atp.candidate_atp_qty,
+					wh_atp.actual_qty,
+					wh_atp.effective_reserved_qty,
+					wh_atp.safety_stock_qty,
+				)
 			)
-		)
+		alloc_qty = wh_atp.candidate_atp_qty
+		if alloc_qty <= 0:
+			raise InsufficientStockToReserveError(
+				_("No stock available to partially reserve for {0} in warehouse {1}.").format(
+					item_code, warehouse
+				)
+			)
+	else:
+		alloc_qty = requested_qty
+
+	unfulfilled_qty = max(0.0, flt(requested_qty - alloc_qty, prec))
 
 	# 4. Create native Stock Reservation Entry
 	item_doc = frappe.get_cached_value(
@@ -178,7 +253,6 @@ def reserve_stock(
 
 	wh_company = frappe.db.get_value("Warehouse", warehouse, "company") or ""
 
-	# 4. Create and Submit native Stock Reservation Entry
 	ref_key = idempotency_key or f"SRE-REF-{frappe.generate_hash(length=12)}"
 	resolved_voucher_type = voucher_type or "Work Order"
 	resolved_voucher_no = voucher_no
@@ -198,8 +272,8 @@ def reserve_stock(
 	sre.voucher_no = resolved_voucher_no
 	sre.voucher_detail_no = resolved_voucher_detail_no
 	sre.available_qty = wh_atp.actual_qty
-	sre.voucher_qty = requested_qty
-	sre.reserved_qty = requested_qty
+	sre.voucher_qty = alloc_qty
+	sre.reserved_qty = alloc_qty
 	sre.company = wh_company
 	sre.stock_uom = item_doc.stock_uom
 	sre.has_serial_no = item_doc.has_serial_no
@@ -211,33 +285,64 @@ def reserve_stock(
 	sre.insert(ignore_permissions=True)
 	sre.submit()
 
-	# 5. Record Idempotency / Reference Mapping
+	# 5. Record Idempotency / Reference Mapping with DB uniqueness guarantee
 	ref_key = idempotency_key or f"SRE-REF-{sre.name}"
-	ref_doc = frappe.get_doc(
-		{
-			"doctype": "Inventory Reservation Reference",
-			"idempotency_key": ref_key,
-			"stock_reservation_entry": sre.name,
-			"status": "Reserved",
-			"item_code": item_code,
-			"warehouse": warehouse,
-			"reserved_qty": requested_qty,
-			"source_doctype": source_doctype or voucher_type,
-			"source_document": source_document or voucher_no,
-			"source_document_item": source_document_item or voucher_detail_no,
-		}
-	)
-	ref_doc.insert(ignore_permissions=True)
+	try:
+		ref_doc = frappe.get_doc(
+			{
+				"doctype": "Inventory Reservation Reference",
+				"idempotency_key": ref_key,
+				"stock_reservation_entry": sre.name,
+				"status": "Reserved",
+				"item_code": item_code,
+				"warehouse": warehouse,
+				"reserved_qty": alloc_qty,
+				"source_doctype": source_doctype or voucher_type,
+				"source_document": source_document or voucher_no,
+				"source_document_item": source_document_item or voucher_detail_no,
+			}
+		)
+		ref_doc.insert(ignore_permissions=True)
+	except (frappe.UniqueValidationError, frappe.DuplicateEntryError):
+		# DB caught concurrent duplicate key insert: cancel our duplicate SRE and return winner
+		sre.cancel()
+		existing_ref = frappe.db.get_value(
+			"Inventory Reservation Reference",
+			{"idempotency_key": ref_key},
+			["name", "stock_reservation_entry", "reserved_qty", "warehouse", "status"],
+			as_dict=True,
+		)
+		if existing_ref:
+			res_qty = flt(existing_ref.reserved_qty, prec)
+			return ReservationResult(
+				success=True,
+				item_code=item_code,
+				requested_qty=requested_qty,
+				reserved_qty=res_qty,
+				unfulfilled_qty=max(0.0, flt(requested_qty - res_qty, prec)),
+				allocations=[
+					ReservationAllocation(
+						warehouse=existing_ref.warehouse,
+						allocated_qty=res_qty,
+						stock_reservation_entry=existing_ref.stock_reservation_entry,
+						idempotency_key=ref_key,
+					)
+				],
+				idempotency_key=ref_key,
+				is_idempotent_replay=True,
+			)
+		raise
 
 	return ReservationResult(
 		success=True,
 		item_code=item_code,
 		requested_qty=requested_qty,
-		reserved_qty=requested_qty,
+		reserved_qty=alloc_qty,
+		unfulfilled_qty=unfulfilled_qty,
 		allocations=[
 			ReservationAllocation(
 				warehouse=warehouse,
-				allocated_qty=requested_qty,
+				allocated_qty=alloc_qty,
 				stock_reservation_entry=sre.name,
 				idempotency_key=ref_key,
 			)
@@ -264,6 +369,7 @@ def reserve_channel_stock(
 	Multi-warehouse reservation engine across enabled Channel Inventory Sources.
 	- Deterministic Deadlock-free Locking: sorts all candidate warehouses canonically before acquiring locks.
 	- All-or-Nothing Default: rejects whole request if total ATP < requested_qty unless allow_partial is True.
+	- Savepoint Rollback: if any allocation fails midway, the entire multi-warehouse transaction rolls back cleanly.
 	- Priority-based Sequential Allocation: fulfills demand according to Channel Inventory Source.priority.
 	- Native ERPNext SRE creation per allocated warehouse.
 	- Idempotent request replay safety.
@@ -274,7 +380,7 @@ def reserve_channel_stock(
 	if requested_qty <= 0:
 		raise InvalidReservationRequestError(_("Requested reservation quantity must be greater than 0."))
 
-	# 1. Idempotency Check
+	# 1. Fast idempotency check before locking
 	if idempotency_key:
 		existing_refs = frappe.get_all(
 			"Inventory Reservation Reference",
@@ -297,6 +403,7 @@ def reserve_channel_stock(
 				item_code=item_code,
 				requested_qty=requested_qty,
 				reserved_qty=flt(tot_res, prec),
+				unfulfilled_qty=max(0.0, flt(requested_qty - tot_res, prec)),
 				allocations=allocations,
 				idempotency_key=idempotency_key,
 				is_idempotent_replay=True,
@@ -319,7 +426,36 @@ def reserve_channel_stock(
 	# 3. Deterministic locking of all eligible warehouses
 	lock_inventory_scope(item_code, candidate_warehouses)
 
-	# 4. In-Transaction ATP Evaluation
+	# 3b. Re-check idempotency under lock
+	if idempotency_key:
+		existing_refs = frappe.get_all(
+			"Inventory Reservation Reference",
+			filters={"idempotency_key": ["like", f"{idempotency_key}%"], "status": "Reserved"},
+			fields=["name", "stock_reservation_entry", "reserved_qty", "warehouse", "idempotency_key"],
+		)
+		if existing_refs:
+			allocations = [
+				ReservationAllocation(
+					warehouse=r.warehouse,
+					allocated_qty=flt(r.reserved_qty, prec),
+					stock_reservation_entry=r.stock_reservation_entry,
+					idempotency_key=r.idempotency_key,
+				)
+				for r in existing_refs
+			]
+			tot_res = sum(a.allocated_qty for a in allocations)
+			return ReservationResult(
+				success=True,
+				item_code=item_code,
+				requested_qty=requested_qty,
+				reserved_qty=flt(tot_res, prec),
+				unfulfilled_qty=max(0.0, flt(requested_qty - tot_res, prec)),
+				allocations=allocations,
+				idempotency_key=idempotency_key,
+				is_idempotent_replay=True,
+			)
+
+	# 4. In-Transaction ATP Evaluation under lock
 	wh_atp_map = {}
 	total_atp = 0.0
 	for wh in candidate_warehouses:
@@ -334,50 +470,67 @@ def reserve_channel_stock(
 			).format(requested_qty, item_code, total_atp, len(candidate_warehouses))
 		)
 
-	# 5. Sequential Priority Allocation
-	remaining_demand = requested_qty
-	allocations: List[ReservationAllocation] = []
+	# 5. Sequential Priority Allocation with Savepoint Protection
+	sp_name = f"sp_chan_res_{frappe.generate_hash(length=8)}"
+	frappe.db.savepoint(sp_name)
+	try:
+		remaining_demand = requested_qty
+		allocations: List[ReservationAllocation] = []
 
-	for s in sources:
-		wh = s.warehouse
-		avail = wh_atp_map.get(wh, 0.0)
-		if avail <= 0:
-			continue
+		for s in sources:
+			wh = s.warehouse
+			avail = wh_atp_map.get(wh, 0.0)
+			if avail <= 0:
+				continue
 
-		alloc_qty = min(remaining_demand, avail)
-		alloc_qty = flt(alloc_qty, prec)
-		if alloc_qty <= 0:
-			continue
+			alloc_qty = min(remaining_demand, avail)
+			alloc_qty = flt(alloc_qty, prec)
+			if alloc_qty <= 0:
+				continue
 
-		sub_idem_key = f"{idempotency_key}:{wh}" if idempotency_key else None
-		res = reserve_stock(
+			sub_idem_key = f"{idempotency_key}:{wh}" if idempotency_key else None
+			res = reserve_stock(
+				item_code=item_code,
+				warehouse=wh,
+				requested_qty=alloc_qty,
+				voucher_type=voucher_type,
+				voucher_no=voucher_no,
+				voucher_detail_no=voucher_detail_no,
+				allow_partial=False,
+				idempotency_key=sub_idem_key,
+				source_doctype=source_doctype,
+				source_document=source_document,
+				source_document_item=source_document_item,
+			)
+			allocations.extend(res.allocations)
+			remaining_demand = flt(remaining_demand - alloc_qty, prec)
+
+			if remaining_demand <= 0:
+				break
+
+		tot_reserved = sum(a.allocated_qty for a in allocations)
+		unfulfilled_qty = max(0.0, flt(requested_qty - tot_reserved, prec))
+
+		if tot_reserved < requested_qty and not allow_partial:
+			raise InsufficientStockToReserveError(
+				_("All-or-Nothing check failed: Requested {0} units of {1}, but only {2} units could be allocated.").format(
+					requested_qty, item_code, tot_reserved
+				)
+			)
+
+		return ReservationResult(
+			success=True,
 			item_code=item_code,
-			warehouse=wh,
-			requested_qty=alloc_qty,
-			voucher_type=voucher_type,
-			voucher_no=voucher_no,
-			voucher_detail_no=voucher_detail_no,
-			idempotency_key=sub_idem_key,
-			source_doctype=source_doctype,
-			source_document=source_document,
-			source_document_item=source_document_item,
+			requested_qty=requested_qty,
+			reserved_qty=flt(tot_reserved, prec),
+			unfulfilled_qty=unfulfilled_qty,
+			allocations=allocations,
+			idempotency_key=idempotency_key,
+			is_idempotent_replay=False,
 		)
-		allocations.extend(res.allocations)
-		remaining_demand = flt(remaining_demand - alloc_qty, prec)
-
-		if remaining_demand <= 0:
-			break
-
-	tot_reserved = sum(a.allocated_qty for a in allocations)
-	return ReservationResult(
-		success=True,
-		item_code=item_code,
-		requested_qty=requested_qty,
-		reserved_qty=flt(tot_reserved, prec),
-		allocations=allocations,
-		idempotency_key=idempotency_key,
-		is_idempotent_replay=False,
-	)
+	except Exception:
+		frappe.db.rollback(save_point=sp_name)
+		raise
 
 
 def release_stock_reservation(
@@ -387,28 +540,47 @@ def release_stock_reservation(
 ) -> bool:
 	"""
 	Releases a native Stock Reservation Entry and restores ATP.
+	Idempotent: Releasing or cancelling an already released/cancelled reservation is a safe no-op.
 	If qty is None or >= remaining reserved qty, cancels the SRE.
 	If qty < remaining, reduces SRE reserved quantity.
 	Updates tracking in Inventory Reservation Reference.
+	Never allows negative reserved quantities.
 	"""
 	if not frappe.db.exists("Stock Reservation Entry", reservation_entry_name):
-		raise ReservationNotFoundError(
-			_("Stock Reservation Entry '{0}' not found.").format(reservation_entry_name)
+		# Also check if reservation_entry_name was passed as an idempotency key
+		ref_sre = frappe.db.get_value(
+			"Inventory Reservation Reference",
+			{"idempotency_key": reservation_entry_name},
+			"stock_reservation_entry",
 		)
+		if ref_sre and frappe.db.exists("Stock Reservation Entry", ref_sre):
+			reservation_entry_name = ref_sre
+		else:
+			raise ReservationNotFoundError(
+				_("Stock Reservation Entry or Reference '{0}' not found.").format(reservation_entry_name)
+			)
 
 	sre = frappe.get_doc("Stock Reservation Entry", reservation_entry_name)
-	if sre.docstatus == 2:
-		return True  # Already cancelled
+
+	# Safe idempotency: if already cancelled or closed, do not re-cancel or error
+	if sre.docstatus == 2 or sre.status in ("Cancelled", "Closed"):
+		return True
 
 	# Lock the Bin row during release
 	lock_inventory_scope(sre.item_code, [sre.warehouse])
 
-	net_reserved = flt(sre.reserved_qty) - flt(sre.delivered_qty)
+	net_reserved = flt(sre.reserved_qty) - flt(sre.delivered_qty) - flt(sre.transferred_qty) - flt(sre.consumed_qty)
+	if net_reserved <= 0:
+		# Nothing left to release (e.g. fully delivered)
+		return True
+
+	prec = get_stock_precision("Bin", "reserved_stock")
 
 	if qty is None or flt(qty) >= net_reserved:
-		# Full cancellation
+		# Full release / cancellation
 		sre.reload()
-		sre.cancel()
+		if sre.docstatus == 1:
+			sre.cancel()
 		frappe.db.set_value(
 			"Inventory Reservation Reference",
 			{"stock_reservation_entry": reservation_entry_name},
@@ -417,9 +589,11 @@ def release_stock_reservation(
 		)
 	else:
 		# Partial release
-		new_reserved = flt(sre.reserved_qty) - flt(qty)
+		release_qty = min(net_reserved, max(0.0, flt(qty)))
+		new_reserved = max(0.0, round(flt(sre.reserved_qty) - release_qty, prec))
 		sre.db_set("reserved_qty", new_reserved)
 		sre.update_reserved_stock_in_bin()
+		sre.update_status()
 		frappe.db.set_value(
 			"Inventory Reservation Reference",
 			{"stock_reservation_entry": reservation_entry_name},

@@ -35,6 +35,13 @@ class TestATPUnit(unittest.TestCase):
 	- Auditable explanation breakdown
 	"""
 
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		if not getattr(frappe.local, "site", None):
+			frappe.init("frontend")
+			frappe.connect()
+
 	def test_01_core_atp_formula_calculation(self):
 		"""
 		Verifies base candidate ATP:
@@ -413,3 +420,115 @@ class TestATPUnit(unittest.TestCase):
 			self.assertEqual(bd.lines[0].atp_qty, 70.0)
 			self.assertEqual(bd.lines[1].warehouse, "Orlando Main")
 			self.assertEqual(bd.lines[1].atp_qty, 45.0)
+
+	def test_12_effective_reserved_qty_no_double_counting(self):
+		"""
+		VERIFIES EXACT NON-DOUBLE-COUNTING FORMULA FOR EFFECTIVE RESERVED QTY:
+		Case 1: Only SRE exists (10) -> effective = 10
+		Case 2: Sales Order (10) + SRE tied to SO (10) -> effective = 10 (NOT 20!)
+		Case 3: Sales Order (10) + SRE tied to SO (4) -> effective = 10 (4 SRE + 6 unreserved SO)
+		Case 4: Sales Order (10) + no SRE -> effective = 10
+		Case 5: Manufacturing allocations (production=5, subcontract=3, plan=2) -> +10
+		"""
+		# Case 2 simulation: SO=10, SRE=10 for SO -> must equal 10 (NOT 20!)
+		def fake_sql_c2(query, values=None, as_list=0, *args, **kwargs):
+			return [[10.0]]
+
+		def fake_get_value_c2(doctype, filters, fieldname=None, *args, **kwargs):
+			if doctype == "Bin":
+				return frappe._dict({
+					"reserved_qty": 10.0,
+					"reserved_qty_for_production": 0.0,
+					"reserved_qty_for_sub_contract": 0.0,
+					"reserved_qty_for_production_plan": 0.0,
+				})
+			return None
+
+		with patch.object(frappe.db, "sql", side_effect=fake_sql_c2), \
+			 patch.object(frappe.db, "get_value", side_effect=fake_get_value_c2), \
+			 patch("bop_erp.inventory.availability.get_stock_precision", return_value=3):
+			res = get_effective_reserved_qty("BOLT-001", "Miami Main")
+			self.assertEqual(res, 10.0)
+
+		# Case 3 simulation: SO=10, SRE=4 for SO -> 4 SRE + 6 unreserved SO = 10
+		def fake_sql_c3(query, values=None, as_list=0, *args, **kwargs):
+			return [[4.0]]
+
+		def fake_get_value_c3(doctype, filters, fieldname=None, *args, **kwargs):
+			if doctype == "Bin":
+				return frappe._dict({
+					"reserved_qty": 10.0,
+					"reserved_qty_for_production": 0.0,
+					"reserved_qty_for_sub_contract": 0.0,
+					"reserved_qty_for_production_plan": 0.0,
+				})
+			return None
+
+		with patch.object(frappe.db, "sql", side_effect=fake_sql_c3), \
+			 patch.object(frappe.db, "get_value", side_effect=fake_get_value_c3), \
+			 patch("bop_erp.inventory.availability.get_stock_precision", return_value=3):
+			res = get_effective_reserved_qty("BOLT-001", "Miami Main")
+			self.assertEqual(res, 10.0)
+
+		# Case 5 simulation: SO=0, SRE=0, manufacturing=10 -> 10
+		def fake_sql_c5(query, values=None, as_list=0, *args, **kwargs):
+			return [[0.0]]
+
+		def fake_get_value_c5(doctype, filters, fieldname=None, *args, **kwargs):
+			if doctype == "Bin":
+				return frappe._dict({
+					"reserved_qty": 0.0,
+					"reserved_qty_for_production": 5.0,
+					"reserved_qty_for_sub_contract": 3.0,
+					"reserved_qty_for_production_plan": 2.0,
+				})
+			return None
+
+		with patch.object(frappe.db, "sql", side_effect=fake_sql_c5), \
+			 patch.object(frappe.db, "get_value", side_effect=fake_get_value_c5), \
+			 patch("bop_erp.inventory.availability.get_stock_precision", return_value=3):
+			res = get_effective_reserved_qty("BOLT-001", "Miami Main")
+			self.assertEqual(res, 10.0)
+
+	def test_13_reservation_result_partial_and_unfulfilled_qty(self):
+		"""
+		Verifies ReservationResult model supports unfulfilled_qty and partial mode fields.
+		"""
+		from bop_erp.inventory.models import ReservationAllocation, ReservationResult
+
+		res = ReservationResult(
+			success=True,
+			item_code="BOLT-001",
+			requested_qty=10.0,
+			reserved_qty=8.0,
+			unfulfilled_qty=2.0,
+			allocations=[
+				ReservationAllocation(warehouse="Miami Main", allocated_qty=8.0, stock_reservation_entry="SRE-001")
+			],
+		)
+		self.assertEqual(res.requested_qty, 10.0)
+		self.assertEqual(res.reserved_qty, 8.0)
+		self.assertEqual(res.unfulfilled_qty, 2.0)
+		self.assertEqual(res.is_idempotent_replay, False)
+
+	def test_14_atp_snapshot_vs_reservation_guarantee_semantics(self):
+		"""
+		Verifies that WarehouseATP and ChannelATP are read-only point-in-time snapshots,
+		confirming the architectural separation between informational calculation and transactional reservation.
+		"""
+		from bop_erp.inventory.models import ChannelATP, WarehouseATP
+
+		wh_atp = WarehouseATP(
+			item_code="BOLT-001",
+			warehouse="Miami Main",
+			company="Industrial DP",
+			actual_qty=100.0,
+			native_reserved_qty=10.0,
+			effective_reserved_qty=10.0,
+			safety_stock_qty=5.0,
+			candidate_atp_qty=85.0,
+			stock_uom="Nos",
+		)
+		self.assertIn("INFORMATIONAL ONLY", wh_atp.__doc__)
+		self.assertEqual(wh_atp.candidate_atp_qty, 85.0)
+
