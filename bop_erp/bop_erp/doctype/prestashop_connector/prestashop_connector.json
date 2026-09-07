@@ -14,6 +14,7 @@
   "read_enabled",
   "write_enabled",
   "webhook_enabled",
+  "eligible_order_states",
   "section_break_network",
   "timeout_seconds",
   "verify_tls",
@@ -82,6 +83,13 @@
    "fieldname": "webhook_enabled",
    "fieldtype": "Check",
    "label": "Webhook Enabled"
+  },
+  {
+   "default": "2,3,11",
+   "description": "Comma-separated list of PrestaShop order state IDs eligible for ERP order ingestion (default 2=Payment accepted, 3=Processing, 11=Remote payment accepted)",
+   "fieldname": "eligible_order_states",
+   "fieldtype": "Data",
+   "label": "Eligible Order States"
   },
   {
    "fieldname": "section_break_network",

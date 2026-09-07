@@ -183,6 +183,8 @@ class PrestaShopClient:
 				params[f"filter[{k}]"] = f"[{v}]"
 
 		data = self._request("GET", resource_name, params=params)
+		if isinstance(data, list):
+			return data
 		items = data.get(resource_name, [])
 		if isinstance(items, list):
 			return items
