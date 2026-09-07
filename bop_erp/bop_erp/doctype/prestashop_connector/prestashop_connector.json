@@ -85,8 +85,7 @@
    "label": "Webhook Enabled"
   },
   {
-   "default": "2,3,11",
-   "description": "Comma-separated list of PrestaShop order state IDs eligible for ERP order ingestion (default 2=Payment accepted, 3=Processing, 11=Remote payment accepted)",
+   "description": "Comma-separated list of PrestaShop order state IDs eligible for ERP order ingestion (e.g. 2=Payment accepted, 3=Processing in progress, 11=Remote payment accepted). Must be explicitly configured per connector.",
    "fieldname": "eligible_order_states",
    "fieldtype": "Data",
    "label": "Eligible Order States"

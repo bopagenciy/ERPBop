@@ -88,7 +88,8 @@ def discover_channel_orders(
 	"""
 	sales_channel = connector["sales_channel"]
 	provider = IntegrationProvider.PRESTASHOP
-	eligible_states = [s.strip() for s in str(connector.get("eligible_order_states") or "2,3,11").split(",") if s.strip()]
+	raw_states = connector.get("eligible_order_states")
+	eligible_states = [s.strip() for s in str(raw_states).split(",") if s.strip()] if raw_states else []
 
 	if not client:
 		config = PrestaShopConfig.from_connector_doc(connector)

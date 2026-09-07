@@ -53,8 +53,25 @@ from bop_erp.orders.exceptions import (
 	OrderReservationFailedError,
 )
 
-DEFAULT_ELIGIBLE_STATES = ("2", "3", "11")
-TOTAL_RECONCILIATION_TOLERANCE = 0.05
+def get_currency_tolerance(currency: Optional[str] = None) -> float:
+	"""
+	Derives financial reconciliation tolerance from native ERPNext currency precision.
+	Avoids arbitrary hardcoded tolerances (e.g. 0.05).
+	Uses 10^(-precision).
+	"""
+	precision = 2
+	try:
+		prec = frappe.get_precision("Sales Order", "net_total")
+		if prec is not None:
+			precision = int(prec)
+		elif currency:
+			frac = frappe.db.get_value("Currency", currency, "fraction_units")
+			if frac:
+				import math
+				precision = max(0, int(math.log10(float(frac))))
+	except Exception:
+		precision = 2
+	return round(1.0 / (10 ** max(0, precision)), precision)
 
 
 def compute_order_idempotency_key(provider: str, sales_channel: str, external_order_id: str) -> str:
@@ -71,7 +88,10 @@ def compute_order_idempotency_key(provider: str, sales_channel: str, external_or
 
 
 def get_eligible_order_states(sales_channel: str) -> List[str]:
-	"""Retrieves configured eligible order state IDs for a given sales channel connector."""
+	"""
+	Retrieves configured eligible order state IDs for a given sales channel connector.
+	Requires connector-specific configuration; does not assume universal state numbers.
+	"""
 	connector_name = frappe.db.get_value(
 		"PrestaShop Connector",
 		{"sales_channel": sales_channel, "enabled": 1},
@@ -81,7 +101,7 @@ def get_eligible_order_states(sales_channel: str) -> List[str]:
 		raw_states = frappe.db.get_value("PrestaShop Connector", connector_name, "eligible_order_states")
 		if raw_states:
 			return [s.strip() for s in str(raw_states).split(",") if s.strip()]
-	return list(DEFAULT_ELIGIBLE_STATES)
+	return []
 
 
 def find_existing_order_mapping(sales_channel: str, provider: str, external_order_id: str) -> Optional[str]:
@@ -139,7 +159,10 @@ def resolve_or_create_customer(
 	if existing_customer and frappe.db.exists("Customer", existing_customer):
 		return existing_customer
 
-	# 2. Acquire lock or attempt atomic insertion
+	# 2. Concurrency-safe atomic creation using Savepoint
+	sp_cust = f"sp_cust_{frappe.generate_hash(length=8)}"
+	frappe.db.savepoint(sp_cust)
+
 	cust_name = f"{customer.first_name} {customer.last_name}".strip()
 	if not cust_name:
 		cust_name = customer.company.strip() if customer.company else f"PS Customer {cid}"
@@ -159,39 +182,28 @@ def resolve_or_create_customer(
 	})
 	try:
 		c_doc.insert(ignore_permissions=True)
-	except (frappe.DuplicateEntryError, frappe.QueryDeadlockError, Exception):
-		winner = frappe.db.get_value(
-			"External ID Mapping",
-			{
-				"sales_channel": sales_channel,
-				"provider": str(provider).strip().upper(),
-				"external_entity_type": ExternalEntityType.CUSTOMER,
-				"external_id": cid,
-				"active": 1,
-			},
-			"erp_document",
-		)
-		if winner:
-			return winner
-		if frappe.db.exists("Customer", unique_cust_name):
-			return unique_cust_name
 
-	# 3. Create External ID Mapping with duplicate-race protection
-	mapping = frappe.get_doc({
-		"doctype": "External ID Mapping",
-		"sales_channel": sales_channel,
-		"provider": str(provider).strip().upper(),
-		"external_entity_type": ExternalEntityType.CUSTOMER,
-		"external_id": cid,
-		"erp_doctype": "Customer",
-		"erp_document": c_doc.name,
-		"active": 1,
-	})
-	try:
+		# 3. Create External ID Mapping with duplicate-race protection
+		mapping = frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": sales_channel,
+			"provider": str(provider).strip().upper(),
+			"external_entity_type": ExternalEntityType.CUSTOMER,
+			"external_id": cid,
+			"erp_doctype": "Customer",
+			"erp_document": c_doc.name,
+			"active": 1,
+		})
 		mapping.insert(ignore_permissions=True)
 		return c_doc.name
-	except (frappe.DuplicateEntryError, frappe.QueryDeadlockError, Exception):
-		# Race condition: another thread created the mapping simultaneously
+	except frappe.QueryDeadlockError:
+		raise
+	except (frappe.DuplicateEntryError, Exception):
+		# Roll back unmapped customer to prevent orphan record
+		try:
+			frappe.db.rollback(save_point=sp_cust)
+		except Exception:
+			pass
 		winner = frappe.db.get_value(
 			"External ID Mapping",
 			{
@@ -205,7 +217,7 @@ def resolve_or_create_customer(
 		)
 		if winner:
 			return winner
-		return c_doc.name
+		raise
 
 
 def resolve_or_create_address(
@@ -238,7 +250,10 @@ def resolve_or_create_address(
 	if existing_address and frappe.db.exists("Address", existing_address):
 		return existing_address
 
-	# 2. Create Address
+	# 2. Concurrency-safe atomic creation using Savepoint
+	sp_addr = f"sp_addr_{frappe.generate_hash(length=8)}"
+	frappe.db.savepoint(sp_addr)
+
 	addr_title = f"{address.first_name} {address.last_name}".strip() or customer_name
 	country = _resolve_country(address.country)
 
@@ -261,23 +276,31 @@ def resolve_or_create_address(
 		],
 	})
 	a_doc.flags.ignore_mandatory = True
-	a_doc.insert(ignore_permissions=True)
 
-	# 3. Create External ID Mapping with duplicate-race protection
-	mapping = frappe.get_doc({
-		"doctype": "External ID Mapping",
-		"sales_channel": sales_channel,
-		"provider": str(provider).strip().upper(),
-		"external_entity_type": ExternalEntityType.ADDRESS,
-		"external_id": aid,
-		"erp_doctype": "Address",
-		"erp_document": a_doc.name,
-		"active": 1,
-	})
 	try:
+		a_doc.insert(ignore_permissions=True)
+
+		# 3. Create External ID Mapping with duplicate-race protection
+		mapping = frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": sales_channel,
+			"provider": str(provider).strip().upper(),
+			"external_entity_type": ExternalEntityType.ADDRESS,
+			"external_id": aid,
+			"erp_doctype": "Address",
+			"erp_document": a_doc.name,
+			"active": 1,
+		})
 		mapping.insert(ignore_permissions=True)
 		return a_doc.name
-	except frappe.DuplicateEntryError:
+	except frappe.QueryDeadlockError:
+		raise
+	except (frappe.DuplicateEntryError, Exception):
+		# Roll back unmapped address to prevent orphan record
+		try:
+			frappe.db.rollback(save_point=sp_addr)
+		except Exception:
+			pass
 		winner = frappe.db.get_value(
 			"External ID Mapping",
 			{
@@ -291,7 +314,7 @@ def resolve_or_create_address(
 		)
 		if winner:
 			return winner
-		return a_doc.name
+		raise
 
 
 def resolve_order_line_item(
@@ -399,6 +422,38 @@ def schedule_post_commit_publication(affected_channels: List[str], item_codes: L
 	frappe.db.after_commit(_on_commit)
 
 
+def _ensure_order_reservations(so_doc, sales_channel: str):
+	"""
+	Ensures complete native stock reservations for a Sales Order during crash recovery.
+	"""
+	for so_item in so_doc.items:
+		existing_sre = frappe.db.get_value(
+			"Stock Reservation Entry",
+			{
+				"voucher_type": "Sales Order",
+				"voucher_no": so_doc.name,
+				"voucher_detail_no": so_item.name,
+				"docstatus": 1,
+				"status": ["not in", ["Closed", "Delivered", "Cancelled"]],
+			},
+			"name",
+		)
+		if not existing_sre:
+			reserve_channel_stock(
+				item_code=so_item.item_code,
+				sales_channel=sales_channel,
+				requested_qty=so_item.qty,
+				voucher_type="Sales Order",
+				voucher_no=so_doc.name,
+				voucher_detail_no=so_item.name,
+				allow_partial=False,
+				idempotency_key=f"SO:{so_doc.name}:{so_item.name}",
+				source_doctype="Sales Order",
+				source_document=so_doc.name,
+				source_document_item=so_item.name,
+			)
+
+
 def ingest_order_pipeline(
 	external_order: ExternalOrder,
 	client: Optional[PrestaShopClient] = None,
@@ -406,13 +461,15 @@ def ingest_order_pipeline(
 	"""
 	Core atomic ingestion pipeline:
 	1. External order freshness & eligibility check.
-	2. Idempotency & existing mapping check.
+	2. Idempotency & existing mapping check with crash recovery completion.
 	3. Customer & Address resolution.
-	4. Line item mapping & ATP preflight verification.
-	5. Native Sales Order creation & submission.
-	6. Native Stock Reservation Entry allocation (Phase 1I service, all-or-nothing).
-	7. ORDER External ID Mapping creation.
-	8. Post-commit multi-channel publication intent scheduling.
+	4. Line item mapping & aggregate ATP preflight verification.
+	5. Native Sales Order creation in Draft (docstatus=0).
+	6. Pre-claim External ID Mapping before submission.
+	7. Sales Order submission.
+	8. Native Stock Reservation Entry allocation (all-or-nothing).
+	9. Atomic savepoint rollback if any reservation or step fails.
+	10. Post-commit multi-channel publication intent scheduling.
 	"""
 	sales_channel = external_order.sales_channel
 	provider = external_order.provider
@@ -421,6 +478,10 @@ def ingest_order_pipeline(
 	# 1. Check idempotency: does mapping already exist?
 	existing_so = find_existing_order_mapping(sales_channel, provider, order_id)
 	if existing_so and frappe.db.exists("Sales Order", existing_so):
+		so_doc = frappe.get_doc("Sales Order", existing_so)
+		if so_doc.docstatus == 0:
+			so_doc.submit()
+		_ensure_order_reservations(so_doc, sales_channel)
 		return {
 			"success": True,
 			"sales_order": existing_so,
@@ -446,11 +507,12 @@ def ingest_order_pipeline(
 			)
 		)
 
-	# 3. Line validation
+	# 3. Line validation & item resolution
 	if not external_order.lines:
 		raise OrderIngestionError(_("External order contains no line items."))
 
 	resolved_lines: List[Tuple[ExternalOrderLine, str]] = []
+	requested_by_item: Dict[str, float] = {}
 	for line in external_order.lines:
 		if flt(line.quantity) <= 0:
 			raise InvalidOrderQuantityError(
@@ -458,14 +520,15 @@ def ingest_order_pipeline(
 			)
 		item_code = resolve_order_line_item(line, sales_channel, provider)
 		resolved_lines.append((line, item_code))
+		requested_by_item[item_code] = requested_by_item.get(item_code, 0.0) + flt(line.quantity)
 
-	# 4. In-Transaction ATP Preflight Check
-	for line, item_code in resolved_lines:
+	# 4. In-Transaction Aggregate ATP Preflight Check
+	for item_code, tot_qty in requested_by_item.items():
 		atp_res = get_channel_atp(item_code, sales_channel)
-		if flt(line.quantity) > flt(atp_res.aggregate_atp_qty):
+		if flt(tot_qty) > flt(atp_res.aggregate_atp_qty):
 			raise InsufficientOrderStockError(
-				_("Insufficient Stock: Requested {0} units of {1}, available channel ATP is {2}").format(
-					line.quantity, item_code, atp_res.aggregate_atp_qty
+				_("Insufficient Stock: Total requested {0} units of {1}, available channel ATP is {2}").format(
+					tot_qty, item_code, atp_res.aggregate_atp_qty
 				)
 			)
 
@@ -507,19 +570,25 @@ def ingest_order_pipeline(
 			"delivery_date": _parse_date(external_order.date_add) or nowdate(),
 		})
 
-	# Total Reconciliation: Check product subtotal
-	ext_prod_tot = flt(external_order.totals.total_products_ex_tax)
-	if ext_prod_tot > 0.0 and abs(expected_product_total - ext_prod_tot) > TOTAL_RECONCILIATION_TOLERANCE:
-		raise OrderTotalMismatchError(
-			_("Order Total Mismatch: Computed product total {0} != external total {1}").format(
-				expected_product_total, ext_prod_tot
-			)
-		)
-
 	currency = external_order.currency or "USD"
 	if not frappe.db.exists("Currency", currency):
 		currency = frappe.defaults.get_global_default("currency") or "USD"
 
+	# Dynamic currency precision tolerance
+	tolerance = get_currency_tolerance(currency)
+	ext_prod_tot = flt(external_order.totals.total_products_ex_tax)
+	if ext_prod_tot > 0.0 and abs(expected_product_total - ext_prod_tot) > tolerance:
+		raise OrderTotalMismatchError(
+			_("Order Total Mismatch: Computed product total {0} != external total {1} (tolerance {2})").format(
+				expected_product_total, ext_prod_tot, tolerance
+			)
+		)
+
+	# 8. Multi-line All-Or-Nothing Ingestion with Pre-Claim & Savepoint Rollback Protection
+	sp_order = f"sp_ord_ingest_{frappe.generate_hash(length=8)}"
+	frappe.db.savepoint(sp_order)
+
+	# Create Sales Order in DRAFT (docstatus = 0)
 	so = frappe.get_doc({
 		"doctype": "Sales Order",
 		"customer": customer_name,
@@ -535,13 +604,44 @@ def ingest_order_pipeline(
 	})
 	so.flags.ignore_permissions = True
 	so.insert(ignore_permissions=True)
+
+	# Pre-claim External ID Mapping BEFORE submitting or reserving!
+	mapping = frappe.get_doc({
+		"doctype": "External ID Mapping",
+		"sales_channel": sales_channel,
+		"provider": str(provider).strip().upper(),
+		"external_entity_type": ExternalEntityType.ORDER,
+		"external_id": str(order_id).strip(),
+		"erp_doctype": "Sales Order",
+		"erp_document": so.name,
+		"active": 1,
+	})
+	try:
+		mapping.insert(ignore_permissions=True)
+	except frappe.QueryDeadlockError:
+		raise
+	except (frappe.DuplicateEntryError, frappe.ValidationError):
+		# Race condition: another worker claimed this external order first!
+		# Roll back our draft order cleanly so NO transient submitted order exists!
+		try:
+			frappe.db.rollback(save_point=sp_order)
+		except Exception:
+			pass
+		winner = find_existing_order_mapping(sales_channel, provider, order_id)
+		if winner:
+			return {
+				"success": True,
+				"sales_order": winner,
+				"is_replay": True,
+				"reason": "CONCURRENT_WINNER_MAPPED",
+			}
+		raise
+
+	# Confirmed sole owner: proceed with submission
 	so.submit()
 
-	# 8. Multi-line All-Or-Nothing Reservation with Savepoint Rollback Protection
-	sp_res = f"sp_ord_res_{frappe.generate_hash(length=8)}"
-	frappe.db.savepoint(sp_res)
+	# Execute native Stock Reservation Entries (all-or-nothing)
 	created_reservations = []
-
 	try:
 		for so_item in so.items:
 			res = reserve_channel_stock(
@@ -558,48 +658,17 @@ def ingest_order_pipeline(
 				source_document_item=so_item.name,
 			)
 			created_reservations.append(res)
+	except frappe.QueryDeadlockError:
+		raise
 	except Exception as res_err:
-		# Roll back reservation savepoint, cancel and remove the Sales Order
-		frappe.db.rollback(save_point=sp_res)
+		# Roll back savepoint sp_order: draft SO, submitted SO, reservations, and mapping are 100% wiped!
 		try:
-			so.cancel()
-			frappe.delete_doc("Sales Order", so.name, force=True, ignore_permissions=True)
+			frappe.db.rollback(save_point=sp_order)
 		except Exception:
 			pass
 		raise OrderReservationFailedError(
 			_("Order Reservation Failed: {0}").format(str(res_err))
 		) from res_err
-
-	# 9. Create ORDER External ID Mapping
-	mapping = frappe.get_doc({
-		"doctype": "External ID Mapping",
-		"sales_channel": sales_channel,
-		"provider": str(provider).strip().upper(),
-		"external_entity_type": ExternalEntityType.ORDER,
-		"external_id": str(order_id).strip(),
-		"erp_doctype": "Sales Order",
-		"erp_document": so.name,
-		"active": 1,
-	})
-	try:
-		mapping.insert(ignore_permissions=True)
-	except (frappe.DuplicateEntryError, frappe.ValidationError):
-		# Race condition: someone already created mapping
-		winner = find_existing_order_mapping(sales_channel, provider, order_id)
-		if winner and winner != so.name:
-			# Unwind this order to prevent duplicate
-			frappe.db.rollback(save_point=sp_res)
-			try:
-				so.cancel()
-				frappe.delete_doc("Sales Order", so.name, force=True, ignore_permissions=True)
-			except Exception:
-				pass
-			return {
-				"success": True,
-				"sales_order": winner,
-				"is_replay": True,
-				"reason": "CONCURRENT_WINNER_MAPPED",
-			}
 
 	# 10. Multi-channel Affected Publication Scheduling
 	item_codes = [ic for _, ic in resolved_lines]
@@ -653,6 +722,10 @@ def process_order_ingestion_event(
 	# Check for crash recovery / existing mapping
 	existing_so = find_existing_order_mapping(sales_channel, provider, external_order_id)
 	if existing_so and frappe.db.exists("Sales Order", existing_so):
+		so_doc = frappe.get_doc("Sales Order", existing_so)
+		if so_doc.docstatus == 0:
+			so_doc.submit()
+		_ensure_order_reservations(so_doc, sales_channel)
 		if verify_processing_authority(event_name, processing_token):
 			event_doc.db_set({
 				"status": IntegrationStatus.SUCCEEDED,

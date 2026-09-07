@@ -134,6 +134,39 @@ class TestPrestaShopOrderIngestionLive(FrappeTestCase):
 				"is_stock_item": 1,
 			}).insert(ignore_permissions=True)
 
+		cls.item_zero = "ITEM-ORD-LIVE-ZERO"
+		if not frappe.db.exists("Item", cls.item_zero):
+			frappe.get_doc({
+				"doctype": "Item",
+				"item_code": cls.item_zero,
+				"item_name": "Order Test Zero Item",
+				"item_group": "All Item Groups",
+				"stock_uom": "Nos",
+				"is_stock_item": 1,
+			}).insert(ignore_permissions=True)
+
+		cls.item_short = "ITEM-ORD-LIVE-SHORT"
+		if not frappe.db.exists("Item", cls.item_short):
+			frappe.get_doc({
+				"doctype": "Item",
+				"item_code": cls.item_short,
+				"item_name": "Order Test Short Item",
+				"item_group": "All Item Groups",
+				"stock_uom": "Nos",
+				"is_stock_item": 1,
+			}).insert(ignore_permissions=True)
+
+		cls.item_po = "ITEM-ORD-LIVE-PO"
+		if not frappe.db.exists("Item", cls.item_po):
+			frappe.get_doc({
+				"doctype": "Item",
+				"item_code": cls.item_po,
+				"item_name": "Order Test PO Item",
+				"item_group": "All Item Groups",
+				"stock_uom": "Nos",
+				"is_stock_item": 1,
+			}).insert(ignore_permissions=True)
+
 		# Setup PrestaShop Read Client
 		cls.config = PrestaShopConfig(
 			sales_channel="TID",
@@ -150,6 +183,9 @@ class TestPrestaShopOrderIngestionLive(FrappeTestCase):
 		cls._set_physical_stock(cls.item_simple, cls.wh_a, 500.0)
 		cls._set_physical_stock(cls.item_var9, cls.wh_a, 500.0)
 		cls._set_physical_stock(cls.item_var10, cls.wh_a, 500.0)
+		cls._set_physical_stock(cls.item_short, cls.wh_a, 2.0)
+		cls._set_physical_stock(cls.item_zero, cls.wh_a, 0.0)
+		cls._set_physical_stock(cls.item_po, cls.wh_a, 0.0)
 		frappe.db.commit()
 
 	@classmethod
@@ -166,7 +202,7 @@ class TestPrestaShopOrderIngestionLive(FrappeTestCase):
 			frappe.delete_doc("Warehouse", cls.wh_a, force=True, ignore_permissions=True)
 
 		# Clean test items
-		for ic in [cls.item_simple, cls.item_var9, cls.item_var10]:
+		for ic in [cls.item_simple, cls.item_var9, cls.item_var10, cls.item_zero, cls.item_short, cls.item_po]:
 			frappe.db.delete("Bin", {"item_code": ic})
 			if frappe.db.exists("Item", ic):
 				frappe.delete_doc("Item", ic, force=True, ignore_permissions=True)
@@ -190,7 +226,7 @@ class TestPrestaShopOrderIngestionLive(FrappeTestCase):
 			# Clean Stock Reservation Entries
 			sres = frappe.get_all(
 				"Stock Reservation Entry",
-				filters={"item_code": ["in", [cls.item_simple, cls.item_var9, cls.item_var10]]},
+				filters={"item_code": ["in", [cls.item_simple, cls.item_var9, cls.item_var10, cls.item_zero, cls.item_short, cls.item_po]]},
 				fields=["name", "docstatus"],
 			)
 			for s in sres:
@@ -202,7 +238,7 @@ class TestPrestaShopOrderIngestionLive(FrappeTestCase):
 						pass
 				frappe.delete_doc("Stock Reservation Entry", s.name, force=True, ignore_permissions=True)
 
-			frappe.db.delete("Inventory Reservation Reference", {"item_code": ["in", [cls.item_simple, cls.item_var9, cls.item_var10]]})
+			frappe.db.delete("Inventory Reservation Reference", {"item_code": ["in", [cls.item_simple, cls.item_var9, cls.item_var10, cls.item_zero, cls.item_short, cls.item_po]]})
 			frappe.db.sql("DELETE FROM `tabIntegration Event` WHERE sales_channel = %s", (ch,))
 			frappe.db.sql("DELETE FROM `tabInventory Publication State` WHERE sales_channel = %s", (ch,))
 			frappe.db.sql("DELETE FROM `tabExternal ID Mapping` WHERE sales_channel = %s", (ch,))
@@ -211,12 +247,66 @@ class TestPrestaShopOrderIngestionLive(FrappeTestCase):
 			frappe.db.sql("DELETE FROM `tabSales Channel` WHERE name = %s", (ch,))
 
 		# Clean test Customers & Addresses
-		custs = frappe.get_all("Customer", filters={"customer_name": ["like", "%Test Customer%"]}, pluck="name")
-		for c in custs:
+		custs = frappe.get_all(
+			"Customer",
+			filters={
+				"name": [
+					"like",
+					"%Test Customer%",
+				]
+			},
+			pluck="name",
+		) + frappe.get_all(
+			"Customer",
+			filters={
+				"name": [
+					"like",
+					"%Crash Test%",
+				]
+			},
+			pluck="name",
+		) + frappe.get_all(
+			"Customer",
+			filters={
+				"name": [
+					"like",
+					"%FiveHundred%",
+				]
+			},
+			pluck="name",
+		)
+		for c in set(custs):
 			frappe.delete_doc("Customer", c, force=True, ignore_permissions=True)
 
-		addrs = frappe.get_all("Address", filters={"address_title": ["like", "%Test Customer%"]}, pluck="name")
-		for a in addrs:
+		addrs = frappe.get_all(
+			"Address",
+			filters={
+				"address_title": [
+					"like",
+					"%Test Customer%",
+				]
+			},
+			pluck="name",
+		) + frappe.get_all(
+			"Address",
+			filters={
+				"address_title": [
+					"like",
+					"%Crash Test%",
+				]
+			},
+			pluck="name",
+		) + frappe.get_all(
+			"Address",
+			filters={
+				"address_title": [
+					"like",
+					"%FiveHundred%",
+				]
+			},
+			pluck="name",
+		)
+		for a in set(addrs):
 			frappe.delete_doc("Address", a, force=True, ignore_permissions=True)
 
 		frappe.db.commit()
@@ -228,6 +318,9 @@ class TestPrestaShopOrderIngestionLive(FrappeTestCase):
 		self._set_physical_stock(self.item_simple, self.wh_a, 100.0)
 		self._set_physical_stock(self.item_var9, self.wh_a, 100.0)
 		self._set_physical_stock(self.item_var10, self.wh_a, 100.0)
+		self._set_physical_stock(self.item_short, self.wh_a, 2.0)
+		self._set_physical_stock(self.item_zero, self.wh_a, 0.0)
+		self._set_physical_stock(self.item_po, self.wh_a, 0.0)
 		frappe.db.commit()
 
 	def tearDown(self):
@@ -346,6 +439,54 @@ class TestPrestaShopOrderIngestionLive(FrappeTestCase):
 			"external_variant_id": "10",
 			"erp_doctype": "Item",
 			"erp_document": self.item_var10,
+			"active": 1,
+		}).insert(ignore_permissions=True)
+
+		# Mappings: Product 20 -> item_zero
+		frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": self.channel_a,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"external_entity_type": ExternalEntityType.PRODUCT,
+			"external_id": "20",
+			"erp_doctype": "Item",
+			"erp_document": self.item_zero,
+			"active": 1,
+		}).insert(ignore_permissions=True)
+
+		# Mappings: Product 21 -> item_short
+		frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": self.channel_a,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"external_entity_type": ExternalEntityType.PRODUCT,
+			"external_id": "21",
+			"erp_doctype": "Item",
+			"erp_document": self.item_short,
+			"active": 1,
+		}).insert(ignore_permissions=True)
+
+		# Mappings: Product 22 -> item_po
+		frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": self.channel_a,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"external_entity_type": ExternalEntityType.PRODUCT,
+			"external_id": "22",
+			"erp_doctype": "Item",
+			"erp_document": self.item_po,
+			"active": 1,
+		}).insert(ignore_permissions=True)
+
+		# Mappings on Channel B: Product 6 -> item_simple
+		frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": self.channel_b,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"external_entity_type": ExternalEntityType.PRODUCT,
+			"external_id": "6",
+			"erp_doctype": "Item",
+			"erp_document": self.item_simple,
 			"active": 1,
 		}).insert(ignore_permissions=True)
 
@@ -753,6 +894,20 @@ class TestPrestaShopOrderIngestionLive(FrappeTestCase):
 			}),
 			1,
 		)
+		# Exactly ONE Sales Order in database, zero transient or extra submitted orders
+		self.assertEqual(
+			frappe.db.count("Sales Order", {"sales_channel": self.channel_a, "customer": ["like", "%Epsilon%"]}),
+			1,
+		)
+		# Exactly ONE active SRE with reserved_qty = 1.0
+		total_reserved = frappe.db.sql(
+			"""
+			SELECT SUM(reserved_qty) FROM `tabStock Reservation Entry`
+			WHERE voucher_type = 'Sales Order' AND voucher_no = %s AND docstatus = 1
+			""",
+			(res1["sales_order"],),
+		)[0][0]
+		self.assertEqual(flt(total_reserved), 1.0)
 
 	# ==================================================
 	# 8. CRASH RECOVERY LIVE TEST
@@ -916,3 +1071,388 @@ class TestPrestaShopOrderIngestionLive(FrappeTestCase):
 		self.assertTrue(res["success"])
 		self.assertIn(self.channel_a, res["affected_channels"])
 		self.assertIn(self.channel_b, res["affected_channels"])
+
+	# ==================================================
+	# 12. ZERO STOCK ORDER LIVE TEST
+	# ==================================================
+	def test_12_zero_stock_order_live(self):
+		"""
+		External order arrives for an item with 0.0 physical stock.
+		Must reject immediately with InsufficientOrderStockError.
+		Must leave ZERO active submitted Sales Orders and ZERO reservations.
+		"""
+		atp = get_channel_atp(self.item_zero, self.channel_a).aggregate_atp_qty
+		self.assertEqual(atp, 0.0)
+
+		ext_order = ExternalOrder(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.channel_a,
+			external_order_id="912",
+			external_reference="SYNTH-912",
+			order_state_id="2",
+			customer=ExternalCustomer(external_customer_id="912", first_name="Test Customer", last_name="ZeroStock"),
+			lines=[ExternalOrderLine(external_line_id="1", external_product_id="20", quantity=2.0, unit_price_ex_tax=10.0)],
+			totals=ExternalTotals(total_products_ex_tax=20.0, total_paid=20.0),
+		)
+
+		with self.assertRaises(InsufficientOrderStockError):
+			ingest_order_pipeline(ext_order)
+
+		self.assertIsNone(find_existing_order_mapping(self.channel_a, IntegrationProvider.PRESTASHOP, "912"))
+		# Verify zero submitted Sales Orders
+		self.assertEqual(
+			frappe.db.count("Sales Order", {"sales_channel": self.channel_a, "customer": ["like", "%ZeroStock%"]}),
+			0,
+		)
+		# Verify zero SREs
+		self.assertEqual(
+			frappe.db.count("Stock Reservation Entry", {"item_code": self.item_zero}),
+			0,
+		)
+
+	# ==================================================
+	# 13. PARTIALLY AVAILABLE SINGLE-LINE ORDER LIVE TEST
+	# ==================================================
+	def test_13_partially_available_single_line_order_live(self):
+		"""
+		Available physical stock is 2.0, order requests 5.0.
+		Under all-or-nothing policy, partial acceptance is FORBIDDEN.
+		Must fail with InsufficientOrderStockError.
+		Must leave ZERO active Sales Orders and ZERO reservations.
+		Stock must remain at 2.0.
+		"""
+		atp_before = get_channel_atp(self.item_short, self.channel_a).aggregate_atp_qty
+		self.assertEqual(atp_before, 2.0)
+
+		ext_order = ExternalOrder(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.channel_a,
+			external_order_id="913",
+			external_reference="SYNTH-913",
+			order_state_id="2",
+			customer=ExternalCustomer(external_customer_id="913", first_name="Test Customer", last_name="PartialShort"),
+			lines=[ExternalOrderLine(external_line_id="1", external_product_id="21", quantity=5.0, unit_price_ex_tax=15.0)],
+			totals=ExternalTotals(total_products_ex_tax=75.0, total_paid=75.0),
+		)
+
+		with self.assertRaises(InsufficientOrderStockError):
+			ingest_order_pipeline(ext_order)
+
+		self.assertIsNone(find_existing_order_mapping(self.channel_a, IntegrationProvider.PRESTASHOP, "913"))
+		self.assertEqual(
+			frappe.db.count("Sales Order", {"sales_channel": self.channel_a, "customer": ["like", "%PartialShort%"]}),
+			0,
+		)
+		self.assertEqual(
+			frappe.db.count("Stock Reservation Entry", {"item_code": self.item_short}),
+			0,
+		)
+		atp_after = get_channel_atp(self.item_short, self.channel_a).aggregate_atp_qty
+		self.assertEqual(atp_after, 2.0)
+
+	# ==================================================
+	# 14. MULTI-LINE PARTIAL FAILURE FULL ROLLBACK
+	# ==================================================
+	def test_14_multiline_partial_failure_full_rollback_live(self):
+		"""
+		Multi-line order:
+		- Line 1: Item with ample stock (item_simple requested 2, ATP 100)
+		- Line 2: Item with insufficient stock (item_short requested 3, ATP 2)
+		Must fail atomically.
+		ZERO active Sales Orders.
+		ZERO surviving SREs for Line 1 (full rollback).
+		"""
+		atp_simple_before = get_channel_atp(self.item_simple, self.channel_a).aggregate_atp_qty
+		atp_short_before = get_channel_atp(self.item_short, self.channel_a).aggregate_atp_qty
+
+		ext_order = ExternalOrder(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.channel_a,
+			external_order_id="914",
+			external_reference="SYNTH-914",
+			order_state_id="2",
+			customer=ExternalCustomer(external_customer_id="914", first_name="Test Customer", last_name="MultiRollback"),
+			lines=[
+				ExternalOrderLine(external_line_id="1", external_product_id="6", quantity=2.0, unit_price_ex_tax=10.0),
+				ExternalOrderLine(external_line_id="2", external_product_id="21", quantity=3.0, unit_price_ex_tax=15.0),
+			],
+			totals=ExternalTotals(total_products_ex_tax=65.0, total_paid=65.0),
+		)
+
+		with self.assertRaises(InsufficientOrderStockError):
+			ingest_order_pipeline(ext_order)
+
+		self.assertIsNone(find_existing_order_mapping(self.channel_a, IntegrationProvider.PRESTASHOP, "914"))
+		self.assertEqual(
+			frappe.db.count("Sales Order", {"sales_channel": self.channel_a, "customer": ["like", "%MultiRollback%"]}),
+			0,
+		)
+		# Line 1 must NOT leave a surviving reservation!
+		self.assertEqual(
+			frappe.db.count("Stock Reservation Entry", {"voucher_no": ["like", "%914%"]}),
+			0,
+		)
+		self.assertEqual(
+			get_channel_atp(self.item_simple, self.channel_a).aggregate_atp_qty,
+			atp_simple_before,
+		)
+		self.assertEqual(
+			get_channel_atp(self.item_short, self.channel_a).aggregate_atp_qty,
+			atp_short_before,
+		)
+
+	# ==================================================
+	# 15. CROSS-CHANNEL SAME EXTERNAL ORDER ID
+	# ==================================================
+	def test_15_cross_channel_same_external_order_id_live(self):
+		"""
+		Two orders from different sales channels (Channel A and Channel B)
+		share the exact same external_order_id="500".
+		Both must ingest cleanly, mapping to 2 distinct ERP Sales Orders.
+		"""
+		ext_order_a = ExternalOrder(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.channel_a,
+			external_order_id="500",
+			external_reference="SYNTH-500-A",
+			order_state_id="2",
+			customer=ExternalCustomer(external_customer_id="500-A", first_name="Cust A", last_name="FiveHundred"),
+			lines=[ExternalOrderLine(external_line_id="1", external_product_id="6", quantity=1.0, unit_price_ex_tax=20.0)],
+			totals=ExternalTotals(total_products_ex_tax=20.0, total_paid=20.0),
+		)
+
+		ext_order_b = ExternalOrder(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.channel_b,
+			external_order_id="500",
+			external_reference="SYNTH-500-B",
+			order_state_id="2",
+			customer=ExternalCustomer(external_customer_id="500-B", first_name="Cust B", last_name="FiveHundred"),
+			lines=[ExternalOrderLine(external_line_id="1", external_product_id="6", quantity=1.0, unit_price_ex_tax=20.0)],
+			totals=ExternalTotals(total_products_ex_tax=20.0, total_paid=20.0),
+		)
+
+		res_a = ingest_order_pipeline(ext_order_a)
+		res_b = ingest_order_pipeline(ext_order_b)
+
+		self.assertTrue(res_a["success"])
+		self.assertTrue(res_b["success"])
+
+		so_a = res_a["sales_order"]
+		so_b = res_b["sales_order"]
+
+		# Must be two distinct Sales Orders
+		self.assertNotEqual(so_a, so_b)
+		self.assertEqual(frappe.db.get_value("Sales Order", so_a, "sales_channel"), self.channel_a)
+		self.assertEqual(frappe.db.get_value("Sales Order", so_b, "sales_channel"), self.channel_b)
+
+		# Mappings must be distinct and channel-scoped
+		mapped_a = find_existing_order_mapping(self.channel_a, IntegrationProvider.PRESTASHOP, "500")
+		mapped_b = find_existing_order_mapping(self.channel_b, IntegrationProvider.PRESTASHOP, "500")
+		self.assertEqual(mapped_a, so_a)
+		self.assertEqual(mapped_b, so_b)
+
+	# ==================================================
+	# 16. SAME EMAIL DIFFERENT CUSTOMERS NOT MERGED
+	# ==================================================
+	def test_16_same_email_different_customers_not_merged_live(self):
+		"""
+		Two orders have different external_customer_ids (916-A, 916-B)
+		but share the exact same email address.
+		Automated ingestion must NOT merge them into a single Customer.
+		"""
+		shared_email = "shared_live_audit@example.com"
+
+		ext_order_1 = ExternalOrder(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.channel_a,
+			external_order_id="916-1",
+			external_reference="SYNTH-916-1",
+			order_state_id="2",
+			customer=ExternalCustomer(
+				external_customer_id="916-A",
+				first_name="Alice",
+				last_name="Test Customer",
+				email=shared_email,
+			),
+			lines=[ExternalOrderLine(external_line_id="1", external_product_id="6", quantity=1.0, unit_price_ex_tax=20.0)],
+			totals=ExternalTotals(total_products_ex_tax=20.0, total_paid=20.0),
+		)
+
+		ext_order_2 = ExternalOrder(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.channel_a,
+			external_order_id="916-2",
+			external_reference="SYNTH-916-2",
+			order_state_id="2",
+			customer=ExternalCustomer(
+				external_customer_id="916-B",
+				first_name="Bob",
+				last_name="Test Customer",
+				email=shared_email,
+			),
+			lines=[ExternalOrderLine(external_line_id="1", external_product_id="6", quantity=1.0, unit_price_ex_tax=20.0)],
+			totals=ExternalTotals(total_products_ex_tax=20.0, total_paid=20.0),
+		)
+
+		res1 = ingest_order_pipeline(ext_order_1)
+		res2 = ingest_order_pipeline(ext_order_2)
+
+		so1 = frappe.get_doc("Sales Order", res1["sales_order"])
+		so2 = frappe.get_doc("Sales Order", res2["sales_order"])
+
+		# Two separate Customers must exist
+		self.assertNotEqual(so1.customer, so2.customer)
+
+		cust_a = frappe.db.get_value("External ID Mapping", {
+			"sales_channel": self.channel_a,
+			"external_entity_type": ExternalEntityType.CUSTOMER,
+			"external_id": "916-A",
+			"active": 1,
+		}, "erp_document")
+		cust_b = frappe.db.get_value("External ID Mapping", {
+			"sales_channel": self.channel_a,
+			"external_entity_type": ExternalEntityType.CUSTOMER,
+			"external_id": "916-B",
+			"active": 1,
+		}, "erp_document")
+
+		self.assertIsNotNone(cust_a)
+		self.assertIsNotNone(cust_b)
+		self.assertNotEqual(cust_a, cust_b)
+
+	# ==================================================
+	# 17. ADDRESS EXTERNAL IDENTITY
+	# ==================================================
+	def test_17_address_external_identity_live(self):
+		"""
+		PrestaShop delivery and invoice addresses are mapped by external_address_id.
+		Sales Order links to the mapped Address document.
+		"""
+		ext_order = ExternalOrder(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.channel_a,
+			external_order_id="917",
+			external_reference="SYNTH-917",
+			order_state_id="2",
+			customer=ExternalCustomer(external_customer_id="917", first_name="Test Customer", last_name="AddrIdentity"),
+			delivery_address=ExternalAddress(
+				external_address_id="ADDR-917-D",
+				first_name="Test Customer",
+				last_name="AddrIdentity",
+				address1="789 Shipping Way",
+				city="Miami",
+				postcode="33101",
+				country="United States",
+			),
+			invoice_address=ExternalAddress(
+				external_address_id="ADDR-917-I",
+				first_name="Test Customer",
+				last_name="AddrIdentity",
+				address1="101 Billing Blvd",
+				city="Tampa",
+				postcode="33601",
+				country="United States",
+			),
+			lines=[ExternalOrderLine(external_line_id="1", external_product_id="6", quantity=1.0, unit_price_ex_tax=20.0)],
+			totals=ExternalTotals(total_products_ex_tax=20.0, total_paid=20.0),
+		)
+
+		res = ingest_order_pipeline(ext_order)
+		self.assertTrue(res["success"])
+		so = frappe.get_doc("Sales Order", res["sales_order"])
+
+		# Verify shipping address mapped
+		deliv_addr_name = frappe.db.get_value("External ID Mapping", {
+			"sales_channel": self.channel_a,
+			"external_entity_type": ExternalEntityType.ADDRESS,
+			"external_id": "ADDR-917-D",
+			"active": 1,
+		}, "erp_document")
+		self.assertIsNotNone(deliv_addr_name)
+		self.assertEqual(so.shipping_address_name, deliv_addr_name)
+
+		# Verify invoice address mapped
+		inv_addr_name = frappe.db.get_value("External ID Mapping", {
+			"sales_channel": self.channel_a,
+			"external_entity_type": ExternalEntityType.ADDRESS,
+			"external_id": "ADDR-917-I",
+			"active": 1,
+		}, "erp_document")
+		self.assertIsNotNone(inv_addr_name)
+		self.assertEqual(so.customer_address, inv_addr_name)
+
+	# ==================================================
+	# 18. INSUFFICIENT ORDER ZERO PUBLICATION INTENTS
+	# ==================================================
+	def test_18_insufficient_order_zero_publication_intents_live(self):
+		"""
+		When an order fails due to insufficient stock, ZERO publication
+		intents must be scheduled. Database state must be unmutated.
+		"""
+		intents_before = frappe.db.count("Inventory Publication State", {"sales_channel": self.channel_a})
+
+		ext_order = ExternalOrder(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.channel_a,
+			external_order_id="918",
+			external_reference="SYNTH-918",
+			order_state_id="2",
+			customer=ExternalCustomer(external_customer_id="918"),
+			lines=[ExternalOrderLine(external_line_id="1", external_product_id="20", quantity=10.0, unit_price_ex_tax=10.0)],
+			totals=ExternalTotals(total_products_ex_tax=100.0, total_paid=100.0),
+		)
+
+		with self.assertRaises(InsufficientOrderStockError):
+			ingest_order_pipeline(ext_order)
+
+		frappe.db.commit()
+		intents_after = frappe.db.count("Inventory Publication State", {"sales_channel": self.channel_a})
+		self.assertEqual(intents_after, intents_before)
+
+	# ==================================================
+	# 19. INCOMING ORDERED_QTY DOES NOT INCREASE ATP
+	# ==================================================
+	def test_19_incoming_ordered_qty_does_not_increase_atp_live(self):
+		"""
+		Regression verification of Phase 1I ATP authority:
+		item_po has actual_qty = 0.
+		Even with ordered_qty = 100 on tabBin, immediate Channel ATP MUST be 0.0.
+		An order requesting 1 unit must fail with InsufficientOrderStockError.
+		"""
+		# Ensure bin exists with actual_qty = 0 and ordered_qty = 100
+		bin_name = frappe.db.get_value("Bin", {"item_code": self.item_po, "warehouse": self.wh_a}, "name")
+		if not bin_name:
+			b = frappe.get_doc({
+				"doctype": "Bin",
+				"item_code": self.item_po,
+				"warehouse": self.wh_a,
+				"actual_qty": 0.0,
+				"ordered_qty": 100.0,
+			})
+			b.flags.ignore_permissions = True
+			b.insert(ignore_permissions=True)
+		else:
+			frappe.db.set_value("Bin", bin_name, {"actual_qty": 0.0, "ordered_qty": 100.0})
+		frappe.db.commit()
+
+		# Verify immediate ATP is strictly 0.0
+		atp = get_channel_atp(self.item_po, self.channel_a)
+		self.assertEqual(atp.aggregate_atp_qty, 0.0)
+
+		# Attempt order
+		ext_order = ExternalOrder(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.channel_a,
+			external_order_id="919",
+			external_reference="SYNTH-919",
+			order_state_id="2",
+			customer=ExternalCustomer(external_customer_id="919"),
+			lines=[ExternalOrderLine(external_line_id="1", external_product_id="22", quantity=1.0, unit_price_ex_tax=10.0)],
+			totals=ExternalTotals(total_products_ex_tax=10.0, total_paid=10.0),
+		)
+
+		with self.assertRaises(InsufficientOrderStockError):
+			ingest_order_pipeline(ext_order)
+
+		self.assertIsNone(find_existing_order_mapping(self.channel_a, IntegrationProvider.PRESTASHOP, "919"))

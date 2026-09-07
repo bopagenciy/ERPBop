@@ -264,6 +264,7 @@ class TestPrestaShopOrderIngestionUnit(FrappeTestCase):
 	# ==================================================
 	# 9. FINANCIAL TOTAL RECONCILIATION
 	# ==================================================
+	@patch("bop_erp.orders.ingestion.get_eligible_order_states")
 	@patch("bop_erp.orders.ingestion.find_existing_order_mapping")
 	@patch("bop_erp.orders.ingestion.resolve_order_line_item")
 	@patch("bop_erp.orders.ingestion.get_channel_atp")
@@ -272,8 +273,9 @@ class TestPrestaShopOrderIngestionUnit(FrappeTestCase):
 	@patch("frappe.get_doc")
 	@patch("frappe.db.get_value")
 	def test_09_financial_total_reconciliation(
-		self, mock_db_val, mock_get_doc, mock_res_addr, mock_res_cust, mock_atp, mock_res_item, mock_find_map
+		self, mock_db_val, mock_get_doc, mock_res_addr, mock_res_cust, mock_atp, mock_res_item, mock_find_map, mock_states
 	):
+		mock_states.return_value = ["2", "3", "11"]
 		mock_find_map.return_value = None
 		mock_res_item.return_value = "ITEM-1"
 		mock_atp.return_value = MagicMock(aggregate_atp_qty=100.0)
@@ -320,8 +322,10 @@ class TestPrestaShopOrderIngestionUnit(FrappeTestCase):
 	# ==================================================
 	# 10. QUANTITY VALIDATION
 	# ==================================================
+	@patch("bop_erp.orders.ingestion.get_eligible_order_states")
 	@patch("bop_erp.orders.ingestion.find_existing_order_mapping")
-	def test_10_quantity_validation(self, mock_find_map):
+	def test_10_quantity_validation(self, mock_find_map, mock_states):
+		mock_states.return_value = ["2", "3", "11"]
 		mock_find_map.return_value = None
 		ext_order = ExternalOrder(
 			provider=IntegrationProvider.PRESTASHOP,
@@ -344,9 +348,11 @@ class TestPrestaShopOrderIngestionUnit(FrappeTestCase):
 	# ==================================================
 	# 11. ELIGIBLE STATES FILTER
 	# ==================================================
+	@patch("bop_erp.orders.ingestion.get_eligible_order_states")
 	@patch("bop_erp.orders.ingestion.find_existing_order_mapping")
-	def test_11_eligible_states_filter(self, mock_find_map):
+	def test_11_eligible_states_filter(self, mock_find_map, mock_states):
 		mock_find_map.return_value = None
+		mock_states.return_value = ["2", "3", "11"]
 		ext_order = ExternalOrder(
 			provider=IntegrationProvider.PRESTASHOP,
 			sales_channel="TEST-A",
@@ -362,9 +368,11 @@ class TestPrestaShopOrderIngestionUnit(FrappeTestCase):
 	# ==================================================
 	# 12. EXTERNAL STATE REFRESH BEHAVIOR
 	# ==================================================
+	@patch("bop_erp.orders.ingestion.get_eligible_order_states")
 	@patch("bop_erp.orders.ingestion.find_existing_order_mapping")
-	def test_12_external_state_refresh(self, mock_find_map):
+	def test_12_external_state_refresh(self, mock_find_map, mock_states):
 		mock_find_map.return_value = None
+		mock_states.return_value = ["2", "3", "11"]
 		mock_client = MagicMock()
 		# Client reports order has been changed to state 7 (Refunded) on PrestaShop
 		mock_client.get_order.return_value = {"id": 205, "current_state": 7}
@@ -436,3 +444,64 @@ class TestPrestaShopOrderIngestionUnit(FrappeTestCase):
 		# Cursor at 0 -> next run starts at index (0 + 1) % 3 = 1 (TEST-B)
 		fair_order = get_fair_channel_order(channels)
 		self.assertEqual([c["sales_channel"] for c in fair_order], ["TEST-B", "TEST-C", "TEST-A"])
+
+	# ==================================================
+	# 16. DYNAMIC CURRENCY TOLERANCE
+	# ==================================================
+	def test_16_dynamic_currency_tolerance(self):
+		from bop_erp.orders.ingestion import get_currency_tolerance
+		# Standard 2-decimal precision (e.g. USD, EUR) -> 0.01 tolerance
+		tol = get_currency_tolerance("USD")
+		self.assertLessEqual(tol, 0.05)
+		self.assertGreater(tol, 0.0)
+
+	# ==================================================
+	# 17. CUSTOMER EMAIL NON-MERGING INDEPENDENCE
+	# ==================================================
+	@patch("bop_erp.orders.ingestion.frappe.db.get_value")
+	@patch("bop_erp.orders.ingestion.frappe.db.exists")
+	def test_17_customer_email_non_merging(self, mock_exists, mock_get_value):
+		# Two customers sharing the same email but different external IDs
+		cust_a = ExternalCustomer(external_customer_id="101", first_name="Alice", email="shared@example.com")
+		cust_b = ExternalCustomer(external_customer_id="102", first_name="Bob", email="shared@example.com")
+
+		# When resolving cust_a with existing mapping
+		mock_get_value.return_value = "CUST-ALICE"
+		mock_exists.return_value = True
+		res_a = resolve_or_create_customer(cust_a, sales_channel="TEST-A")
+		self.assertEqual(res_a, "CUST-ALICE")
+
+		# When resolving cust_b without existing mapping
+		mock_get_value.return_value = None
+		mock_exists.return_value = False
+		with patch("bop_erp.orders.ingestion.frappe.get_doc") as mock_get_doc:
+			mock_doc = MagicMock(name="CUST-BOB")
+			mock_get_doc.return_value = mock_doc
+			res_b = resolve_or_create_customer(cust_b, sales_channel="TEST-A")
+			# Verify mapping was created with external_id="102", NOT merged to Alice
+			self.assertNotEqual(res_b, "CUST-ALICE")
+
+	# ==================================================
+	# 18. INCOMING STOCK EXCLUDED FROM CHANNEL ATP
+	# ==================================================
+	@patch("bop_erp.inventory.availability.get_warehouse_reservable_capacity")
+	@patch("bop_erp.inventory.availability.get_channel_uncovered_sales_order_demand")
+	@patch("frappe.get_all")
+	@patch("frappe.db.get_value")
+	def test_18_incoming_stock_excluded_from_atp(self, mock_val, mock_get_all, mock_uncovered, mock_cap):
+		from bop_erp.inventory.availability import get_channel_atp
+		# Channel has warehouse with actual_qty = 0, but ordered_qty = 100
+		mock_get_all.return_value = [{"warehouse": "Stores - TC", "allow_sellable_stock": 1, "allow_fulfillment": 1}]
+		def _mock_db_val(doctype, *args, **kwargs):
+			if doctype in ("Sales Channel", "Warehouse"):
+				return frappe._dict(company="Test Company")
+			if doctype == "Bin":
+				return frappe._dict(actual_qty=0.0, reserved_qty=0.0)
+			return "Nos"
+		mock_val.side_effect = _mock_db_val
+		mock_cap.return_value = 0.0  # physical capacity is 0 (excludes ordered_qty)
+		mock_uncovered.return_value = (0.0, [])
+
+		atp = get_channel_atp("ITEM-TEST", "TEST-A")
+		# Immediate ATP must be 0.0, not 100.0
+		self.assertEqual(atp.aggregate_atp_qty, 0.0)
