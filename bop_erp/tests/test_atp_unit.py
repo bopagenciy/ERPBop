@@ -14,7 +14,11 @@ from bop_erp.inventory.availability import (
 	get_safety_stock,
 	get_warehouse_atp,
 )
-from bop_erp.inventory.models import WarehouseATP
+from bop_erp.inventory.models import (
+	ChannelDemandBreakdown,
+	EffectiveReservedBreakdown,
+	WarehouseATP,
+)
 
 
 class TestATPUnit(unittest.TestCase):
@@ -538,4 +542,382 @@ class TestATPUnit(unittest.TestCase):
 		)
 		self.assertIn("INFORMATIONAL ONLY", wh_atp.__doc__)
 		self.assertEqual(wh_atp.candidate_atp_qty, 85.0)
+
+	def test_15_safety_stock_deficit_does_not_leak_between_warehouses(self):
+		"""
+		VERIFIES SAFETY STOCK LOCAL ISOLATION (SECTION 2 & 7):
+		Warehouse A: actual 5, safety 10 => local ATP = 0 (deficit = 5)
+		Warehouse B: actual 100, safety 0 => local ATP = 100
+		Channel ATP must equal 100, NOT 95.
+		"""
+		with patch("frappe.db.get_value") as mock_get_value, \
+			 patch("frappe.get_all") as mock_get_all, \
+			 patch("bop_erp.inventory.availability.get_warehouse_atp") as mock_wh_atp, \
+			 patch("bop_erp.inventory.availability.get_effective_reserved_breakdown") as mock_breakdown:
+
+			mock_get_value.side_effect = lambda dt, flt, fn=None, *args, **kwargs: (
+				frappe._dict({"name": "TID", "company": "Industrial DP"}) if dt == "Sales Channel"
+				else ("Nos" if dt == "Item" else None)
+			)
+			mock_get_all.return_value = [
+				{"warehouse": "Warehouse A", "priority": 10, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+				{"warehouse": "Warehouse B", "priority": 20, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+			]
+
+			def wh_side_effect(item_code, warehouse, allow_sellable_stock=True, allow_fulfillment=True):
+				if warehouse == "Warehouse A":
+					return WarehouseATP(
+						item_code=item_code, warehouse="Warehouse A", company="Industrial DP",
+						actual_qty=5.0, native_reserved_qty=0.0, effective_reserved_qty=0.0,
+						safety_stock_qty=10.0, candidate_atp_qty=0.0, stock_uom="Nos",
+					)
+				return WarehouseATP(
+					item_code=item_code, warehouse="Warehouse B", company="Industrial DP",
+					actual_qty=100.0, native_reserved_qty=0.0, effective_reserved_qty=0.0,
+					safety_stock_qty=0.0, candidate_atp_qty=100.0, stock_uom="Nos",
+				)
+
+			mock_wh_atp.side_effect = wh_side_effect
+			mock_breakdown.return_value = EffectiveReservedBreakdown(
+				item_code="BOLT-001", warehouse="WH", sales_order_demand=0.0,
+				standalone_sre_demand=0.0, production_demand=0.0, subcontract_demand=0.0,
+				production_plan_demand=0.0, total_effective_reserved=0.0, native_reserved_stock=0.0,
+			)
+
+			ch_atp = get_channel_atp("BOLT-001", "TID")
+			self.assertEqual(ch_atp.aggregate_atp_qty, 100.0)
+			self.assertNotEqual(ch_atp.aggregate_atp_qty, 95.0)
+
+	def test_16_safety_stock_local_surplus_and_deduction(self):
+		"""
+		VERIFIES SAFETY STOCK LOCAL SURPLUS DEDUCTION (SECTION 7):
+		Warehouse A: actual 20, safety 10 => local ATP = 10
+		Warehouse B: actual 100, safety 0 => local ATP = 100
+		Channel ATP must equal 110.
+		"""
+		with patch("frappe.db.get_value") as mock_get_value, \
+			 patch("frappe.get_all") as mock_get_all, \
+			 patch("bop_erp.inventory.availability.get_warehouse_atp") as mock_wh_atp, \
+			 patch("bop_erp.inventory.availability.get_effective_reserved_breakdown") as mock_breakdown:
+
+			mock_get_value.side_effect = lambda dt, flt, fn=None, *args, **kwargs: (
+				frappe._dict({"name": "TID", "company": "Industrial DP"}) if dt == "Sales Channel"
+				else ("Nos" if dt == "Item" else None)
+			)
+			mock_get_all.return_value = [
+				{"warehouse": "Warehouse A", "priority": 10, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+				{"warehouse": "Warehouse B", "priority": 20, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+			]
+
+			def wh_side_effect(item_code, warehouse, allow_sellable_stock=True, allow_fulfillment=True):
+				if warehouse == "Warehouse A":
+					return WarehouseATP(
+						item_code=item_code, warehouse="Warehouse A", company="Industrial DP",
+						actual_qty=20.0, native_reserved_qty=0.0, effective_reserved_qty=0.0,
+						safety_stock_qty=10.0, candidate_atp_qty=10.0, stock_uom="Nos",
+					)
+				return WarehouseATP(
+					item_code=item_code, warehouse="Warehouse B", company="Industrial DP",
+					actual_qty=100.0, native_reserved_qty=0.0, effective_reserved_qty=0.0,
+					safety_stock_qty=0.0, candidate_atp_qty=100.0, stock_uom="Nos",
+				)
+
+			mock_wh_atp.side_effect = wh_side_effect
+			mock_breakdown.return_value = EffectiveReservedBreakdown(
+				item_code="BOLT-001", warehouse="WH", sales_order_demand=0.0,
+				standalone_sre_demand=0.0, production_demand=0.0, subcontract_demand=0.0,
+				production_plan_demand=0.0, total_effective_reserved=0.0, native_reserved_stock=0.0,
+			)
+
+			ch_atp = get_channel_atp("BOLT-001", "TID")
+			self.assertEqual(ch_atp.aggregate_atp_qty, 110.0)
+
+	def test_17_production_deficit_does_not_leak_between_warehouses(self):
+		"""
+		VERIFIES LOCAL PRODUCTION COMMITMENT ISOLATION (SECTION 3):
+		Warehouse A: actual 0, production demand 10 => local ATP = 0
+		Warehouse B: actual 100, production demand 0 => local ATP = 100
+		Channel ATP must equal 100, NOT 90.
+		"""
+		with patch("frappe.db.get_value") as mock_get_value, \
+			 patch("frappe.get_all") as mock_get_all, \
+			 patch("bop_erp.inventory.availability.get_warehouse_atp") as mock_wh_atp, \
+			 patch("bop_erp.inventory.availability.get_effective_reserved_breakdown") as mock_breakdown:
+
+			mock_get_value.side_effect = lambda dt, flt, fn=None, *args, **kwargs: (
+				frappe._dict({"name": "TID", "company": "Industrial DP"}) if dt == "Sales Channel"
+				else ("Nos" if dt == "Item" else None)
+			)
+			mock_get_all.return_value = [
+				{"warehouse": "Warehouse A", "priority": 10, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+				{"warehouse": "Warehouse B", "priority": 20, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+			]
+
+			def wh_side_effect(item_code, warehouse, allow_sellable_stock=True, allow_fulfillment=True):
+				if warehouse == "Warehouse A":
+					return WarehouseATP(
+						item_code=item_code, warehouse="Warehouse A", company="Industrial DP",
+						actual_qty=0.0, native_reserved_qty=10.0, effective_reserved_qty=10.0,
+						safety_stock_qty=0.0, candidate_atp_qty=0.0, stock_uom="Nos",
+					)
+				return WarehouseATP(
+					item_code=item_code, warehouse="Warehouse B", company="Industrial DP",
+					actual_qty=100.0, native_reserved_qty=0.0, effective_reserved_qty=0.0,
+					safety_stock_qty=0.0, candidate_atp_qty=100.0, stock_uom="Nos",
+				)
+
+			mock_wh_atp.side_effect = wh_side_effect
+			mock_breakdown.return_value = EffectiveReservedBreakdown(
+				item_code="BOLT-001", warehouse="WH", sales_order_demand=0.0,
+				standalone_sre_demand=0.0, production_demand=10.0, subcontract_demand=0.0,
+				production_plan_demand=0.0, total_effective_reserved=10.0, native_reserved_stock=0.0,
+			)
+
+			ch_atp = get_channel_atp("BOLT-001", "TID")
+			self.assertEqual(ch_atp.aggregate_atp_qty, 100.0)
+			self.assertNotEqual(ch_atp.aggregate_atp_qty, 90.0)
+
+	def test_18_subcontract_deficit_does_not_leak_between_warehouses(self):
+		"""
+		VERIFIES SUBCONTRACTING DEMAND ISOLATION (SECTION 3):
+		Warehouse A: actual 0, subcontract 10 => local ATP = 0
+		Warehouse B: actual 100, subcontract 0 => local ATP = 100
+		Channel ATP must equal 100.
+		"""
+		with patch("frappe.db.get_value") as mock_get_value, \
+			 patch("frappe.get_all") as mock_get_all, \
+			 patch("bop_erp.inventory.availability.get_warehouse_atp") as mock_wh_atp, \
+			 patch("bop_erp.inventory.availability.get_effective_reserved_breakdown") as mock_breakdown:
+
+			mock_get_value.side_effect = lambda dt, flt, fn=None, *args, **kwargs: (
+				frappe._dict({"name": "TID", "company": "Industrial DP"}) if dt == "Sales Channel"
+				else ("Nos" if dt == "Item" else None)
+			)
+			mock_get_all.return_value = [
+				{"warehouse": "Warehouse A", "priority": 10, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+				{"warehouse": "Warehouse B", "priority": 20, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+			]
+
+			def wh_side_effect(item_code, warehouse, allow_sellable_stock=True, allow_fulfillment=True):
+				if warehouse == "Warehouse A":
+					return WarehouseATP(
+						item_code=item_code, warehouse="Warehouse A", company="Industrial DP",
+						actual_qty=0.0, native_reserved_qty=10.0, effective_reserved_qty=10.0,
+						safety_stock_qty=0.0, candidate_atp_qty=0.0, stock_uom="Nos",
+					)
+				return WarehouseATP(
+					item_code=item_code, warehouse="Warehouse B", company="Industrial DP",
+					actual_qty=100.0, native_reserved_qty=0.0, effective_reserved_qty=0.0,
+					safety_stock_qty=0.0, candidate_atp_qty=100.0, stock_uom="Nos",
+				)
+
+			mock_wh_atp.side_effect = wh_side_effect
+			mock_breakdown.return_value = EffectiveReservedBreakdown(
+				item_code="BOLT-001", warehouse="WH", sales_order_demand=0.0,
+				standalone_sre_demand=0.0, production_demand=0.0, subcontract_demand=10.0,
+				production_plan_demand=0.0, total_effective_reserved=10.0, native_reserved_stock=0.0,
+			)
+
+			ch_atp = get_channel_atp("BOLT-001", "TID")
+			self.assertEqual(ch_atp.aggregate_atp_qty, 100.0)
+
+	def test_19_production_plan_deficit_does_not_leak_between_warehouses(self):
+		"""
+		VERIFIES PRODUCTION PLAN DEMAND ISOLATION (SECTION 3):
+		Warehouse A: actual 0, production plan demand 10 => local ATP = 0
+		Warehouse B: actual 100, production plan demand 0 => local ATP = 100
+		Channel ATP must equal 100.
+		"""
+		with patch("frappe.db.get_value") as mock_get_value, \
+			 patch("frappe.get_all") as mock_get_all, \
+			 patch("bop_erp.inventory.availability.get_warehouse_atp") as mock_wh_atp, \
+			 patch("bop_erp.inventory.availability.get_effective_reserved_breakdown") as mock_breakdown:
+
+			mock_get_value.side_effect = lambda dt, flt, fn=None, *args, **kwargs: (
+				frappe._dict({"name": "TID", "company": "Industrial DP"}) if dt == "Sales Channel"
+				else ("Nos" if dt == "Item" else None)
+			)
+			mock_get_all.return_value = [
+				{"warehouse": "Warehouse A", "priority": 10, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+				{"warehouse": "Warehouse B", "priority": 20, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+			]
+
+			def wh_side_effect(item_code, warehouse, allow_sellable_stock=True, allow_fulfillment=True):
+				if warehouse == "Warehouse A":
+					return WarehouseATP(
+						item_code=item_code, warehouse="Warehouse A", company="Industrial DP",
+						actual_qty=0.0, native_reserved_qty=10.0, effective_reserved_qty=10.0,
+						safety_stock_qty=0.0, candidate_atp_qty=0.0, stock_uom="Nos",
+					)
+				return WarehouseATP(
+					item_code=item_code, warehouse="Warehouse B", company="Industrial DP",
+					actual_qty=100.0, native_reserved_qty=0.0, effective_reserved_qty=0.0,
+					safety_stock_qty=0.0, candidate_atp_qty=100.0, stock_uom="Nos",
+				)
+
+			mock_wh_atp.side_effect = wh_side_effect
+			mock_breakdown.return_value = EffectiveReservedBreakdown(
+				item_code="BOLT-001", warehouse="WH", sales_order_demand=0.0,
+				standalone_sre_demand=0.0, production_demand=0.0, subcontract_demand=0.0,
+				production_plan_demand=10.0, total_effective_reserved=10.0, native_reserved_stock=0.0,
+			)
+
+			ch_atp = get_channel_atp("BOLT-001", "TID")
+			self.assertEqual(ch_atp.aggregate_atp_qty, 100.0)
+
+	def test_20_non_sellable_source_isolation(self):
+		"""
+		VERIFIES NON-SELLABLE SOURCE ISOLATION (SECTION 8):
+		Quarantine: actual 100, reserved 200, allow_sellable_stock = 0 => contributes 0 ATP.
+		Main: actual 50, reserved 0, allow_sellable_stock = 1 => contributes 50 ATP.
+		Channel ATP must remain exactly 50 based on Main only.
+		Quarantine's actual stock and reservation deficit must NOT alter sellable aggregates.
+		"""
+		with patch("frappe.db.get_value") as mock_get_value, \
+			 patch("frappe.get_all") as mock_get_all, \
+			 patch("bop_erp.inventory.availability.get_warehouse_atp") as mock_wh_atp, \
+			 patch("bop_erp.inventory.availability.get_effective_reserved_breakdown") as mock_breakdown:
+
+			mock_get_value.side_effect = lambda dt, flt, fn=None, *args, **kwargs: (
+				frappe._dict({"name": "TID", "company": "Industrial DP"}) if dt == "Sales Channel"
+				else ("Nos" if dt == "Item" else None)
+			)
+			mock_get_all.return_value = [
+				{"warehouse": "Main", "priority": 10, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+				{"warehouse": "Quarantine", "priority": 99, "allow_sellable_stock": 0, "allow_fulfillment": 1},
+			]
+
+			def wh_side_effect(item_code, warehouse, allow_sellable_stock=True, allow_fulfillment=True):
+				if warehouse == "Main":
+					return WarehouseATP(
+						item_code=item_code, warehouse="Main", company="Industrial DP",
+						actual_qty=50.0, native_reserved_qty=0.0, effective_reserved_qty=0.0,
+						safety_stock_qty=0.0, candidate_atp_qty=50.0, stock_uom="Nos",
+						allow_sellable_stock=True,
+					)
+				return WarehouseATP(
+					item_code=item_code, warehouse="Quarantine", company="Industrial DP",
+					actual_qty=100.0, native_reserved_qty=200.0, effective_reserved_qty=200.0,
+					safety_stock_qty=0.0, candidate_atp_qty=0.0, stock_uom="Nos",
+					allow_sellable_stock=False,
+				)
+
+			mock_wh_atp.side_effect = wh_side_effect
+			mock_breakdown.return_value = EffectiveReservedBreakdown(
+				item_code="BOLT-001", warehouse="WH", sales_order_demand=0.0,
+				standalone_sre_demand=0.0, production_demand=0.0, subcontract_demand=0.0,
+				production_plan_demand=0.0, total_effective_reserved=0.0, native_reserved_stock=0.0,
+			)
+
+			ch_atp = get_channel_atp("BOLT-001", "TID")
+			self.assertEqual(ch_atp.aggregate_actual_qty, 50.0)
+			self.assertEqual(ch_atp.aggregate_reserved_qty, 0.0)
+			self.assertEqual(ch_atp.aggregate_atp_qty, 50.0)
+
+	def test_21_disabled_source_isolation(self):
+		"""
+		VERIFIES DISABLED SOURCE ISOLATION (SECTION 9):
+		A disabled Channel Inventory Source contributes neither positive nor negative channel ATP.
+		"""
+		with patch("frappe.db.get_value") as mock_get_value, \
+			 patch("frappe.get_all") as mock_get_all, \
+			 patch("bop_erp.inventory.availability.get_warehouse_atp") as mock_wh_atp, \
+			 patch("bop_erp.inventory.availability.get_effective_reserved_breakdown") as mock_breakdown:
+
+			mock_get_value.side_effect = lambda dt, flt, fn=None, *args, **kwargs: (
+				frappe._dict({"name": "TID", "company": "Industrial DP"}) if dt == "Sales Channel"
+				else ("Nos" if dt == "Item" else None)
+			)
+			# Only enabled sources returned by query
+			mock_get_all.return_value = [
+				{"warehouse": "Active Warehouse", "priority": 10, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+			]
+
+			mock_wh_atp.return_value = WarehouseATP(
+				item_code="BOLT-001", warehouse="Active Warehouse", company="Industrial DP",
+				actual_qty=40.0, native_reserved_qty=0.0, effective_reserved_qty=0.0,
+				safety_stock_qty=0.0, candidate_atp_qty=40.0, stock_uom="Nos",
+			)
+			mock_breakdown.return_value = EffectiveReservedBreakdown(
+				item_code="BOLT-001", warehouse="WH", sales_order_demand=0.0,
+				standalone_sre_demand=0.0, production_demand=0.0, subcontract_demand=0.0,
+				production_plan_demand=0.0, total_effective_reserved=0.0, native_reserved_stock=0.0,
+			)
+
+			ch_atp = get_channel_atp("BOLT-001", "TID")
+			self.assertEqual(ch_atp.aggregate_atp_qty, 40.0)
+			self.assertEqual(len(ch_atp.warehouses), 1)
+
+	def test_22_cross_warehouse_excluded_source_policy(self):
+		"""
+		VERIFIES CROSS-WAREHOUSE EXCLUDED SOURCE POLICY (SECTION 10):
+		An SRE for an excluded warehouse (not in channel sellable pool) does not deduct from channel.
+		"""
+		with patch("frappe.db.get_value") as mock_get_value, \
+			 patch("frappe.get_all") as mock_get_all, \
+			 patch("bop_erp.inventory.availability.get_warehouse_atp") as mock_wh_atp, \
+			 patch("bop_erp.inventory.availability.get_effective_reserved_breakdown") as mock_breakdown:
+
+			mock_get_value.side_effect = lambda dt, flt, fn=None, *args, **kwargs: (
+				frappe._dict({"name": "TID", "company": "Industrial DP"}) if dt == "Sales Channel"
+				else ("Nos" if dt == "Item" else None)
+			)
+			mock_get_all.return_value = [
+				{"warehouse": "Channel Warehouse A", "priority": 10, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+			]
+
+			mock_wh_atp.return_value = WarehouseATP(
+				item_code="BOLT-001", warehouse="Channel Warehouse A", company="Industrial DP",
+				actual_qty=50.0, native_reserved_qty=0.0, effective_reserved_qty=0.0,
+				safety_stock_qty=0.0, candidate_atp_qty=50.0, stock_uom="Nos",
+			)
+			mock_breakdown.return_value = EffectiveReservedBreakdown(
+				item_code="BOLT-001", warehouse="WH", sales_order_demand=0.0,
+				standalone_sre_demand=0.0, production_demand=0.0, subcontract_demand=0.0,
+				production_plan_demand=0.0, total_effective_reserved=0.0, native_reserved_stock=0.0,
+			)
+
+			ch_atp = get_channel_atp("BOLT-001", "TID")
+			self.assertEqual(ch_atp.aggregate_atp_qty, 50.0)
+			self.assertEqual(ch_atp.cross_warehouse_adjustments["deduplicated_sre_demand"], 0.0)
+
+	def test_23_channel_demand_breakdown_explainability(self):
+		"""
+		VERIFIES CHANNEL DEMAND BREAKDOWN MODEL & EXPLAINABILITY (SECTION 5 & 11):
+		Checks ChannelDemandBreakdown structure and cross_warehouse_adjustments.
+		"""
+		with patch("frappe.db.get_value") as mock_get_value, \
+			 patch("frappe.get_all") as mock_get_all, \
+			 patch("bop_erp.inventory.availability.get_warehouse_atp") as mock_wh_atp, \
+			 patch("bop_erp.inventory.availability.get_effective_reserved_breakdown") as mock_breakdown:
+
+			mock_get_value.side_effect = lambda dt, flt, fn=None, *args, **kwargs: (
+				frappe._dict({"name": "TID", "company": "Industrial DP"}) if dt == "Sales Channel"
+				else ("Nos" if dt == "Item" else None)
+			)
+			mock_get_all.return_value = [
+				{"warehouse": "Miami", "priority": 10, "allow_sellable_stock": 1, "allow_fulfillment": 1},
+			]
+
+			mock_wh_atp.return_value = WarehouseATP(
+				item_code="BOLT-001", warehouse="Miami", company="Industrial DP",
+				actual_qty=100.0, native_reserved_qty=20.0, effective_reserved_qty=20.0,
+				safety_stock_qty=10.0, candidate_atp_qty=70.0, stock_uom="Nos",
+			)
+			mock_breakdown.return_value = EffectiveReservedBreakdown(
+				item_code="BOLT-001", warehouse="Miami", sales_order_demand=10.0,
+				standalone_sre_demand=5.0, production_demand=5.0, subcontract_demand=0.0,
+				production_plan_demand=0.0, total_effective_reserved=20.0, native_reserved_stock=5.0,
+			)
+
+			bd = get_atp_breakdown("BOLT-001", "TID")
+			self.assertEqual(bd.channel_atp, 70.0)
+			self.assertIsNotNone(bd.demand_breakdown)
+			self.assertEqual(bd.demand_breakdown.sales_order_demand, 10.0)
+			self.assertEqual(bd.demand_breakdown.standalone_sre_demand, 5.0)
+			self.assertEqual(bd.demand_breakdown.production_demand, 5.0)
+			self.assertEqual(bd.demand_breakdown.safety_stock, 10.0)
+			self.assertIn("sales_order_unallocated_demand", bd.cross_warehouse_adjustments)
+			self.assertIn("deduplicated_sre_demand", bd.cross_warehouse_adjustments)
+
 

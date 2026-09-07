@@ -14,6 +14,7 @@ from bop_erp.inventory.models import (
 	ATPBreakdownWarehouse,
 	ChannelATP,
 	ChannelATPBreakdown,
+	ChannelDemandBreakdown,
 	EffectiveReservedBreakdown,
 	WarehouseATP,
 )
@@ -341,8 +342,8 @@ def get_warehouse_atp(
 
 def get_channel_atp(item_code: str, sales_channel: str) -> ChannelATP:
 	"""
-	Aggregates Available-To-Promise (ATP) across all enabled Channel Inventory Sources for a sales channel.
-	Sources with allow_sellable_stock = 0 contribute 0 ATP.
+	Aggregates Available-To-Promise (ATP) across all enabled sellable Channel Inventory Sources for a sales channel.
+	Sources with allow_sellable_stock = 0 contribute 0 ATP and their inventory/deficits do not affect sellable aggregates.
 	Priority controls allocation routing order, but does not alter aggregate quantity.
 	"""
 	ch_data = frappe.db.get_value("Sales Channel", sales_channel, ["name", "company"], as_dict=True)
@@ -360,11 +361,18 @@ def get_channel_atp(item_code: str, sales_channel: str) -> ChannelATP:
 
 	warehouse_atps: List[WarehouseATP] = []
 	seen_warehouses = set()
+	sellable_warehouses: List[str] = []
 
 	agg_actual = 0.0
 	agg_reserved = 0.0
 	agg_safety = 0.0
 	agg_atp = 0.0
+
+	total_so_demand = 0.0
+	total_standalone_sre = 0.0
+	total_production_demand = 0.0
+	total_subcontract_demand = 0.0
+	total_prod_plan_demand = 0.0
 
 	for src in sources:
 		wh = src.get("warehouse") if isinstance(src, dict) else src.warehouse
@@ -383,20 +391,35 @@ def get_channel_atp(item_code: str, sales_channel: str) -> ChannelATP:
 		)
 		warehouse_atps.append(wh_atp)
 
-		agg_actual += wh_atp.actual_qty
-		agg_reserved += wh_atp.effective_reserved_qty
-		agg_safety += wh_atp.safety_stock_qty
-		if wh_atp.allow_sellable_stock:
+		# SECTION 8 & 9: Only enabled sellable sources contribute to sellable channel aggregates.
+		# Non-sellable sources contribute 0 ATP and their inventory/deficits do NOT alter sellable totals.
+		if allow_sellable:
+			sellable_warehouses.append(wh)
+			agg_actual += wh_atp.actual_qty
+			agg_reserved += wh_atp.effective_reserved_qty
+			agg_safety += wh_atp.safety_stock_qty
 			agg_atp += wh_atp.candidate_atp_qty
 
+			try:
+				bd = get_effective_reserved_breakdown(item_code, wh)
+				total_so_demand += bd.sales_order_demand
+				total_standalone_sre += bd.standalone_sre_demand
+				total_production_demand += bd.production_demand
+				total_subcontract_demand += bd.subcontract_demand
+				total_prod_plan_demand += bd.production_plan_demand
+			except Exception:
+				pass
+
+	cross_overlap_qty = 0.0
+
 	# Cross-Warehouse Sales Order Demand De-duplication:
-	# If a Sales Order item targets warehouse A (in this channel), but has active SRE allocations
-	# in other warehouses B/C (also in this channel), the demand is represented in Bin A.reserved_qty
+	# If a Sales Order item targets warehouse A (sellable in this channel), but has active SRE allocations
+	# in other sellable warehouses B/C (also in this channel), the demand is represented in Bin A.reserved_qty
 	# and also in Bin B/C.reserved_stock.
 	# At the aggregate channel level, de-duplicate this overlap so aggregate_reserved_qty
-	# and aggregate_atp_qty reflect exact net logical demand across channel warehouses.
-	if len(seen_warehouses) > 1:
-		wh_list = list(seen_warehouses)
+	# and aggregate_atp_qty reflect exact net logical demand across channel sellable warehouses.
+	# SECTION 10: Only warehouses in sellable_warehouses are included; excluded warehouses do not deduct/add.
+	if len(sellable_warehouses) > 1:
 		cross_wh_sres = frappe.db.sql(
 			"""
 			SELECT 
@@ -412,15 +435,32 @@ def get_channel_atp(item_code: str, sales_channel: str) -> ChannelATP:
 			  AND soi.warehouse IN ({wh_placeholders})
 			  AND sre.warehouse != soi.warehouse
 			""".format(
-				wh_placeholders=", ".join(["%s"] * len(wh_list))
+				wh_placeholders=", ".join(["%s"] * len(sellable_warehouses))
 			),
-			tuple([item_code] + wh_list + wh_list),
+			tuple([item_code] + sellable_warehouses + sellable_warehouses),
 			as_dict=True,
 		)
-		cross_overlap_qty = sum(flt(r.net_qty) for r in cross_wh_sres)
+		cross_overlap_qty = sum(flt(r.net_qty) for r in cross_wh_sres) if cross_wh_sres else 0.0
 		if cross_overlap_qty > 0:
 			agg_reserved = max(0.0, agg_reserved - cross_overlap_qty)
-			agg_atp = min(agg_actual, max(0.0, agg_atp + cross_overlap_qty))
+			max_recoverable = max(0.0, agg_actual - agg_reserved - agg_safety - agg_atp)
+			effective_cross_overlap = min(cross_overlap_qty, max_recoverable)
+			agg_atp = min(agg_actual, max(0.0, agg_atp + effective_cross_overlap))
+
+	demand_breakdown = ChannelDemandBreakdown(
+		sales_order_demand=round(flt(total_so_demand), prec),
+		cross_warehouse_sales_order_demand=round(flt(cross_overlap_qty), prec),
+		standalone_sre_demand=round(flt(total_standalone_sre), prec),
+		production_demand=round(flt(total_production_demand), prec),
+		subcontract_demand=round(flt(total_subcontract_demand), prec),
+		production_plan_demand=round(flt(total_prod_plan_demand), prec),
+		warehouse_local_commitments=round(
+			flt(total_standalone_sre + total_production_demand + total_subcontract_demand + total_prod_plan_demand),
+			prec,
+		),
+		safety_stock=round(flt(agg_safety), prec),
+		total_demand=round(flt(agg_reserved + agg_safety), prec),
+	)
 
 	return ChannelATP(
 		item_code=item_code,
@@ -431,6 +471,11 @@ def get_channel_atp(item_code: str, sales_channel: str) -> ChannelATP:
 		aggregate_reserved_qty=round(flt(agg_reserved), prec),
 		aggregate_safety_stock_qty=round(flt(agg_safety), prec),
 		aggregate_atp_qty=round(flt(agg_atp), prec),
+		cross_warehouse_adjustments={
+			"sales_order_unallocated_demand": round(flt(max(0.0, total_so_demand - cross_overlap_qty)), prec),
+			"deduplicated_sre_demand": round(flt(cross_overlap_qty), prec),
+		},
+		demand_breakdown=demand_breakdown,
 		stock_uom=item_uom,
 	)
 
@@ -496,57 +541,41 @@ def get_atp_breakdown(item_code: str, sales_channel: str) -> ChannelATPBreakdown
 	Returns an auditable, line-by-line breakdown of how Channel ATP was derived.
 	Useful for diagnostics, explanations, and admin desk view.
 	"""
-	ch_data = frappe.db.get_value("Sales Channel", sales_channel, ["name", "company"], as_dict=True)
-	ch_company = ch_data.get("company", "") if ch_data else ""
-	item_uom = frappe.db.get_value("Item", item_code, "stock_uom") or "Nos"
+	ch_atp = get_channel_atp(item_code, sales_channel)
 
 	sources = frappe.get_all(
 		"Channel Inventory Source",
 		filters={"sales_channel": sales_channel, "enabled": 1},
-		fields=["warehouse", "priority", "allow_sellable_stock", "allow_fulfillment"],
+		fields=["warehouse", "priority"],
 		order_by="priority asc, creation asc",
 	)
-
-	lines: List[ATPBreakdownWarehouse] = []
-	total_atp = 0.0
-	prec = get_stock_precision("Bin", "actual_qty")
-	seen = set()
-
-	for src in sources:
-		wh = src.get("warehouse") if isinstance(src, dict) else src.warehouse
-		allow_sellable = bool(src.get("allow_sellable_stock") if isinstance(src, dict) else src.allow_sellable_stock)
-		allow_fulfill = bool(src.get("allow_fulfillment") if isinstance(src, dict) else src.allow_fulfillment)
-		prio = int(src.get("priority", 0) if isinstance(src, dict) else (src.priority or 0))
-
-		if wh in seen:
-			continue
-		seen.add(wh)
-
-		wh_atp = get_warehouse_atp(
-			item_code=item_code,
-			warehouse=wh,
-			allow_sellable_stock=allow_sellable,
-			allow_fulfillment=allow_fulfill,
+	prio_map = {
+		(s.get("warehouse") if isinstance(s, dict) else s.warehouse): int(
+			s.get("priority", 0) if isinstance(s, dict) else (s.priority or 0)
 		)
-		lines.append(
-			ATPBreakdownWarehouse(
-				warehouse=wh,
-				actual_qty=wh_atp.actual_qty,
-				reserved_qty=wh_atp.effective_reserved_qty,
-				safety_stock_qty=wh_atp.safety_stock_qty,
-				atp_qty=wh_atp.candidate_atp_qty,
-				allow_sellable_stock=wh_atp.allow_sellable_stock,
-				priority=prio,
-			)
+		for s in sources
+	}
+
+	lines = [
+		ATPBreakdownWarehouse(
+			warehouse=wh.warehouse,
+			actual_qty=wh.actual_qty,
+			reserved_qty=wh.effective_reserved_qty,
+			safety_stock_qty=wh.safety_stock_qty,
+			atp_qty=wh.candidate_atp_qty,
+			allow_sellable_stock=wh.allow_sellable_stock,
+			priority=prio_map.get(wh.warehouse, 0),
 		)
-		if wh_atp.allow_sellable_stock:
-			total_atp += wh_atp.candidate_atp_qty
+		for wh in ch_atp.warehouses
+	]
 
 	return ChannelATPBreakdown(
 		item_code=item_code,
 		sales_channel=sales_channel,
-		company=ch_company,
+		company=ch_atp.company,
 		lines=lines,
-		channel_atp=round(flt(total_atp), prec),
-		stock_uom=item_uom,
+		channel_atp=ch_atp.aggregate_atp_qty,
+		cross_warehouse_adjustments=ch_atp.cross_warehouse_adjustments,
+		demand_breakdown=ch_atp.demand_breakdown,
+		stock_uom=ch_atp.stock_uom,
 	)

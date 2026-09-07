@@ -293,6 +293,16 @@ class TestReservationsATPLive(unittest.TestCase):
 
 		frappe.db.commit()
 
+	def setUp(self):
+		super().setUp()
+		self._created_recos = []
+
+	def tearDown(self):
+		if hasattr(self, "_created_recos") and self._created_recos:
+			self._cleanup_stock(self._created_recos)
+			self._created_recos = []
+		super().tearDown()
+
 	def _set_physical_stock(self, item_code, warehouse, qty, valuation_rate=10.0):
 		"""Helper to adjust physical stock using native Stock Reconciliation."""
 		reco = frappe.get_doc({
@@ -311,6 +321,9 @@ class TestReservationsATPLive(unittest.TestCase):
 		})
 		reco.insert(ignore_permissions=True)
 		reco.submit()
+		if not hasattr(self, "_created_recos"):
+			self._created_recos = []
+		self._created_recos.append(reco.name)
 		return reco.name
 
 	def _setup_stock(self, warehouse, qty, valuation_rate=10.0):
@@ -337,6 +350,9 @@ class TestReservationsATPLive(unittest.TestCase):
 		})
 		reco.insert(ignore_permissions=True)
 		reco.submit()
+		if not hasattr(self, "_created_recos"):
+			self._created_recos = []
+		self._created_recos.append(reco.name)
 		return reco.name
 
 	def _set_batch_stock(self, item_code, warehouse, batch_no, qty, valuation_rate=10.0):
@@ -365,28 +381,25 @@ class TestReservationsATPLive(unittest.TestCase):
 		})
 		reco.insert(ignore_permissions=True)
 		reco.submit()
+		if not hasattr(self, "_created_recos"):
+			self._created_recos = []
+		self._created_recos.append(reco.name)
 		return reco.name
 
 	def _cleanup_stock(self, reco_names):
 		"""Helper to cancel and purge test stock reconciliations."""
-		for r_name in reco_names:
-			if frappe.db.exists("Stock Reconciliation", r_name):
-				try:
-					r = frappe.get_doc("Stock Reconciliation", r_name)
-					if r.docstatus == 1:
-						r.cancel()
-				except Exception:
-					pass
-				try:
-					frappe.delete_doc("Stock Reconciliation", r_name, force=True, ignore_permissions=True)
-				except Exception:
-					pass
+		if not reco_names:
+			return
+		if isinstance(reco_names, str):
+			reco_names = [reco_names]
 		test_items = [self.item_code, self.serial_item, self.batch_item, self.bundle_parent, self.bundle_comp1, self.bundle_comp2]
 		test_whs = [self.wh_miami, self.wh_orlando, self.wh_quarantine]
 		frappe.db.delete("Stock Ledger Entry", {"voucher_no": ["in", reco_names]})
 		frappe.db.delete("Stock Ledger Entry", {"warehouse": ["in", test_whs]})
 		frappe.db.delete("GL Entry", {"voucher_no": ["in", reco_names]})
 		frappe.db.delete("GL Entry", {"against_voucher": ["in", reco_names]})
+		frappe.db.delete("Stock Reconciliation Item", {"parent": ["in", reco_names]})
+		frappe.db.delete("Stock Reconciliation", {"name": ["in", reco_names]})
 		frappe.db.delete("Bin", {"warehouse": ["in", test_whs]})
 		frappe.db.delete("Bin", {"item_code": ["in", test_items]})
 		frappe.db.delete("Stock Reservation Entry", {"item_code": ["in", test_items]})
@@ -1683,7 +1696,152 @@ class TestReservationsATPLive(unittest.TestCase):
 					frappe.delete_doc("Stock Reservation Entry", sre_name, force=True, ignore_permissions=True)
 				except Exception:
 					pass
-			self._cleanup_stock([reco])
+	def test_24_live_safety_stock_deficit_isolated_between_warehouses(self):
+		"""
+		VERIFIES LIVE SAFETY STOCK DEFICIT ISOLATION (SECTION 2 & 7):
+		Miami: actual 5, safety 10 => local ATP = 0 (deficit of 5).
+		Orlando: actual 100, safety 0 => local ATP = 100.
+		Channel ATP must equal 100, NOT 95.
+		"""
+		reco_m = self._setup_stock(self.wh_miami, 5.0)
+		reco_o = self._setup_stock(self.wh_orlando, 100.0)
+		policy_name = None
+		try:
+			# Configure safety stock policy of 10.0 for Miami
+			policy = frappe.get_doc({
+				"doctype": "Inventory Availability Policy",
+				"policy_name": f"POL-SAFETY-ISO-{self.abbr}",
+				"warehouse": self.wh_miami,
+				"item_code": self.item_code,
+				"safety_stock_qty": 10.0,
+			}).insert(ignore_permissions=True)
+			policy_name = policy.name
+
+			atp_m = get_warehouse_atp(self.item_code, self.wh_miami)
+			self.assertEqual(atp_m.actual_qty, 5.0)
+			self.assertEqual(atp_m.safety_stock_qty, 10.0)
+			self.assertEqual(atp_m.candidate_atp_qty, 0.0)
+
+			atp_o = get_warehouse_atp(self.item_code, self.wh_orlando)
+			self.assertEqual(atp_o.actual_qty, 100.0)
+			self.assertEqual(atp_o.safety_stock_qty, 0.0)
+			self.assertEqual(atp_o.candidate_atp_qty, 100.0)
+
+			ch_atp = get_channel_atp(self.item_code, self.channel)
+			self.assertEqual(ch_atp.aggregate_atp_qty, 100.0)
+			self.assertNotEqual(ch_atp.aggregate_atp_qty, 95.0)
+
+		finally:
+			if policy_name and frappe.db.exists("Inventory Availability Policy", policy_name):
+				frappe.delete_doc("Inventory Availability Policy", policy_name, force=True, ignore_permissions=True)
+			self._cleanup_stock([reco_m, reco_o])
+
+	def test_25_live_production_deficit_isolated_between_warehouses(self):
+		"""
+		VERIFIES LIVE PRODUCTION DEMAND ISOLATION (SECTION 3):
+		Miami: actual 0, production demand 10 => local ATP = 0.
+		Orlando: actual 100, production demand 0 => local ATP = 100.
+		Channel ATP must equal 100, NOT 90.
+		"""
+		from erpnext.stock.utils import get_or_make_bin
+
+		reco_o = self._setup_stock(self.wh_orlando, 100.0)
+		try:
+			# Ensure Bin exists for Miami and force native production demand
+			get_or_make_bin(self.item_code, self.wh_miami)
+			frappe.db.set_value("Bin", {"item_code": self.item_code, "warehouse": self.wh_miami}, "reserved_qty_for_production", 10.0)
+
+			atp_m = get_warehouse_atp(self.item_code, self.wh_miami)
+			self.assertEqual(atp_m.actual_qty, 0.0)
+			self.assertEqual(atp_m.effective_reserved_qty, 10.0)
+			self.assertEqual(atp_m.candidate_atp_qty, 0.0)
+
+			atp_o = get_warehouse_atp(self.item_code, self.wh_orlando)
+			self.assertEqual(atp_o.actual_qty, 100.0)
+			self.assertEqual(atp_o.effective_reserved_qty, 0.0)
+			self.assertEqual(atp_o.candidate_atp_qty, 100.0)
+
+			ch_atp = get_channel_atp(self.item_code, self.channel)
+			self.assertEqual(ch_atp.aggregate_atp_qty, 100.0)
+			self.assertNotEqual(ch_atp.aggregate_atp_qty, 90.0)
+
+		finally:
+			frappe.db.set_value("Bin", {"item_code": self.item_code, "warehouse": self.wh_miami}, "reserved_qty_for_production", 0.0)
+			self._cleanup_stock([reco_o])
+
+	def test_26_live_non_sellable_warehouse_cannot_reduce_sellable_atp(self):
+		"""
+		VERIFIES LIVE NON-SELLABLE SOURCE ISOLATION (SECTION 8):
+		Quarantine: actual 100, reserved 200, allow_sellable_stock = 0 => 0 ATP.
+		Miami: actual 50, reserved 0, allow_sellable_stock = 1 => 50 ATP.
+		Channel ATP must be exactly 50 based on Miami only.
+		Quarantine inventory/deficits do NOT alter sellable aggregates.
+		"""
+		reco_q = self._setup_stock(self.wh_quarantine, 100.0)
+		reco_m = self._setup_stock(self.wh_miami, 50.0)
+		try:
+			frappe.db.set_value("Bin", {"item_code": self.item_code, "warehouse": self.wh_quarantine}, "reserved_qty", 200.0)
+
+			ch_atp = get_channel_atp(self.item_code, self.channel)
+			self.assertEqual(ch_atp.aggregate_actual_qty, 50.0)
+			self.assertEqual(ch_atp.aggregate_reserved_qty, 0.0)
+			self.assertEqual(ch_atp.aggregate_atp_qty, 50.0)
+
+		finally:
+			frappe.db.set_value("Bin", {"item_code": self.item_code, "warehouse": self.wh_quarantine}, "reserved_qty", 0.0)
+			self._cleanup_stock([reco_q, reco_m])
+
+	def test_27_live_disabled_source_cannot_reduce_channel_atp(self):
+		"""
+		VERIFIES LIVE DISABLED SOURCE ISOLATION (SECTION 9):
+		Disabled Channel Inventory Source is completely excluded from channel ATP.
+		"""
+		reco_m = self._setup_stock(self.wh_miami, 40.0)
+		reco_o = self._setup_stock(self.wh_orlando, 60.0)
+		try:
+			# Temporarily disable Orlando
+			frappe.db.set_value("Channel Inventory Source", self.cis_orlando, "enabled", 0)
+
+			ch_atp = get_channel_atp(self.item_code, self.channel)
+			self.assertEqual(ch_atp.aggregate_actual_qty, 40.0)
+			self.assertEqual(ch_atp.aggregate_atp_qty, 40.0)
+
+		finally:
+			frappe.db.set_value("Channel Inventory Source", self.cis_orlando, "enabled", 1)
+			self._cleanup_stock([reco_m, reco_o])
+
+	def test_28_live_priority_invariance_and_channel_demand_breakdown(self):
+		"""
+		VERIFIES LIVE PRIORITY INVARIANCE AND DEMAND BREAKDOWN (SECTION 5, 11, 14):
+		Priority swap (10/20 -> 20/10) does NOT alter aggregate quantity.
+		ChannelDemandBreakdown and explainability fields populated accurately.
+		"""
+		reco_m = self._setup_stock(self.wh_miami, 50.0)
+		reco_o = self._setup_stock(self.wh_orlando, 50.0)
+		try:
+			# Priority Miami=10, Orlando=20
+			ch_atp_1 = get_channel_atp(self.item_code, self.channel)
+			self.assertEqual(ch_atp_1.aggregate_atp_qty, 100.0)
+			self.assertIsNotNone(ch_atp_1.demand_breakdown)
+			self.assertEqual(ch_atp_1.demand_breakdown.total_demand, 0.0)
+
+			# Swap priorities: Miami=20, Orlando=10
+			frappe.db.set_value("Channel Inventory Source", self.cis_miami, "priority", 20)
+			frappe.db.set_value("Channel Inventory Source", self.cis_orlando, "priority", 10)
+
+			ch_atp_2 = get_channel_atp(self.item_code, self.channel)
+			self.assertEqual(ch_atp_2.aggregate_atp_qty, 100.0)
+			self.assertEqual(ch_atp_1.aggregate_atp_qty, ch_atp_2.aggregate_atp_qty)
+
+			# Verify get_atp_breakdown matches
+			bd = get_atp_breakdown(self.item_code, self.channel)
+			self.assertEqual(bd.channel_atp, 100.0)
+			self.assertEqual(len(bd.lines), 3)  # Miami, Orlando, Quarantine
+
+		finally:
+			frappe.db.set_value("Channel Inventory Source", self.cis_miami, "priority", 10)
+			frappe.db.set_value("Channel Inventory Source", self.cis_orlando, "priority", 20)
+			self._cleanup_stock([reco_m, reco_o])
 
 	def test_99_safety_invariance_restoration(self):
 		"""

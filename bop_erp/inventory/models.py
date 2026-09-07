@@ -127,8 +127,11 @@ class ChannelATP:
 	aggregate_reserved_qty: float = 0.0
 	aggregate_safety_stock_qty: float = 0.0
 	aggregate_atp_qty: float = 0.0
+	cross_warehouse_adjustments: Dict[str, float] = field(default_factory=dict)
+	demand_breakdown: Optional[Any] = None
 	stock_uom: str = "Nos"
 	timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
 
 
 @dataclass
@@ -191,6 +194,24 @@ class ATPBreakdownWarehouse:
 
 
 @dataclass
+class ChannelDemandBreakdown:
+	"""
+	Auditable channel-level model with strict single-ownership demand partitioning.
+	Prevents double-counting and avoids aggregate subtraction of clamped local quantities.
+	"""
+	sales_order_demand: float = 0.0
+	cross_warehouse_sales_order_demand: float = 0.0
+	standalone_sre_demand: float = 0.0
+	production_demand: float = 0.0
+	subcontract_demand: float = 0.0
+	production_plan_demand: float = 0.0
+	warehouse_local_commitments: float = 0.0
+	safety_stock: float = 0.0
+	total_demand: float = 0.0
+	timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+@dataclass
 class ChannelATPBreakdown:
 	"""
 	Auditable explanation breakdown of Channel ATP calculation.
@@ -200,5 +221,7 @@ class ChannelATPBreakdown:
 	company: str
 	lines: List[ATPBreakdownWarehouse] = field(default_factory=list)
 	channel_atp: float = 0.0
+	cross_warehouse_adjustments: Dict[str, float] = field(default_factory=dict)
+	demand_breakdown: Optional[ChannelDemandBreakdown] = None
 	stock_uom: str = "Nos"
 	timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
