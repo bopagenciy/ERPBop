@@ -124,3 +124,64 @@ def sanitize_url_for_logging(url):
 	except Exception:
 		return "[SANITIZED_URL]"
 
+
+class ConnectorSafetyError(frappe.ValidationError):
+	"""Raised when a connector target host or write operation violates safety constraints."""
+	pass
+
+
+# Phase 1J write operations are authorized exclusively for local disposable test endpoints:
+ALLOWLISTED_WRITE_HOSTS = {
+	"127.0.0.1",
+	"localhost",
+	"prestashop-test",
+}
+
+
+def assert_safe_write_target(environment=None, base_url=None):
+	"""
+	Strictly enforces write safety guards for outbound publication operations (Phase 1J).
+	Guards BEFORE any network request or DNS resolution:
+	1. Environment MUST be DEVELOPMENT (or local testing).
+	2. Target host MUST NOT resolve to any forbidden production domain (*.theindustrialdepot.com).
+	3. Target host MUST be explicitly listed in ALLOWLISTED_WRITE_HOSTS. Any other host is rejected.
+	Throws ConnectorSafetyError on violation.
+	Returns True if safe.
+	"""
+	env = (environment or IntegrationEnvironment.DEFAULT).strip().upper()
+
+	if env != IntegrationEnvironment.DEVELOPMENT:
+		frappe.throw(
+			_(
+				"CRITICAL WRITE SAFETY VIOLATION: PrestaShop write operations are only authorized "
+				"in DEVELOPMENT environment, but current environment is '{0}'."
+			).format(env),
+			ConnectorSafetyError,
+		)
+
+	if not base_url:
+		frappe.throw(_("Base URL is required to validate connector write target."), ConnectorSafetyError)
+
+	canonical_host = canonicalize_hostname(base_url)
+
+	if is_forbidden_production_host(base_url):
+		frappe.throw(
+			_(
+				"CRITICAL WRITE SAFETY VIOLATION: Target host '{0}' resolves to a forbidden production domain "
+				"and writes are strictly blocked."
+			).format(canonical_host),
+			ConnectorSafetyError,
+		)
+
+	if canonical_host not in ALLOWLISTED_WRITE_HOSTS:
+		frappe.throw(
+			_(
+				"CRITICAL WRITE SAFETY VIOLATION: Target host '{0}' is not in the authorized local test "
+				"write allowlist {1}. Outbound writes are strictly blocked."
+			).format(canonical_host, sorted(list(ALLOWLISTED_WRITE_HOSTS))),
+			ConnectorSafetyError,
+		)
+
+	return True
+
+

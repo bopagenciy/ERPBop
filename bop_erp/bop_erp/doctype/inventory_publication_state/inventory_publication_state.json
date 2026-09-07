@@ -1,0 +1,205 @@
+{
+ "actions": [],
+ "autoname": "hash",
+ "creation": "2026-09-07 11:51:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "sales_channel",
+  "provider",
+  "item_code",
+  "external_entity_type",
+  "external_id",
+  "external_variant_id",
+  "stock_available_id",
+  "column_break_1",
+  "last_computed_atp",
+  "last_published_qty",
+  "last_published_hash",
+  "last_published_at",
+  "last_remote_observed_qty",
+  "publication_version",
+  "status",
+  "section_break_audit",
+  "last_event",
+  "last_error"
+ ],
+ "fields": [
+  {
+   "fieldname": "sales_channel",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Sales Channel",
+   "options": "Sales Channel",
+   "reqd": 1
+  },
+  {
+   "fieldname": "provider",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Provider",
+   "length": 50,
+   "reqd": 1
+  },
+  {
+   "fieldname": "item_code",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Item Code",
+   "options": "Item",
+   "reqd": 1
+  },
+  {
+   "fieldname": "external_entity_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "External Entity Type",
+   "options": "PRODUCT\nPRODUCT_VARIANT",
+   "reqd": 1
+  },
+  {
+   "fieldname": "external_id",
+   "fieldtype": "Small Text",
+   "in_list_view": 1,
+   "label": "External ID",
+   "reqd": 1
+  },
+  {
+   "fieldname": "external_variant_id",
+   "fieldtype": "Small Text",
+   "label": "External Variant ID"
+  },
+  {
+   "fieldname": "stock_available_id",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Stock Available ID",
+   "length": 100,
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "last_computed_atp",
+   "fieldtype": "Float",
+   "label": "Last Computed ATP"
+  },
+  {
+   "fieldname": "last_published_qty",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Last Published Qty"
+  },
+  {
+   "fieldname": "last_published_hash",
+   "fieldtype": "Data",
+   "label": "Last Published Hash",
+   "length": 64
+  },
+  {
+   "fieldname": "last_published_at",
+   "fieldtype": "Datetime",
+   "label": "Last Published At"
+  },
+  {
+   "fieldname": "last_remote_observed_qty",
+   "fieldtype": "Int",
+   "label": "Last Remote Observed Qty"
+  },
+  {
+   "default": "1",
+   "fieldname": "publication_version",
+   "fieldtype": "Int",
+   "label": "Publication Version"
+  },
+  {
+   "default": "Pending",
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Status",
+   "options": "Pending\nSucceeded\nFailed\nDrift_Detected\nStale\nSuperseded\nNo_Op"
+  },
+  {
+   "fieldname": "section_break_audit",
+   "fieldtype": "Section Break",
+   "label": "Audit & Logs"
+  },
+  {
+   "fieldname": "last_event",
+   "fieldtype": "Link",
+   "label": "Last Integration Event",
+   "options": "Integration Event"
+  },
+  {
+   "fieldname": "last_error",
+   "fieldtype": "Small Text",
+   "label": "Last Error"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-09-07 11:51:00.000000",
+ "modified_by": "Administrator",
+ "module": "Bop ERP",
+ "name": "Inventory Publication State",
+ "naming_rule": "Random",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Bop ERP Administrator",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 1,
+   "export": 0,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Bop Integration User",
+   "share": 0,
+   "write": 1
+  },
+  {
+   "create": 0,
+   "delete": 0,
+   "email": 0,
+   "export": 0,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Sales User",
+   "share": 0,
+   "write": 0
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}
