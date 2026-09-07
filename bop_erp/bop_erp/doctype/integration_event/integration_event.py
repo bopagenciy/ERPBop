@@ -145,36 +145,13 @@ class IntegrationEvent(Document):
 		return None
 
 	def _verify_processing_lease(self, processing_token):
-		if not processing_token:
-			frappe.throw(
-				_("Processing token is required to mutate state for event '{0}'.").format(self.name),
-				frappe.ValidationError,
-			)
+		from bop_erp.reliability import verify_processing_authority
 
 		self.reload()
-
-		if self.status != IntegrationStatus.PROCESSING:
+		is_auth, reason = verify_processing_authority(self.name, processing_token)
+		if not is_auth:
 			frappe.throw(
-				_("Cannot mutate event '{0}' with status '{1}'. Event is not in PROCESSING state.").format(
-					self.name, self.status
-				),
-				frappe.ValidationError,
-			)
-
-		if self.processing_token != processing_token:
-			frappe.throw(
-				_("Fencing violation: Stale worker with token '{0}' has lost lease on event '{1}'.").format(
-					processing_token, self.name
-				),
-				frappe.ValidationError,
-			)
-
-		now = now_datetime()
-		if not self.lease_expires_at or self.lease_expires_at <= now:
-			frappe.throw(
-				_("Fencing violation: Processing lease for event '{0}' expired at {1} (current time: {2}).").format(
-					self.name, self.lease_expires_at, now
-				),
+				_(reason),
 				frappe.ValidationError,
 			)
 

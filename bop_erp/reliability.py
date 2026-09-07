@@ -197,6 +197,70 @@ def claim_event_for_processing(event_name, worker_id=None, lease_timeout_seconds
 		return True, worker_id, processing_token
 	return False, None, None
 
+
+def get_database_now():
+	"""
+	Returns the current authoritative timestamp from the database in the site's local timezone.
+	Avoids distributed worker clock skew deciding lease validity while matching Frappe's
+	timestamp persistence semantics.
+	"""
+	try:
+		tz = frappe.get_system_settings("time_zone") or "UTC"
+		db_res = frappe.db.sql("SELECT CONVERT_TZ(NOW(), @@session.time_zone, %s)", (tz,))[0][0]
+		if db_res:
+			return get_datetime(db_res)
+		return now_datetime()
+	except Exception:
+		return now_datetime()
+
+
+def verify_processing_authority(event_name, processing_token, db_time=None):
+	"""
+	Authoritative predicate governing worker authority to perform operations or state mutations.
+	A worker is authoritative ONLY when:
+	1. Event exists.
+	2. event.status == 'Processing'
+	3. event.processing_token == worker's token (not None/empty)
+	4. event.lease_expires_at IS NOT NULL
+	5. event.lease_expires_at > database authoritative time
+
+	Returns (is_authoritative: bool, reason: str).
+	"""
+	if not processing_token:
+		return False, f"Processing token is required for event '{event_name}'"
+
+	event_row = frappe.db.get_value(
+		"Integration Event",
+		event_name,
+		["status", "processing_token", "lease_expires_at"],
+		as_dict=True,
+	)
+	if not event_row:
+		return False, f"Event '{event_name}' not found"
+
+	if event_row.status != IntegrationStatus.PROCESSING:
+		return False, f"Event '{event_name}' status is '{event_row.status}' (expected PROCESSING)"
+
+	if event_row.processing_token != processing_token:
+		return False, (
+			f"Fencing violation for event '{event_name}': "
+			f"worker token '{processing_token}' does not match active token '{event_row.processing_token}'"
+		)
+
+	if not event_row.lease_expires_at:
+		return False, f"Event '{event_name}' has no active lease expiry timestamp"
+
+	now_db = db_time or get_database_now()
+	lease_expires_at = get_datetime(event_row.lease_expires_at)
+	if lease_expires_at <= now_db:
+		return False, (
+			f"Fencing violation: Processing lease for event '{event_name}' expired at {lease_expires_at} "
+			f"(authoritative db time: {now_db})"
+		)
+
+	return True, "OK"
+
+
 def renew_processing_lease(event_name, processing_token, extension_seconds=None):
 	"""
 	Safely extends the processing lease of an active event.
@@ -425,9 +489,16 @@ def process_integration_event(event_name, handler=None):
 			# Default no-op deterministic success
 			result = {"success": True}
 
-		doc.mark_succeeded(processing_token=processing_token, response_metadata=result)
-		return True
+		is_auth, _ = verify_processing_authority(event_name, processing_token)
+		if is_auth:
+			doc.mark_succeeded(processing_token=processing_token, response_metadata=result)
+			return True
+		return False
 	except Exception as e:
+		is_auth, auth_reason = verify_processing_authority(event_name, processing_token)
+		if not is_auth:
+			return False
+
 		delay_seconds = getattr(e, "retry_after", None)
 		error_category = getattr(e, "error_category", None)
 		if not error_category:

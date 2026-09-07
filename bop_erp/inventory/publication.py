@@ -19,7 +19,12 @@ from bop_erp.constants import (
 	ErrorCategory,
 )
 from bop_erp.safety import assert_safe_write_target, ConnectorSafetyError
-from bop_erp.reliability import claim_event_for_processing, sanitize_metadata
+from bop_erp.reliability import (
+	claim_event_for_processing,
+	sanitize_metadata,
+	verify_processing_authority,
+	get_database_now,
+)
 from bop_erp.inventory.availability import get_channel_atp
 from bop_erp.integrations.prestashop.config import PrestaShopConfig
 from bop_erp.integrations.prestashop.client import PrestaShopClient
@@ -221,13 +226,21 @@ def commit_publication_state(
 	status: str = "Succeeded",
 	last_event_name: Optional[str] = None,
 	last_error: str = "",
+	processing_token: Optional[str] = None,
 ) -> bool:
 	"""
 	Atomically updates Inventory Publication State enforcing state ownership fencing.
-	Only updates if target_version >= the row's current publication_version.
-	An older version can NEVER overwrite state written by a newer version.
-	Returns True if committed; False if superseded/fenced.
+	Only updates if:
+	1. If associated with an Integration Event, the worker still possesses valid unexpired authority.
+	2. target_version >= the row's current publication_version.
+	An older version or expired worker can NEVER overwrite state written by a newer or active version.
+	Returns True if committed; False if superseded/fenced/unauthorized.
 	"""
+	if last_event_name and processing_token:
+		is_auth, _ = verify_processing_authority(last_event_name, processing_token)
+		if not is_auth:
+			return False
+
 	now = now_datetime()
 	frappe.db.sql(
 		"""
@@ -452,22 +465,12 @@ def publish_item_inventory(
 				f"PRE_PUT_FRESHNESS_CHECK: Publication version superseded (worker={version}, db={db_v}). Aborting PUT."
 			)
 
-		# Re-verify lease and token if processing an Integration Event
+		# Re-verify lease and authoritative worker processing status if processing an Integration Event
 		if event_doc and processing_token:
-			cur_status, cur_token, cur_lease = frappe.db.get_value(
-				"Integration Event", event_doc.name, ["status", "processing_token", "lease_expires_at"]
-			) or (None, None, None)
-			if cur_status != IntegrationStatus.PROCESSING:
+			is_auth, reason_auth = verify_processing_authority(event_doc.name, processing_token)
+			if not is_auth:
 				raise PrestaShopStalePublicationError(
-					f"PRE_PUT_FRESHNESS_CHECK: Event {event_doc.name} status is '{cur_status}' (expected PROCESSING). Aborting PUT."
-				)
-			if cur_token != processing_token:
-				raise PrestaShopStalePublicationError(
-					f"PRE_PUT_FRESHNESS_CHECK: Fencing violation for event {event_doc.name}: worker token {processing_token} != active token {cur_token}. Aborting PUT."
-				)
-			if not cur_lease or get_datetime(cur_lease) <= now_datetime():
-				raise PrestaShopStalePublicationError(
-					f"PRE_PUT_FRESHNESS_CHECK: Lease expired at {cur_lease} for event {event_doc.name}. Aborting PUT."
+					f"PRE_PUT_FRESHNESS_CHECK: {reason_auth}. Aborting PUT."
 				)
 
 		# Re-verify live ATP freshness if intended_atp was passed
@@ -504,17 +507,18 @@ def publish_item_inventory(
 			status="Succeeded" if changed else "No_Op",
 			last_event_name=event_doc.name if event_doc else None,
 			last_error="",
+			processing_token=processing_token,
 		)
 
 		if not committed:
-			# Fenced by a newer concurrent version!
+			# Fenced by a newer concurrent version or lost authority!
 			return {
 				"item_code": item_code,
 				"sales_channel": sales_channel,
 				"status": "SUPERSEDED_FENCED",
 				"version": version,
 				"changed": False,
-				"reason": "SUPERSEDED_BY_CONCURRENT_NEWER_VERSION",
+				"reason": "SUPERSEDED_BY_CONCURRENT_NEWER_VERSION_OR_REVOKED_AUTHORITY",
 			}
 
 		return {
@@ -546,6 +550,7 @@ def publish_item_inventory(
 			status="Failed",
 			last_event_name=event_doc.name if event_doc else None,
 			last_error=str(exc)[:500],
+			processing_token=processing_token,
 		)
 		raise
 
@@ -749,13 +754,15 @@ def process_inventory_publication_event(
 		}
 
 	except PrestaShopStalePublicationError as stale_err:
-		event_doc.mark_succeeded(
-			processing_token=processing_token,
-			response_metadata={
-				"action": "SUPERSEDED",
-				"reason": str(stale_err),
-			},
-		)
+		is_auth, _ = verify_processing_authority(event_name, processing_token)
+		if is_auth:
+			event_doc.mark_succeeded(
+				processing_token=processing_token,
+				response_metadata={
+					"action": "SUPERSEDED",
+					"reason": str(stale_err),
+				},
+			)
 		return {
 			"success": True,
 			"event_name": event_name,
@@ -764,6 +771,17 @@ def process_inventory_publication_event(
 		}
 
 	except Exception as exc:
+		is_auth, auth_reason = verify_processing_authority(event_name, processing_token)
+		if not is_auth:
+			# Authority already revoked or expired; do not attempt invalid transition
+			return {
+				"success": False,
+				"event_name": event_name,
+				"error_code": "LEASE_EXPIRED_OR_REVOKED",
+				"error_category": ErrorCategory.NON_RETRYABLE,
+				"error": auth_reason,
+			}
+
 		error_category, error_code = map_prestashop_exception_to_error_category(exc)
 		delay_seconds = getattr(exc, "retry_after", None)
 

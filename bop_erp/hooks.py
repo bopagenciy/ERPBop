@@ -40,3 +40,13 @@ doc_events = {
 		"validate": "bop_erp.attribution.validate_transaction_attribution",
 	},
 }
+
+# Scheduler Events
+# ----------------
+scheduler_events = {
+	"cron": {
+		"*/5 * * * *": [
+			"bop_erp.inventory.scheduler.enqueue_scheduled_inventory_publication",
+		],
+	},
+}
