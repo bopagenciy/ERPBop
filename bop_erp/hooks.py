@@ -46,7 +46,7 @@ doc_events = {
 scheduler_events = {
 	"cron": {
 		"*/5 * * * *": [
-			"bop_erp.inventory.scheduler.enqueue_scheduled_inventory_publication",
+			"bop_erp.inventory.scheduler.enqueue_inventory_publication_dispatcher",
 		],
 	},
 }
