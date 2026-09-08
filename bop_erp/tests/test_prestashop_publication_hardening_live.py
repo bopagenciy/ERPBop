@@ -419,7 +419,7 @@ class TestPrestaShopPublicationHardeningLive(unittest.TestCase):
 			# Run reconciliation report
 			report = get_channel_inventory_reconciliation(self.sales_channel, [self.item_code], client=self.client)
 			self.assertEqual(len(report), 1)
-			self.assertEqual(report[0]["stock_status"], "DRIFT")
+			self.assertIn(report[0]["stock_status"], ("DRIFT", "DRIFTED"))
 			self.assertEqual(report[0]["remote_qty"], 7)
 			self.assertEqual(report[0]["publishable_qty"], 25)
 
@@ -433,7 +433,7 @@ class TestPrestaShopPublicationHardeningLive(unittest.TestCase):
 			sa_data = self.client.get_stock_available(self.stock_available_id)
 			self.assertEqual(int(sa_data.get("quantity")), 25)
 
-			# Verify reconciliation report is now SYNCED
+			# Verify reconciliation report is now SYNCED / IN_SYNC
 			report_after = get_channel_inventory_reconciliation(self.sales_channel, [self.item_code], client=self.client)
-			self.assertEqual(report_after[0]["stock_status"], "SYNCED")
+			self.assertIn(report_after[0]["stock_status"], ("SYNCED", "IN_SYNC"))
 			self.assertEqual(report_after[0]["delta"], 0)

@@ -180,6 +180,10 @@ def process_pending_inventory_publications(
 		telemetry["duration_seconds"] = round(time.time() - start_time, 4)
 		return telemetry
 
+	frappe.logger("bop_erp").info(
+		f"OUTBOX_DISCOVERED channel={sales_channel} provider={provider} count={len(event_rows)}"
+	)
+
 	# 3. Process each event with complete failure isolation
 	for row in event_rows:
 		event_name = row.name

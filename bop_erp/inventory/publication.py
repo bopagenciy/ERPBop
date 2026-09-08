@@ -720,6 +720,9 @@ def process_inventory_publication_event(
 	"""
 	claimed, worker_id, processing_token = claim_event_for_processing(event_name, worker_id=worker_id)
 	if not claimed:
+		frappe.logger("bop_erp").info(
+			f"OUTBOX_CLAIM_REJECTED event={event_name} worker={worker_id}"
+		)
 		return {
 			"success": False,
 			"event_name": event_name,
@@ -741,6 +744,10 @@ def process_inventory_publication_event(
 	intended_atp = payload.get("intended_atp")
 	publication_version = payload.get("publication_version")
 
+	frappe.logger("bop_erp").info(
+		f"OUTBOX_CLAIMED event={event_name} channel={sales_channel} item={item_code} attempt={event_doc.attempt_count}"
+	)
+
 	if not item_code or not sales_channel:
 		event_doc.mark_failed(
 			processing_token=processing_token,
@@ -748,11 +755,18 @@ def process_inventory_publication_event(
 			error_message="Event missing required item_code or sales_channel",
 			error_category=ErrorCategory.VALIDATION,
 		)
+		frappe.logger("bop_erp").warning(
+			f"PUBLICATION_FAILED event={event_name} error=INVALID_PAYLOAD"
+		)
 		return {
 			"success": False,
 			"event_name": event_name,
 			"reason": "INVALID_PAYLOAD",
 		}
+
+	frappe.logger("bop_erp").info(
+		f"PUBLICATION_STARTED event={event_name} channel={sales_channel} item={item_code}"
+	)
 
 	try:
 		result = publish_item_inventory(
@@ -768,6 +782,9 @@ def process_inventory_publication_event(
 
 		status_str = result.get("status")
 		if status_str in ("STALE_SUPERSEDED", "SUPERSEDED_PRE_PUT", "SUPERSEDED_FENCED"):
+			frappe.logger("bop_erp").info(
+				f"PUBLICATION_STALE_WORKER_REJECTED event={event_name} channel={sales_channel} item={item_code} reason={result.get('reason')}"
+			)
 			event_doc.mark_succeeded(
 				processing_token=processing_token,
 				response_metadata={
@@ -777,6 +794,9 @@ def process_inventory_publication_event(
 				},
 			)
 		else:
+			frappe.logger("bop_erp").info(
+				f"PUBLICATION_SUCCEEDED event={event_name} channel={sales_channel} item={item_code} qty={result.get('publishable_qty')}"
+			)
 			event_doc.mark_succeeded(
 				processing_token=processing_token,
 				response_metadata=result,
@@ -790,6 +810,9 @@ def process_inventory_publication_event(
 
 	except PrestaShopStalePublicationError as stale_err:
 		is_auth, _ = verify_processing_authority(event_name, processing_token)
+		frappe.logger("bop_erp").info(
+			f"PUBLICATION_STALE_WORKER_REJECTED event={event_name} channel={sales_channel} item={item_code} reason={stale_err}"
+		)
 		if is_auth:
 			event_doc.mark_succeeded(
 				processing_token=processing_token,
@@ -808,6 +831,9 @@ def process_inventory_publication_event(
 	except Exception as exc:
 		is_auth, auth_reason = verify_processing_authority(event_name, processing_token)
 		if not is_auth:
+			frappe.logger("bop_erp").warning(
+				f"PUBLICATION_STALE_WORKER_REJECTED event={event_name} channel={sales_channel} item={item_code} auth_reason={auth_reason}"
+			)
 			# Authority already revoked or expired; do not attempt invalid transition
 			return {
 				"success": False,
@@ -827,6 +853,16 @@ def process_inventory_publication_event(
 			error_category=error_category,
 			delay_seconds=delay_seconds,
 		)
+
+		st_after = frappe.db.get_value("Integration Event", event_name, "status")
+		if st_after == IntegrationStatus.RETRY_PENDING:
+			frappe.logger("bop_erp").warning(
+				f"PUBLICATION_RETRY event={event_name} channel={sales_channel} item={item_code} error_code={error_code} attempt={event_doc.attempt_count}"
+			)
+		else:
+			frappe.logger("bop_erp").error(
+				f"PUBLICATION_FAILED event={event_name} channel={sales_channel} item={item_code} error_code={error_code} status={st_after}"
+			)
 
 		return {
 			"success": False,
