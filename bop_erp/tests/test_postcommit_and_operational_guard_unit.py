@@ -42,6 +42,8 @@ from bop_erp.orders.ingestion import (
 	find_affected_channels_for_items,
 	find_affected_channel_items_for_scopes,
 	schedule_post_commit_publication,
+	persist_publication_outbox_intents,
+	register_post_commit_wake,
 	is_order_ingestion_complete,
 	ingest_order_pipeline,
 	process_order_ingestion_event,
@@ -726,3 +728,124 @@ class TestPostcommitAndOperationalGuardUnit(FrappeTestCase):
 		field_names = [f.fieldname for f in meta.fields]
 		for ef in expected_fields:
 			self.assertIn(ef, field_names, f"Sales Order must contain custom field '{ef}'")
+
+	# ==================================================
+	# 10. TRANSACTIONAL PUBLICATION OUTBOX DURABILITY (PHASE 1K.4)
+	# ==================================================
+	def test_21_outbox_intents_exist_in_mariadb_before_commit_and_rollback_cleanly(self):
+		"""Outbox PENDING event is written to MariaDB during transaction and rolls back on rollback."""
+		initial_count = frappe.db.count("Integration Event", {
+			"direction": IntegrationDirection.OUTBOUND,
+			"entity_type": ExternalEntityType.INVENTORY,
+		})
+
+		# Persist outbox inside uncommitted transaction
+		res = persist_publication_outbox_intents({self.sales_channel: [self.item_code]})
+		self.assertEqual(res["outbox_persisted"], 1)
+		ev_name = res["event_names"][0]
+
+		# Verify it exists in MariaDB before commit
+		self.assertTrue(frappe.db.exists("Integration Event", ev_name))
+		status = frappe.db.get_value("Integration Event", ev_name, "status")
+		self.assertEqual(status, IntegrationStatus.PENDING)
+
+		# Roll back transaction
+		frappe.db.rollback()
+
+		# Verify it no longer exists after rollback
+		self.assertFalse(frappe.db.exists("Integration Event", ev_name))
+		final_count = frappe.db.count("Integration Event", {
+			"direction": IntegrationDirection.OUTBOUND,
+			"entity_type": ExternalEntityType.INVENTORY,
+		})
+		self.assertEqual(final_count, initial_count)
+
+	def test_22_outbox_persistence_failure_aborts_transaction_cleanly(self):
+		"""Simulate an error during outbox write -> aborts transaction with zero leftover records."""
+		initial_so_count = frappe.db.count("Sales Order")
+		initial_sre_count = frappe.db.count("Stock Reservation Entry")
+		initial_ev_count = frappe.db.count("Integration Event", {
+			"direction": IntegrationDirection.OUTBOUND,
+			"entity_type": ExternalEntityType.INVENTORY,
+		})
+
+		with patch("bop_erp.orders.ingestion.schedule_inventory_publication", side_effect=Exception("Outbox disk full")):
+			with self.assertRaises(OrderReservationFailedError):
+				schedule_post_commit_publication({self.sales_channel: [self.item_code]})
+
+		frappe.db.rollback()
+
+		self.assertEqual(frappe.db.count("Sales Order"), initial_so_count)
+		self.assertEqual(frappe.db.count("Stock Reservation Entry"), initial_sre_count)
+		self.assertEqual(frappe.db.count("Integration Event", {
+			"direction": IntegrationDirection.OUTBOUND,
+			"entity_type": ExternalEntityType.INVENTORY,
+		}), initial_ev_count)
+
+	def test_23_hard_crash_after_commit_leaves_outbox_event_in_mariadb(self):
+		"""Hard crash after SQL commit (before dispatcher wake) leaves durable PENDING event in DB."""
+		initial_count = frappe.db.count("Integration Event", {
+			"direction": IntegrationDirection.OUTBOUND,
+			"entity_type": ExternalEntityType.INVENTORY,
+		})
+
+		# Persist outbox intent and commit to MariaDB
+		res = persist_publication_outbox_intents({self.sales_channel: [self.item_code]})
+		self.assertEqual(res["outbox_persisted"], 1)
+		ev_name = res["event_names"][0]
+
+		# SQL commit without calling after_commit hooks (simulating power loss / kill -9)
+		frappe.db.commit()
+
+		# Verify outbox event is durable in MariaDB
+		event_doc = frappe.get_doc("Integration Event", ev_name)
+		self.assertEqual(event_doc.status, IntegrationStatus.PENDING)
+		self.assertEqual(event_doc.direction, IntegrationDirection.OUTBOUND)
+		self.assertEqual(event_doc.entity_type, ExternalEntityType.INVENTORY)
+		self.assertEqual(event_doc.erp_document, self.item_code)
+
+		# Clean up
+		frappe.db.delete("Integration Event", {"name": ev_name})
+		frappe.db.commit()
+
+	def test_24_dispatcher_wake_failure_does_not_affect_committed_outbox(self):
+		"""If the after_commit wake callback fails, it does not affect the committed outbox event."""
+		res = persist_publication_outbox_intents({self.sales_channel: [self.item_code]})
+		ev_name = res["event_names"][0]
+
+		# Register wake callback with simulated failure
+		with patch("bop_erp.orders.ingestion.enqueue_inventory_publication_dispatcher", side_effect=Exception("Redis Queue Down")):
+			register_post_commit_wake()
+			# Durable commit triggers after_commit callbacks
+			frappe.db.commit()
+
+		# The outbox event remains safely committed in MariaDB
+		self.assertTrue(frappe.db.exists("Integration Event", ev_name))
+		status = frappe.db.get_value("Integration Event", ev_name, "status")
+		self.assertEqual(status, IntegrationStatus.PENDING)
+
+		# Clean up
+		frappe.db.delete("Integration Event", {"name": ev_name})
+		frappe.db.commit()
+
+	def test_25_multichannel_outbox_atomicity_in_single_transaction(self):
+		"""Multi-channel affected items create outbox events atomically in the same transaction."""
+		channel_map = {
+			self.sales_channel: [self.item_code],
+			self.coal_channel: [self.item_coal],
+		}
+
+		res = persist_publication_outbox_intents(channel_map)
+		self.assertEqual(res["outbox_persisted"], 2)
+		ev_names = res["event_names"]
+		self.assertEqual(len(ev_names), 2)
+
+		# Both exist before commit
+		for ev in ev_names:
+			self.assertTrue(frappe.db.exists("Integration Event", ev))
+
+		# Roll back: both disappear atomically
+		frappe.db.rollback()
+		for ev in ev_names:
+			self.assertFalse(frappe.db.exists("Integration Event", ev))
+

@@ -861,3 +861,105 @@ class TestPostcommitAndOperationalGuardLive(unittest.TestCase):
 				frappe.delete_doc("Address", so.shipping_address_name, force=True, ignore_permissions=True)
 			frappe.delete_doc("Customer", cust, force=True, ignore_permissions=True)
 			frappe.db.commit()
+
+	# ==================================================
+	# 5. TRANSACTIONAL OUTBOX LIVE CRASH SURVIVAL & RECOVERY
+	# ==================================================
+	def test_05_transactional_outbox_survives_process_crash_and_publishes_to_prestashop(self):
+		"""
+		Phase 1K.4 Core Acceptance Test:
+		Simulates a process crash / worker loss after SQL commit by suppressing
+		post-commit dispatcher wake.
+		Proves:
+		1. Outbound publication event was persisted in MariaDB in the SAME transaction as SO/SRE.
+		2. Even without any wake callback or dispatcher running at commit time, the outbox event
+		   survives durably in MariaDB with status = PENDING.
+		3. An independent scheduled publication worker claims the event, calculates ATP, and
+		   publishes the new stock level to the live PrestaShop TEST instance.
+		4. PrestaShop stock level accurately decrements from 120 to 119.
+		5. Restores PrestaShop stock cleanly back to 120.
+		"""
+		self._setup_tid_channel()
+
+		initial_remote_sa = self.write_client.get_stock_available(self.stock_available_id_pliers)
+		self.assertEqual(int(initial_remote_sa.get("quantity")), 120)
+
+		initial_invoices = frappe.db.count("Sales Invoice")
+		initial_payments = frappe.db.count("Payment Entry")
+
+		# Create simulated inbound order for Order 8
+		inbound_event = frappe.get_doc({
+			"doctype": "Integration Event",
+			"provider": IntegrationProvider.PRESTASHOP,
+			"sales_channel": self.channel_tid,
+			"direction": IntegrationDirection.INBOUND,
+			"entity_type": ExternalEntityType.ORDER,
+			"operation": IntegrationOperation.INGEST_ORDER,
+			"external_id": "8",
+			"idempotency_key": compute_order_idempotency_key(IntegrationProvider.PRESTASHOP, self.channel_tid, "8-CRASH-TEST"),
+			"status": IntegrationStatus.PENDING,
+			"max_attempts": 3,
+		})
+		inbound_event.insert(ignore_permissions=True)
+		frappe.db.commit()
+
+		# Explicitly suppress post-commit wake to simulate total loss of in-memory callbacks / process crash
+		frappe.flags.suppress_outbox_wake = True
+		try:
+			ingest_res = process_order_ingestion_event(inbound_event.name, worker_id="worker-crash-test", client=self.read_client)
+			self.assertTrue(ingest_res["success"], f"Ingestion failed: {ingest_res}")
+			so_name = ingest_res["sales_order"]
+		finally:
+			frappe.flags.suppress_outbox_wake = False
+
+		# Confirm SO is committed and READY
+		so = frappe.get_doc("Sales Order", so_name)
+		self.assertEqual(so.docstatus, 1)
+		self.assertEqual(so.integration_status, IntegrationReadinessStatus.READY)
+
+		# Verify that outbox event EXISTS in MariaDB with status = PENDING
+		# (Proving it was persisted transactionally before commit, not in RAM callback)
+		outbox_events = frappe.get_all("Integration Event", filters={
+			"sales_channel": self.channel_tid,
+			"direction": IntegrationDirection.OUTBOUND,
+			"entity_type": ExternalEntityType.INVENTORY,
+			"erp_document": self.item_pliers,
+			"status": IntegrationStatus.PENDING,
+		})
+		self.assertGreaterEqual(len(outbox_events), 1, "Transactional outbox event must exist in MariaDB as PENDING")
+		outbox_ev_name = outbox_events[0].name
+
+		# Simulate recovery worker picking up the dormant outbox event
+		pub_res = process_multichannel_inventory_publications(client=self.write_client)
+		self.assertGreaterEqual(pub_res["published"], 1)
+
+		# Verify outbox event is now SUCCEEDED in MariaDB
+		outbox_ev = frappe.get_doc("Integration Event", outbox_ev_name)
+		self.assertEqual(outbox_ev.status, IntegrationStatus.SUCCEEDED)
+
+		# Verify PrestaShop TEST API shows updated stock (119)
+		updated_remote_sa = self.write_client.get_stock_available(self.stock_available_id_pliers)
+		self.assertEqual(int(updated_remote_sa.get("quantity")), 119, "PrestaShop TEST stock must be updated to 119")
+
+		# Verify ZERO sales invoices and ZERO payment entries created
+		self.assertEqual(frappe.db.count("Sales Invoice"), initial_invoices)
+		self.assertEqual(frappe.db.count("Payment Entry"), initial_payments)
+
+		# Clean up: restore stock back to 120
+		restore_res = self.write_client.update_stock_available_quantity(self.stock_available_id_pliers, 120, self.product_id_pliers, None)
+		restored_remote_sa = self.write_client.get_stock_available(self.stock_available_id_pliers)
+		self.assertEqual(int(restored_remote_sa.get("quantity")), 120, "PrestaShop TEST stock must be restored to 120")
+
+		# Clean up created customer, address and mappings from Order 8
+		if so.customer and so.customer != "Test ATP Cust":
+			cust = so.customer
+			frappe.db.delete("External ID Mapping", {"erp_document": cust})
+			if so.customer_address:
+				frappe.db.delete("External ID Mapping", {"erp_document": so.customer_address})
+				frappe.delete_doc("Address", so.customer_address, force=True, ignore_permissions=True)
+			if so.shipping_address_name and so.shipping_address_name != so.customer_address:
+				frappe.db.delete("External ID Mapping", {"erp_document": so.shipping_address_name})
+				frappe.delete_doc("Address", so.shipping_address_name, force=True, ignore_permissions=True)
+			frappe.delete_doc("Customer", cust, force=True, ignore_permissions=True)
+			frappe.db.commit()
+

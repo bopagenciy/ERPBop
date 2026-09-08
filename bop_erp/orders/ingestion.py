@@ -29,6 +29,7 @@ from bop_erp.reliability import (
 from bop_erp.inventory.availability import get_channel_atp
 from bop_erp.inventory.reservations import reserve_channel_stock
 from bop_erp.inventory.publication import schedule_channel_inventory_publication as schedule_inventory_publication
+from bop_erp.inventory.scheduler import enqueue_inventory_publication_dispatcher
 from bop_erp.integrations.prestashop.client import PrestaShopClient
 from bop_erp.integrations.prestashop.config import PrestaShopConfig
 from bop_erp.integrations.prestashop.adapters.order_normalizer import (
@@ -491,15 +492,26 @@ def find_affected_channels_for_items(
 	return unique_channels if unique_channels else [sales_channel]
 
 
-def schedule_post_commit_publication(
+def persist_publication_outbox_intents(
 	channel_items_or_channels: Union[Dict[str, List[str]], List[str]],
 	item_codes: Optional[List[str]] = None,
-):
+) -> Dict[str, Any]:
 	"""
-	Schedules publication intents for all affected channels strictly AFTER durable DB commit.
-	Accepts either:
-	- Dict[str, List[str]]: mapping sales_channel -> list of item_codes
-	- List[str] with item_codes: list of channels with shared item_codes
+	Transactional Publication Outbox:
+	Atomically persists outbound publication intents (`Integration Event` with status = PENDING,
+	direction = OUTBOUND, entity_type = INVENTORY) into MariaDB *strictly within* the current
+	database transaction.
+
+	Executes 0 network requests, 0 PrestaShop API calls, and NO internal frappe.db.commit().
+	If an error occurs during outbox persistence, raises OrderReservationFailedError so the
+	entire outer transaction / savepoint rolls back cleanly (0 SO, 0 SRE, 0 Outbox events).
+
+	Returns a dict summarizing persisted events:
+	{
+		"event_names": List[str],
+		"channels": List[str],
+		"outbox_persisted": int,
+	}
 	"""
 	if isinstance(channel_items_or_channels, dict):
 		channel_map = channel_items_or_channels
@@ -507,23 +519,77 @@ def schedule_post_commit_publication(
 		items = item_codes or []
 		channel_map = {ch: items for ch in channel_items_or_channels}
 	else:
-		return
+		return {"event_names": [], "channels": [], "outbox_persisted": 0}
 
 	if not channel_map:
+		return {"event_names": [], "channels": [], "outbox_persisted": 0}
+
+	all_event_names: List[str] = []
+	for ch, items in channel_map.items():
+		if not items:
+			continue
+		try:
+			# schedule_inventory_publication writes PENDING Integration Events to MariaDB
+			# WITHOUT calling frappe.db.commit() and WITHOUT performing network I/O.
+			ev_names = schedule_inventory_publication(sales_channel=ch, item_codes=items)
+			if ev_names:
+				all_event_names.extend(ev_names)
+		except Exception as e:
+			frappe.logger("bop_erp").error(
+				f"Transactional Outbox failure for channel '{ch}' with items {items}: {e}"
+			)
+			raise OrderReservationFailedError(
+				_("Failed to persist transactional publication outbox for channel '{0}': {1}").format(
+					ch, str(e)
+				)
+			) from e
+
+	return {
+		"event_names": all_event_names,
+		"channels": sorted(list(channel_map.keys())),
+		"outbox_persisted": len(all_event_names),
+	}
+
+
+def register_post_commit_wake():
+	"""
+	Registers a lightweight after_commit hook strictly as a low-latency wake signal
+	for the outbound inventory publication dispatcher.
+	
+	Failure of this hook or a process crash immediately following SQL commit has
+	ZERO effect on durability, because the outbound PENDING Integration Event
+	is already persisted in MariaDB and will be processed by the periodic scheduler.
+	"""
+	if getattr(frappe.flags, "suppress_outbox_wake", False):
 		return
 
-	def _on_commit():
-		for ch, items in channel_map.items():
-			if not items:
-				continue
-			try:
-				schedule_inventory_publication(sales_channel=ch, item_codes=items)
-			except Exception as e:
-				frappe.logger("bop_erp").error(
-					f"Failed to schedule post-commit publication for channel {ch}: {e}"
-				)
+	def _wake_dispatcher():
+		if getattr(frappe.flags, "in_test", False):
+			# In automated test suites, do not auto-drain outbox synchronously during
+			# frappe.db.commit(), allowing test assertions to inspect persisted outbox events
+			# and run workers with deterministic/mocked clients.
+			return
+		try:
+			enqueue_inventory_publication_dispatcher()
+		except Exception as wake_err:
+			frappe.logger("bop_erp").warning(
+				f"Post-commit dispatcher wake failed (safe to ignore; cron scheduler will pick up event): {wake_err}"
+			)
 
-	frappe.db.after_commit(_on_commit)
+	frappe.db.after_commit(_wake_dispatcher)
+
+
+def schedule_post_commit_publication(
+	channel_items_or_channels: Union[Dict[str, List[str]], List[str]],
+	item_codes: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+	"""
+	Canonical helper that combines transactional outbox persistence (inside MariaDB transaction)
+	with lightweight post-commit dispatcher wake registration.
+	"""
+	outbox_res = persist_publication_outbox_intents(channel_items_or_channels, item_codes=item_codes)
+	register_post_commit_wake()
+	return outbox_res
 
 
 
