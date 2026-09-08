@@ -148,7 +148,13 @@ def assert_safe_write_target(environment=None, base_url=None):
 	Throws ConnectorSafetyError on violation.
 	Returns True if safe.
 	"""
-	env = (environment or IntegrationEnvironment.DEFAULT).strip().upper()
+	if not environment or not str(environment).strip():
+		frappe.throw(
+			_("CRITICAL WRITE SAFETY VIOLATION: Missing environment. Outbound writes strictly require an explicit authorized environment."),
+			ConnectorSafetyError,
+		)
+
+	env = str(environment).strip().upper()
 
 	if env != IntegrationEnvironment.DEVELOPMENT:
 		frappe.throw(

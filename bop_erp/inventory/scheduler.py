@@ -399,3 +399,27 @@ def enqueue_scheduled_inventory_publication(
 		)
 	else:
 		enqueue_inventory_publication_dispatcher(max_events_per_channel=max_events)
+
+
+def enqueue_periodic_channel_reconciliation(
+	provider: str = IntegrationProvider.PRESTASHOP,
+	repair: bool = True,
+	limit_per_channel: int = 100,
+):
+	"""
+	Periodic background reconciliation cron entry point.
+	Discovers eligible active channels and enqueues bounded drift reconciliation with repair=True.
+	"""
+	channels = discover_eligible_publication_channels(provider=provider)
+	for ch_info in channels:
+		ch_name = ch_info["sales_channel"]
+		frappe.enqueue(
+			"bop_erp.inventory.reconciliation.reconcile_channel_inventory",
+			queue="default",
+			sales_channel=ch_name,
+			provider=provider,
+			repair=repair,
+			limit=limit_per_channel,
+			now=frappe.flags.in_test or False,
+		)
+

@@ -57,5 +57,12 @@ scheduler_events = {
 		"*/5 * * * *": [
 			"bop_erp.inventory.scheduler.enqueue_inventory_publication_dispatcher",
 		],
+		"*/10 * * * *": [
+			"bop_erp.reliability.recover_stale_events",
+		],
+		"0 */4 * * *": [
+			"bop_erp.inventory.scheduler.enqueue_periodic_channel_reconciliation",
+		],
 	},
 }
+
