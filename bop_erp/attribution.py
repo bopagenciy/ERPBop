@@ -5,6 +5,7 @@ import frappe
 from frappe import _
 from bop_erp.constants import TransactionOrigin
 
+
 def validate_sales_order_attribution(doc, method=None):
 	if doc.transaction_origin and doc.transaction_origin not in TransactionOrigin.ALL:
 		frappe.throw(

@@ -46,6 +46,40 @@
   "name": "Sales Order-integration_correlation_id"
  },
  {
+  "allow_on_submit": 1,
+  "doctype": "Custom Field",
+  "dt": "Sales Order",
+  "fieldname": "integration_status",
+  "fieldtype": "Select",
+  "in_list_view": 1,
+  "in_standard_filter": 1,
+  "insert_after": "integration_correlation_id",
+  "label": "Integration Status",
+  "name": "Sales Order-integration_status",
+  "options": "INGESTION_PENDING\nRESERVATION_PENDING\nREADY\nFAILED_REVIEW"
+ },
+ {
+  "allow_on_submit": 1,
+  "doctype": "Custom Field",
+  "dt": "Sales Order",
+  "fieldname": "integration_provider",
+  "fieldtype": "Data",
+  "insert_after": "integration_status",
+  "label": "Integration Provider",
+  "name": "Sales Order-integration_provider"
+ },
+ {
+  "allow_on_submit": 1,
+  "doctype": "Custom Field",
+  "dt": "Sales Order",
+  "fieldname": "latest_integration_event",
+  "fieldtype": "Link",
+  "insert_after": "integration_provider",
+  "label": "Latest Integration Event",
+  "name": "Sales Order-latest_integration_event",
+  "options": "Integration Event"
+ },
+ {
   "allow_on_submit": 0,
   "doctype": "Custom Field",
   "dt": "Pick List",

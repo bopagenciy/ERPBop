@@ -649,6 +649,41 @@ def schedule_channel_inventory_publication(
 			"desired_state_hash": pub_hash,
 		}
 
+		# Coalescing & Idempotency guard: check for existing PENDING event
+		existing_pending = frappe.db.get_value(
+			"Integration Event",
+			{
+				"provider": provider,
+				"sales_channel": sales_channel,
+				"direction": IntegrationDirection.OUTBOUND,
+				"entity_type": ExternalEntityType.INVENTORY,
+				"erp_doctype": "Item",
+				"erp_document": ic,
+				"status": IntegrationStatus.PENDING,
+			},
+			["name", "request_metadata", "idempotency_key"],
+			as_dict=True,
+		)
+		if existing_pending:
+			meta = {}
+			if existing_pending.request_metadata:
+				try:
+					meta = json.loads(existing_pending.request_metadata) if isinstance(existing_pending.request_metadata, str) else existing_pending.request_metadata
+				except Exception:
+					meta = {}
+			if meta.get("desired_state_hash") == pub_hash and flt(meta.get("intended_atp")) == flt(live_atp_qty):
+				# Safe coalescence: identical intent already queued
+				event_names.append(existing_pending.name)
+				continue
+			else:
+				# Coalesce: update existing pending intent with latest state
+				existing_doc = frappe.get_doc("Integration Event", existing_pending.name)
+				existing_doc.request_metadata = json.dumps(payload_dict)
+				existing_doc.idempotency_key = idempotency_key
+				existing_doc.save(ignore_permissions=True)
+				event_names.append(existing_doc.name)
+				continue
+
 		event = frappe.get_doc({
 			"doctype": "Integration Event",
 			"provider": provider,

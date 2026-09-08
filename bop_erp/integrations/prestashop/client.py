@@ -417,7 +417,7 @@ class PrestaShopClient:
 		status = resp.status_code
 		safe_url = sanitize_url_for_logging(url)
 
-		if status in (401, 403):
+		if status in (401, 403, 405):
 			raise PrestaShopAuthError(
 				f"Authentication/permission rejected ({status}) for PUT {safe_url}: {resp.text[:200]}",
 				status_code=status,

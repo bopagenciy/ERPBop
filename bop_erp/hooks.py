@@ -21,15 +21,24 @@ doc_events = {
 	},
 	"Pick List": {
 		"before_insert": "bop_erp.attribution.propagate_attribution_to_pick_list",
-		"validate": "bop_erp.attribution.validate_transaction_attribution",
+		"validate": [
+			"bop_erp.attribution.validate_transaction_attribution",
+			"bop_erp.orders.guard.validate_operational_guard",
+		],
 	},
 	"Delivery Note": {
 		"before_insert": "bop_erp.attribution.propagate_attribution_to_delivery_note",
-		"validate": "bop_erp.attribution.validate_transaction_attribution",
+		"validate": [
+			"bop_erp.attribution.validate_transaction_attribution",
+			"bop_erp.orders.guard.validate_operational_guard",
+		],
 	},
 	"Shipment": {
 		"before_insert": "bop_erp.attribution.propagate_attribution_to_shipment",
-		"validate": "bop_erp.attribution.validate_transaction_attribution",
+		"validate": [
+			"bop_erp.attribution.validate_transaction_attribution",
+			"bop_erp.orders.guard.validate_operational_guard",
+		],
 	},
 	"Sales Invoice": {
 		"before_insert": "bop_erp.attribution.propagate_attribution_to_sales_invoice",
