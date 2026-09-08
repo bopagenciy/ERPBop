@@ -20,7 +20,11 @@
   "verify_tls",
   "column_break_health",
   "last_health_check_at",
-  "last_health_check_status"
+  "last_health_check_status",
+  "section_break_discovery",
+  "last_order_watermark",
+  "column_break_discovery",
+  "last_order_id"
  ],
  "fields": [
   {
@@ -122,6 +126,27 @@
    "fieldtype": "Data",
    "label": "Last Health Check Status",
    "read_only": 1
+  },
+  {
+   "fieldname": "section_break_discovery",
+   "fieldtype": "Section Break",
+   "label": "Order Discovery Watermark"
+  },
+  {
+   "description": "Timestamp (authoritative database/remote time) of the latest successfully discovered and processed order date_upd",
+   "fieldname": "last_order_watermark",
+   "fieldtype": "Datetime",
+   "label": "Last Order Watermark"
+  },
+  {
+   "fieldname": "column_break_discovery",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "External order ID tie-breaker for the latest order watermark",
+   "fieldname": "last_order_id",
+   "fieldtype": "Data",
+   "label": "Last Order ID"
   }
  ],
  "index_web_pages_for_search": 1,

@@ -33,6 +33,7 @@ VALID_TRANSITIONS = {
 		IntegrationStatus.FAILED,
 		IntegrationStatus.RETRY_PENDING,
 		IntegrationStatus.DEAD_LETTER,
+		IntegrationStatus.CANCELLED,
 	},
 	IntegrationStatus.FAILED: {
 		IntegrationStatus.RETRY_PENDING,
@@ -223,12 +224,16 @@ class IntegrationEvent(Document):
 		self.next_retry_at = None
 		self.save()
 
-	def cancel(self, reason=None):
+	def cancel(self, reason=None, processing_token=None):
+		old_status = frappe.db.get_value("Integration Event", self.name, "status")
+		if old_status == IntegrationStatus.PROCESSING or processing_token:
+			self._verify_processing_lease(processing_token)
 		self.status = IntegrationStatus.CANCELLED
 		self.worker_id = None
 		self.processing_token = None
 		self.lease_expires_at = None
 		self.next_retry_at = None
+		self.processing_finished_at = now_datetime()
 		# Idempotency key remains reserved
 		if reason:
 			self.last_error_message = _("Cancelled: {0}").format(reason)

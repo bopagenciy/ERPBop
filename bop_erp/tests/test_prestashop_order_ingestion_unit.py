@@ -51,6 +51,11 @@ from bop_erp.orders.ingestion import (
 	find_affected_channels_for_items,
 	ingest_order_pipeline,
 	process_order_ingestion_event,
+	is_order_ingestion_complete,
+)
+from bop_erp.reliability import (
+	claim_event_for_processing,
+	verify_processing_authority,
 )
 from bop_erp.orders.discovery import (
 	discover_eligible_connectors,
@@ -505,3 +510,213 @@ class TestPrestaShopOrderIngestionUnit(FrappeTestCase):
 		atp = get_channel_atp("ITEM-TEST", "TEST-A")
 		# Immediate ATP must be 0.0, not 100.0
 		self.assertEqual(atp.aggregate_atp_qty, 0.0)
+
+	# ==================================================
+	# 19. INBOUND EVENT PENDING ONLY (NO DIRECT PROCESSING)
+	# ==================================================
+	@patch("bop_erp.orders.discovery.frappe.db.commit")
+	@patch("bop_erp.orders.discovery.frappe.get_doc")
+	@patch("bop_erp.orders.discovery.get_existing_idempotent_event")
+	@patch("bop_erp.orders.discovery.find_existing_order_mapping")
+	def test_19_inbound_event_pending_only_no_direct_processing(self, mock_mapping, mock_existing_event, mock_get_doc, mock_commit):
+		mock_mapping.return_value = None
+		mock_existing_event.return_value = None
+
+		created_events = []
+		def _mock_doc(d):
+			doc = MagicMock()
+			doc.doctype = d.get("doctype")
+			doc.status = d.get("status")
+			doc.insert = MagicMock()
+			created_events.append(d)
+			return doc
+
+		mock_get_doc.side_effect = _mock_doc
+
+		mock_client = MagicMock()
+		mock_client._request.return_value = {
+			"orders": [
+				{"id": "501", "current_state": "2", "date_upd": "2026-09-08 10:00:00"}
+			]
+		}
+
+		connector = {
+			"name": "PS-TEST-CONNECTOR",
+			"sales_channel": "TEST-A",
+			"environment": "DEVELOPMENT",
+			"base_url": "http://prestashop-test",
+			"eligible_order_states": "2,3,11",
+		}
+
+		res = discover_channel_orders(connector, client=mock_client)
+		self.assertEqual(res["events_created"], 1)
+		self.assertEqual(len(created_events), 1)
+		# Crucial: Event MUST be created as PENDING, never directly PROCESSING
+		self.assertEqual(created_events[0]["status"], IntegrationStatus.PENDING)
+
+	# ==================================================
+	# 20. WORKER CLAIM FENCING & AUTHORITY LOSS
+	# ==================================================
+	@patch("bop_erp.orders.ingestion.verify_processing_authority")
+	@patch("bop_erp.orders.ingestion.claim_event_for_processing")
+	def test_20_worker_claim_fencing_and_authority_loss(self, mock_claim, mock_verify):
+		# Case 1: Claim fails (already claimed by another worker)
+		mock_claim.return_value = (False, None, None)
+		res1 = process_order_ingestion_event("EVT-TEST-1", worker_id="worker-b")
+		self.assertFalse(res1["success"])
+		self.assertEqual(res1["reason"], "CLAIM_REJECTED_ALREADY_CLAIMED_OR_TERMINAL")
+
+		# Case 2: Claim succeeds, but authority check fails (lease expired or worker fenced)
+		mock_claim.return_value = (True, "worker-a", "token-xyz")
+		mock_verify.return_value = (False, "Lease expired")
+		res2 = process_order_ingestion_event("EVT-TEST-2", worker_id="worker-a")
+		self.assertFalse(res2["success"])
+		self.assertEqual(res2["reason"], "LOST_PROCESSING_AUTHORITY")
+
+	# ==================================================
+	# 21. DISCOVERY DURABLE WATERMARK AND OVERLAP
+	# ==================================================
+	@patch("bop_erp.orders.discovery.frappe.db.commit")
+	@patch("bop_erp.orders.discovery.frappe.db.set_value")
+	@patch("bop_erp.orders.discovery.frappe.get_doc")
+	@patch("bop_erp.orders.discovery.get_existing_idempotent_event")
+	@patch("bop_erp.orders.discovery.find_existing_order_mapping")
+	def test_21_discovery_durable_watermark_and_overlap(self, mock_map, mock_exist, mock_get_doc, mock_set_val, mock_commit):
+		mock_map.return_value = None
+		mock_exist.return_value = None
+		mock_get_doc.return_value = MagicMock()
+
+		mock_client = MagicMock()
+		mock_client._request.return_value = {
+			"orders": [
+				{"id": "505", "current_state": "2", "date_upd": "2026-09-08 12:45:00"},
+				{"id": "506", "current_state": "2", "date_upd": "2026-09-08 13:00:00"},
+			]
+		}
+
+		connector = {
+			"name": "PS-TEST-CONNECTOR",
+			"sales_channel": "TEST-A",
+			"environment": "DEVELOPMENT",
+			"base_url": "http://prestashop-test",
+			"eligible_order_states": "2,3,11",
+			"last_order_watermark": "2026-09-08 12:00:00",
+			"last_order_id": "500",
+		}
+
+		res = discover_channel_orders(connector, client=mock_client)
+		self.assertEqual(res["orders_seen"], 2)
+
+		# Verify request used overlap window (last_watermark - 30 minutes = 11:30:00)
+		call_params = mock_client._request.call_args[1]["params"]
+		self.assertIn("11:30:00", call_params["filter[date_upd]"])
+
+		# Verify connector watermark persisted with max observed date_upd
+		mock_set_val.assert_called_once_with(
+			"PrestaShop Connector",
+			"PS-TEST-CONNECTOR",
+			{
+				"last_order_watermark": "2026-09-08 13:00:00",
+				"last_order_id": "506",
+			},
+			update_modified=False,
+		)
+
+	# ==================================================
+	# 22. DISCOVERY DETERMINISTIC PAGINATION SAFETY & TIE BREAKING
+	# ==================================================
+	def test_22_discovery_pagination_safety_and_tie_breaking(self):
+		mock_client = MagicMock()
+		# Page 1 returns 2 orders, Page 2 returns 1 order
+		mock_client._request.side_effect = [
+			{
+				"orders": [
+					{"id": "10", "current_state": "2", "date_upd": "2026-09-08 12:00:00"},
+					{"id": "11", "current_state": "2", "date_upd": "2026-09-08 12:00:00"},
+				]
+			},
+			{
+				"orders": [
+					{"id": "12", "current_state": "2", "date_upd": "2026-09-08 12:05:00"},
+				]
+			},
+		]
+
+		connector = {
+			"name": "PS-TEST-CONNECTOR",
+			"sales_channel": "TEST-A",
+			"environment": "DEVELOPMENT",
+			"base_url": "http://prestashop-test",
+			"eligible_order_states": "2,3,11",
+		}
+
+		with patch("bop_erp.orders.discovery.frappe.get_doc") as mock_get_doc, \
+		     patch("bop_erp.orders.discovery.find_existing_order_mapping", return_value=None), \
+		     patch("bop_erp.orders.discovery.get_existing_idempotent_event", return_value=None), \
+		     patch("bop_erp.orders.discovery.frappe.db.set_value") as mock_set_val, \
+		     patch("bop_erp.orders.discovery.frappe.db.commit"):
+			mock_get_doc.return_value = MagicMock()
+			res = discover_channel_orders(connector, client=mock_client, page_size=2, max_orders=10)
+
+		self.assertEqual(res["orders_seen"], 3)
+		# Verify sort parameter enforces deterministic tie-breaking [date_upd_ASC,id_ASC]
+		call_1_params = mock_client._request.call_args_list[0][1]["params"]
+		self.assertEqual(call_1_params["sort"], "[date_upd_ASC,id_ASC]")
+		self.assertEqual(call_1_params["limit"], "0,2")
+
+		call_2_params = mock_client._request.call_args_list[1][1]["params"]
+		self.assertEqual(call_2_params["limit"], "2,2")
+
+	# ==================================================
+	# 23. EMPTY ELIGIBLE STATES FAILS SAFELY
+	# ==================================================
+	def test_23_empty_eligible_states_fails_safely(self):
+		connector = {
+			"name": "PS-UNCONFIGURED",
+			"sales_channel": "TEST-EMPTY",
+			"environment": "DEVELOPMENT",
+			"base_url": "http://prestashop-test",
+			"eligible_order_states": "",  # Empty
+		}
+
+		mock_client = MagicMock()
+		res = discover_channel_orders(connector, client=mock_client)
+		# Must safely skip without calling PrestaShop API or guessing fallback states
+		self.assertEqual(res["events_created"], 0)
+		self.assertEqual(res["orders_seen"], 0)
+		mock_client._request.assert_not_called()
+
+	# ==================================================
+	# 24. INCOMPLETE ORDER IDENTIFICATION
+	# ==================================================
+	@patch("bop_erp.orders.ingestion.frappe.get_all")
+	@patch("bop_erp.orders.ingestion.frappe.get_doc")
+	@patch("bop_erp.orders.ingestion.frappe.db.exists")
+	def test_24_incomplete_order_identification(self, mock_exists, mock_get_doc, mock_get_all):
+		mock_exists.return_value = True
+
+		# Mock a Sales Order with 2 line items (qty=2 each)
+		mock_so = MagicMock()
+		mock_so.docstatus = 1
+		mock_item1 = MagicMock(name="item1", item_code="ITEM-1", qty=2.0)
+		mock_item1.name = "row-1"
+		mock_item2 = MagicMock(name="item2", item_code="ITEM-2", qty=2.0)
+		mock_item2.name = "row-2"
+		mock_so.items = [mock_item1, mock_item2]
+		mock_get_doc.return_value = mock_so
+
+		# Row 1 has full reservation (2.0), row 2 has partial reservation (1.0)
+		def _mock_sres(doctype, filters=None, fields=None):
+			if filters.get("voucher_detail_no") == "row-1":
+				return [{"name": "SRE-1", "reserved_qty": 2.0}]
+			if filters.get("voucher_detail_no") == "row-2":
+				return [{"name": "SRE-2", "reserved_qty": 1.0}]
+			return []
+
+		mock_get_all.side_effect = _mock_sres
+
+		is_complete, missing = is_order_ingestion_complete("SO-TEST-INCOMPLETE")
+		self.assertFalse(is_complete)
+		self.assertEqual(len(missing), 1)
+		self.assertIn("ITEM-2", missing[0])
+

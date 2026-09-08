@@ -41,6 +41,8 @@ from bop_erp.orders.ingestion import (
 	ingest_order_pipeline,
 	process_order_ingestion_event,
 	find_affected_channels_for_items,
+	is_order_ingestion_complete,
+	claim_event_for_processing,
 )
 from bop_erp.orders.discovery import (
 	discover_channel_orders,
@@ -247,66 +249,17 @@ class TestPrestaShopOrderIngestionLive(FrappeTestCase):
 			frappe.db.sql("DELETE FROM `tabSales Channel` WHERE name = %s", (ch,))
 
 		# Clean test Customers & Addresses
-		custs = frappe.get_all(
-			"Customer",
-			filters={
-				"name": [
-					"like",
-					"%Test Customer%",
-				]
-			},
-			pluck="name",
-		) + frappe.get_all(
-			"Customer",
-			filters={
-				"name": [
-					"like",
-					"%Crash Test%",
-				]
-			},
-			pluck="name",
-		) + frappe.get_all(
-			"Customer",
-			filters={
-				"name": [
-					"like",
-					"%FiveHundred%",
-				]
-			},
-			pluck="name",
-		)
-		for c in set(custs):
+		cleanup_patterns = ["%Test Customer%", "%Crash%", "%FiveHundred%", "%Recovery%", "%Depth%", "%Brenda%", "%Alex%", "%Race%"]
+		all_custs = []
+		all_addrs = []
+		for pat in cleanup_patterns:
+			all_custs.extend(frappe.get_all("Customer", filters={"name": ["like", pat]}, pluck="name"))
+			all_addrs.extend(frappe.get_all("Address", filters={"address_title": ["like", pat]}, pluck="name"))
+
+		for c in set(all_custs):
 			frappe.delete_doc("Customer", c, force=True, ignore_permissions=True)
 
-		addrs = frappe.get_all(
-			"Address",
-			filters={
-				"address_title": [
-					"like",
-					"%Test Customer%",
-				]
-			},
-			pluck="name",
-		) + frappe.get_all(
-			"Address",
-			filters={
-				"address_title": [
-					"like",
-					"%Crash Test%",
-				]
-			},
-			pluck="name",
-		) + frappe.get_all(
-			"Address",
-			filters={
-				"address_title": [
-					"like",
-					"%FiveHundred%",
-				]
-			},
-			pluck="name",
-		)
-		for a in set(addrs):
+		for a in set(all_addrs):
 			frappe.delete_doc("Address", a, force=True, ignore_permissions=True)
 
 		frappe.db.commit()
@@ -1456,3 +1409,485 @@ class TestPrestaShopOrderIngestionLive(FrappeTestCase):
 			ingest_order_pipeline(ext_order)
 
 		self.assertIsNone(find_existing_order_mapping(self.channel_a, IntegrationProvider.PRESTASHOP, "919"))
+
+	# ==================================================
+	# 20. LIVE END-TO-END DISCOVERY TO EVENT SUCCESS
+	# ==================================================
+	def test_20_live_end_to_end_discovery_to_event_success(self):
+		"""
+		End-to-end live test against local PrestaShop test instance:
+		1. Discover orders via discover_channel_orders with client=self.client.
+		2. Order 8 (state 2, product 21) is discovered and written as a PENDING Integration Event.
+		3. Event is claimed atomically and processed via process_order_ingestion_event.
+		4. Worker performs fresh GET from PrestaShop test instance, validates eligibility,
+		   creates native Sales Order & Stock Reservation Entry, commits, and marks SUCCEEDED.
+		5. Verifies 0 Sales Invoices, 0 Payment Entries, exactly 1 SO and SRE.
+		"""
+		conn_doc = frappe.get_doc("PrestaShop Connector", {"sales_channel": self.channel_a})
+		conn_doc.last_order_watermark = "2026-09-01 00:00:00"
+		conn_doc.last_order_id = None
+		conn_doc.save(ignore_permissions=True)
+		frappe.db.commit()
+
+		# Run live discovery
+		disc_res = discover_channel_orders(conn_doc.as_dict(), max_orders=20, client=self.client)
+		self.assertGreater(disc_res["events_created"], 0)
+
+		event_name = frappe.db.get_value(
+			"Integration Event",
+			{
+				"sales_channel": self.channel_a,
+				"external_id": "8",
+				"provider": IntegrationProvider.PRESTASHOP,
+				"direction": IntegrationDirection.INBOUND,
+				"operation": IntegrationOperation.INGEST_ORDER,
+			},
+			"name",
+		)
+		self.assertIsNotNone(event_name, "Order 8 should have been discovered and queued as an Integration Event")
+
+		event = frappe.get_doc("Integration Event", event_name)
+		self.assertEqual(event.status, IntegrationStatus.PENDING)
+
+		atp_before = get_channel_atp(self.item_short, self.channel_a).aggregate_atp_qty
+
+		# Worker claim and execution
+		res = process_order_ingestion_event(event_name, worker_id="worker-live-20", client=self.client)
+		self.assertTrue(res["success"], f"Processing failed: {res}")
+		so_name = res["sales_order"]
+
+		event.reload()
+		self.assertEqual(event.status, IntegrationStatus.SUCCEEDED)
+		self.assertEqual(event.erp_document, so_name)
+		self.assertIsNotNone(event.processing_finished_at)
+
+		so = frappe.get_doc("Sales Order", so_name)
+		self.assertEqual(so.docstatus, 1)
+		self.assertEqual(len(so.items), 1)
+		self.assertEqual(so.items[0].item_code, self.item_short)
+		self.assertEqual(so.items[0].qty, 1.0)
+
+		# SRE verification
+		sre = frappe.db.get_value(
+			"Stock Reservation Entry",
+			{"voucher_type": "Sales Order", "voucher_no": so_name, "docstatus": 1},
+			["name", "reserved_qty"],
+			as_dict=True,
+		)
+		self.assertIsNotNone(sre)
+		self.assertEqual(flt(sre.reserved_qty), 1.0)
+
+		# ATP check
+		atp_after = get_channel_atp(self.item_short, self.channel_a).aggregate_atp_qty
+		self.assertEqual(atp_after, atp_before - 1.0)
+
+		# Zero invoice / payment entries
+		self.assertEqual(frappe.db.count("Sales Invoice", {"sales_channel": self.channel_a}), 0)
+		self.assertEqual(frappe.db.count("Payment Entry", {"reference_no": so_name}), 0)
+
+	# ==================================================
+	# 21. LIVE STATE CHANGE BEFORE WORKER EXECUTION
+	# ==================================================
+	def test_21_live_state_change_before_worker_execution(self):
+		"""
+		Discovered order was queued as PENDING, but remote PrestaShop state changed to
+		Canceled (state 6) before worker execution.
+		Worker re-reads fresh order state from PrestaShop at execution time, detects
+		state '6' is not in eligible_order_states ('2,3,11'), and safely transitions
+		the Integration Event to CANCELLED without creating Sales Orders or reservations.
+		"""
+		# Order 11 in PrestaShop test DB is in state 6 (Canceled)
+		idem_key = compute_order_idempotency_key(IntegrationProvider.PRESTASHOP, self.channel_a, "11")
+		event = frappe.get_doc({
+			"doctype": "Integration Event",
+			"direction": IntegrationDirection.INBOUND,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"sales_channel": self.channel_a,
+			"entity_type": ExternalEntityType.ORDER,
+			"operation": IntegrationOperation.INGEST_ORDER,
+			"external_id": "11",
+			"idempotency_key": idem_key,
+			"status": IntegrationStatus.PENDING,
+			"request_metadata": json.dumps({
+				"sales_channel": self.channel_a,
+				"provider": IntegrationProvider.PRESTASHOP,
+				"external_order_id": "11",
+			}),
+		})
+		event.insert(ignore_permissions=True)
+		frappe.db.commit()
+
+		so_count_before = frappe.db.count("Sales Order", {"sales_channel": self.channel_a})
+		sre_count_before = frappe.db.count("Stock Reservation Entry", {"docstatus": 1})
+
+		res = process_order_ingestion_event(event.name, worker_id="worker-live-21", client=self.client)
+		self.assertFalse(res["success"])
+		self.assertEqual(res.get("category"), "NOT_ELIGIBLE")
+
+		event.reload()
+		self.assertEqual(event.status, IntegrationStatus.CANCELLED)
+		self.assertIn("not in eligible states", event.last_error_message or "")
+		self.assertIsNotNone(event.processing_finished_at)
+
+		# Verify ZERO Sales Orders and ZERO Stock Reservation Entries created
+		self.assertEqual(frappe.db.count("Sales Order", {"sales_channel": self.channel_a}), so_count_before)
+		self.assertEqual(frappe.db.count("Stock Reservation Entry", {"docstatus": 1}), sre_count_before)
+
+	# ==================================================
+	# 22. LIVE CRASH AFTER SO SUBMIT RECOVERY
+	# ==================================================
+	def test_22_live_crash_after_so_submit_recovery(self):
+		"""
+		Simulate mid-transaction crash where Sales Order was created and submitted,
+		but a Stock Reservation Entry was not created (or cancelled/lost).
+		Worker retry detects incomplete ingestion via is_order_ingestion_complete,
+		idempotently completes missing line reservations via _ensure_order_reservations,
+		and transitions the event to SUCCEEDED.
+		"""
+		ext_order = ExternalOrder(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.channel_a,
+			external_order_id="922",
+			external_reference="SYNTH-922",
+			order_state_id="2",
+			date_add="2026-09-07 12:00:00",
+			customer=ExternalCustomer(external_customer_id="922", first_name="Crash", last_name="Recovery22"),
+			lines=[
+				ExternalOrderLine(external_line_id="1", external_product_id="6", quantity=2.0, unit_price_ex_tax=20.0),
+			],
+			totals=ExternalTotals(total_products_ex_tax=40.0, total_paid=40.0),
+		)
+
+		# Initial ingestion succeeds completely
+		res1 = ingest_order_pipeline(ext_order)
+		self.assertTrue(res1["success"])
+		so_name = res1["sales_order"]
+
+		# Cancel and delete SRE to simulate mid-transaction crash right after SO submission
+		sre_name = frappe.db.get_value(
+			"Stock Reservation Entry",
+			{"voucher_type": "Sales Order", "voucher_no": so_name, "docstatus": 1},
+			"name",
+		)
+		self.assertIsNotNone(sre_name)
+		sre_doc = frappe.get_doc("Stock Reservation Entry", sre_name)
+		sre_doc.cancel()
+		frappe.delete_doc("Stock Reservation Entry", sre_name, force=True, ignore_permissions=True)
+		frappe.db.commit()
+
+		# Verify incomplete order state detected
+		complete, issues = is_order_ingestion_complete(so_name)
+		self.assertFalse(complete)
+		self.assertTrue(len(issues) > 0)
+
+		# Create Integration Event simulating worker recovery attempt
+		idem_key = compute_order_idempotency_key(IntegrationProvider.PRESTASHOP, self.channel_a, "922")
+		event = frappe.get_doc({
+			"doctype": "Integration Event",
+			"direction": IntegrationDirection.INBOUND,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"sales_channel": self.channel_a,
+			"entity_type": ExternalEntityType.ORDER,
+			"operation": IntegrationOperation.INGEST_ORDER,
+			"external_id": "922",
+			"idempotency_key": idem_key,
+			"status": IntegrationStatus.PENDING,
+			"request_metadata": json.dumps({
+				"sales_channel": self.channel_a,
+				"provider": IntegrationProvider.PRESTASHOP,
+				"external_order_id": "922",
+				"normalized_order": {
+					"provider": IntegrationProvider.PRESTASHOP,
+					"sales_channel": self.channel_a,
+					"external_order_id": "922",
+					"external_reference": "SYNTH-922",
+					"order_state_id": "2",
+					"customer": {"external_customer_id": "922"},
+					"lines": [{"external_line_id": "1", "external_product_id": "6", "quantity": 2.0, "unit_price_ex_tax": 20.0}],
+					"totals": {"total_products_ex_tax": 40.0, "total_paid": 40.0},
+				}
+			}),
+		})
+		event.insert(ignore_permissions=True)
+		frappe.db.commit()
+
+		# Recovery worker execution
+		rec_res = process_order_ingestion_event(event.name, worker_id="worker-live-22")
+		self.assertTrue(rec_res["success"])
+		self.assertTrue(rec_res.get("is_replay"))
+		self.assertEqual(rec_res["sales_order"], so_name)
+
+		# Verify reservation entry was reconstituted
+		complete_after, issues_after = is_order_ingestion_complete(so_name)
+		self.assertTrue(complete_after, f"Order still incomplete: {issues_after}")
+
+		new_sre = frappe.db.get_value(
+			"Stock Reservation Entry",
+			{"voucher_type": "Sales Order", "voucher_no": so_name, "docstatus": 1},
+			["name", "reserved_qty"],
+			as_dict=True,
+		)
+		self.assertIsNotNone(new_sre)
+		self.assertEqual(flt(new_sre.reserved_qty), 2.0)
+
+		event.reload()
+		self.assertEqual(event.status, IntegrationStatus.SUCCEEDED)
+
+	# ==================================================
+	# 23. LIVE CRASH AFTER RESERVATION BEFORE SUCCESS
+	# ==================================================
+	def test_23_live_crash_after_reservation_before_success(self):
+		"""
+		Simulate crash after SO and SRE have both been committed, but the Integration Event
+		remains in PROCESSING (e.g. worker died right before calling mark_succeeded).
+		Upon worker retry (e.g. after lease expiration or retry trigger), worker:
+		1. Reclaims or detects active mapping with complete SO + SRE.
+		2. Detects is_order_ingestion_complete is True.
+		3. Creates ZERO duplicate Sales Orders and ZERO duplicate reservations.
+		4. Gracefully converges the event to SUCCEEDED with is_replay=True.
+		"""
+		ext_order = ExternalOrder(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.channel_a,
+			external_order_id="923",
+			external_reference="SYNTH-923",
+			order_state_id="2",
+			date_add="2026-09-07 12:00:00",
+			customer=ExternalCustomer(external_customer_id="923", first_name="Crash", last_name="Replay23"),
+			lines=[
+				ExternalOrderLine(external_line_id="1", external_product_id="6", quantity=1.0, unit_price_ex_tax=20.0),
+			],
+			totals=ExternalTotals(total_products_ex_tax=20.0, total_paid=20.0),
+		)
+
+		res = ingest_order_pipeline(ext_order)
+		self.assertTrue(res["success"])
+		so_name = res["sales_order"]
+
+		sre_count_before = frappe.db.count("Stock Reservation Entry", {"voucher_no": so_name, "docstatus": 1})
+		self.assertEqual(sre_count_before, 1)
+
+		# Create event in PENDING simulating replay of the event
+		idem_key = compute_order_idempotency_key(IntegrationProvider.PRESTASHOP, self.channel_a, "923")
+		event = frappe.get_doc({
+			"doctype": "Integration Event",
+			"direction": IntegrationDirection.INBOUND,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"sales_channel": self.channel_a,
+			"entity_type": ExternalEntityType.ORDER,
+			"operation": IntegrationOperation.INGEST_ORDER,
+			"external_id": "923",
+			"idempotency_key": idem_key,
+			"status": IntegrationStatus.PENDING,
+			"request_metadata": json.dumps({
+				"sales_channel": self.channel_a,
+				"provider": IntegrationProvider.PRESTASHOP,
+				"external_order_id": "923",
+				"normalized_order": {
+					"provider": IntegrationProvider.PRESTASHOP,
+					"sales_channel": self.channel_a,
+					"external_order_id": "923",
+					"external_reference": "SYNTH-923",
+					"order_state_id": "2",
+					"customer": {"external_customer_id": "923"},
+					"lines": [{"external_line_id": "1", "external_product_id": "6", "quantity": 1.0, "unit_price_ex_tax": 20.0}],
+					"totals": {"total_products_ex_tax": 20.0, "total_paid": 20.0},
+				}
+			}),
+		})
+		event.insert(ignore_permissions=True)
+		frappe.db.commit()
+
+		# Re-run worker on the event
+		replay_res = process_order_ingestion_event(event.name, worker_id="worker-live-23")
+		self.assertTrue(replay_res["success"])
+		self.assertTrue(replay_res.get("is_replay"))
+		self.assertEqual(replay_res["sales_order"], so_name)
+
+		# Assert zero duplicate reservations created
+		sre_count_after = frappe.db.count("Stock Reservation Entry", {"voucher_no": so_name, "docstatus": 1})
+		self.assertEqual(sre_count_after, 1)
+
+		# Total reserved quantity remains 1.0
+		total_reserved = frappe.db.sql(
+			"""
+			SELECT SUM(reserved_qty) FROM `tabStock Reservation Entry`
+			WHERE voucher_type = 'Sales Order' AND voucher_no = %s AND docstatus = 1
+			""",
+			(so_name,),
+		)[0][0]
+		self.assertEqual(flt(total_reserved), 1.0)
+
+		event.reload()
+		self.assertEqual(event.status, IntegrationStatus.SUCCEEDED)
+		self.assertEqual(event.erp_document, so_name)
+
+	# ==================================================
+	# 24. LIVE TWO WORKER CLAIM RACE
+	# ==================================================
+	def test_24_live_two_worker_claim_race(self):
+		"""
+		Two concurrent worker threads attempt to claim and process the same PENDING Integration Event.
+		Database-level row fencing ensures exactly ONE worker succeeds in claiming and processing.
+		The second worker receives claim failure/authority loss and does not execute duplicate creation.
+		System state contains exactly ONE Sales Order and ONE reservation.
+		"""
+		idem_key = compute_order_idempotency_key(IntegrationProvider.PRESTASHOP, self.channel_a, "924")
+		event = frappe.get_doc({
+			"doctype": "Integration Event",
+			"direction": IntegrationDirection.INBOUND,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"sales_channel": self.channel_a,
+			"entity_type": ExternalEntityType.ORDER,
+			"operation": IntegrationOperation.INGEST_ORDER,
+			"external_id": "924",
+			"idempotency_key": idem_key,
+			"status": IntegrationStatus.PENDING,
+			"request_metadata": json.dumps({
+				"sales_channel": self.channel_a,
+				"provider": IntegrationProvider.PRESTASHOP,
+				"external_order_id": "924",
+				"normalized_order": {
+					"provider": IntegrationProvider.PRESTASHOP,
+					"sales_channel": self.channel_a,
+					"external_order_id": "924",
+					"external_reference": "SYNTH-924",
+					"order_state_id": "2",
+					"customer": {"external_customer_id": "924", "first_name": "Race", "last_name": "Worker"},
+					"lines": [{"external_line_id": "1", "external_product_id": "6", "quantity": 1.0, "unit_price_ex_tax": 20.0}],
+					"totals": {"total_products_ex_tax": 20.0, "total_paid": 20.0},
+				}
+			}),
+		})
+		event.insert(ignore_permissions=True)
+		frappe.db.commit()
+
+		def _competing_worker(worker_id):
+			frappe.init("frontend")
+			frappe.connect()
+			try:
+				res = process_order_ingestion_event(event.name, worker_id=worker_id)
+				frappe.db.commit()
+				return res
+			finally:
+				frappe.db.close()
+
+		with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+			f1 = executor.submit(_competing_worker, "worker-race-1")
+			f2 = executor.submit(_competing_worker, "worker-race-2")
+			res1 = f1.result(timeout=30)
+			res2 = f2.result(timeout=30)
+
+		# Exactly one worker succeeded; other was locked out
+		successes = [r for r in [res1, res2] if r.get("success")]
+		failures = [r for r in [res1, res2] if not r.get("success")]
+
+		self.assertEqual(len(successes), 1, f"Expected exactly 1 success, got {res1} and {res2}")
+		self.assertEqual(len(failures), 1, f"Expected exactly 1 failure, got {res1} and {res2}")
+		self.assertTrue(
+			failures[0].get("category") in ["LOCKED", "CONCURRENCY"]
+			or failures[0].get("reason") in ["CLAIM_REJECTED_ALREADY_CLAIMED_OR_TERMINAL", "LOST_PROCESSING_AUTHORITY"],
+			f"Unexpected failure response: {failures[0]}",
+		)
+
+		# Exactly 1 Sales Order in system for external order 924
+		so_name = successes[0]["sales_order"]
+		self.assertEqual(frappe.db.count("Sales Order", {"name": so_name}), 1)
+		sre_count = frappe.db.count("Stock Reservation Entry", {"voucher_no": so_name, "docstatus": 1})
+		self.assertEqual(sre_count, 1)
+
+	# ==================================================
+	# 25. LIVE DUPLICATE EVENT DEFENSE IN DEPTH
+	# ==================================================
+	def test_25_live_duplicate_event_defense_in_depth(self):
+		"""
+		Defense-in-depth against duplicate Integration Events:
+		Suppose two separate Integration Events (e.g. from overlapping discovery windows or
+		manual re-queuing with distinct event names) reference the SAME external order ID.
+		Worker 1 executes Event 1 -> creates SO and SRE, marks Event 1 SUCCEEDED.
+		Worker 2 executes Event 2 -> detects existing mapping via find_existing_order_mapping,
+		links Event 2's erp_document to the existing Sales Order, performs 0 duplicate reservations,
+		and marks Event 2 SUCCEEDED with is_replay=True.
+		"""
+		norm_payload = {
+			"sales_channel": self.channel_a,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"external_order_id": "925",
+			"normalized_order": {
+				"provider": IntegrationProvider.PRESTASHOP,
+				"sales_channel": self.channel_a,
+				"external_order_id": "925",
+				"external_reference": "SYNTH-925",
+				"order_state_id": "2",
+				"customer": {"external_customer_id": "925", "first_name": "Defense", "last_name": "Depth"},
+				"lines": [{"external_line_id": "1", "external_product_id": "6", "quantity": 1.0, "unit_price_ex_tax": 20.0}],
+				"totals": {"total_products_ex_tax": 20.0, "total_paid": 20.0},
+			}
+		}
+
+		# Event 1
+		event1 = frappe.get_doc({
+			"doctype": "Integration Event",
+			"direction": IntegrationDirection.INBOUND,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"sales_channel": self.channel_a,
+			"entity_type": ExternalEntityType.ORDER,
+			"operation": IntegrationOperation.INGEST_ORDER,
+			"external_id": "925",
+			"idempotency_key": "EVENT-DEFENSE-DEPTH-1",
+			"status": IntegrationStatus.PENDING,
+			"request_metadata": json.dumps(norm_payload),
+		})
+		event1.insert(ignore_permissions=True)
+
+		# Event 2 (different event name and idempotency key, but same external_order_id)
+		event2 = frappe.get_doc({
+			"doctype": "Integration Event",
+			"direction": IntegrationDirection.INBOUND,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"sales_channel": self.channel_a,
+			"entity_type": ExternalEntityType.ORDER,
+			"operation": IntegrationOperation.INGEST_ORDER,
+			"external_id": "925",
+			"idempotency_key": "EVENT-DEFENSE-DEPTH-2",
+			"status": IntegrationStatus.PENDING,
+			"request_metadata": json.dumps(norm_payload),
+		})
+		event2.insert(ignore_permissions=True)
+		frappe.db.commit()
+
+		# Process Event 1
+		res1 = process_order_ingestion_event(event1.name, worker_id="worker-depth-1")
+		self.assertTrue(res1["success"])
+		self.assertFalse(res1.get("is_replay", False))
+		so_name = res1["sales_order"]
+
+		event1.reload()
+		self.assertEqual(event1.status, IntegrationStatus.SUCCEEDED)
+		self.assertEqual(event1.erp_document, so_name)
+
+		# Process Event 2
+		res2 = process_order_ingestion_event(event2.name, worker_id="worker-depth-2")
+		self.assertTrue(res2["success"])
+		self.assertTrue(res2.get("is_replay"))
+		self.assertEqual(res2["sales_order"], so_name)
+
+		event2.reload()
+		self.assertEqual(event2.status, IntegrationStatus.SUCCEEDED)
+		self.assertEqual(event2.erp_document, so_name)
+
+		# Exactly 1 Sales Order exists for 925
+		self.assertEqual(frappe.db.count("Sales Order", {"name": so_name}), 1)
+		# Exactly 1 SRE with reserved_qty = 1.0 (zero over-reservation)
+		sre_count = frappe.db.count("Stock Reservation Entry", {"voucher_no": so_name, "docstatus": 1})
+		self.assertEqual(sre_count, 1)
+
+		total_reserved = frappe.db.sql(
+			"""
+			SELECT SUM(reserved_qty) FROM `tabStock Reservation Entry`
+			WHERE voucher_type = 'Sales Order' AND voucher_no = %s AND docstatus = 1
+			""",
+			(so_name,),
+		)[0][0]
+		self.assertEqual(flt(total_reserved), 1.0)
+

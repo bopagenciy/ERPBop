@@ -17,6 +17,8 @@ from bop_erp.constants import (
 from bop_erp.safety import assert_safe_connector_target
 from bop_erp.integrations.prestashop.client import PrestaShopClient
 from bop_erp.integrations.prestashop.config import PrestaShopConfig
+from bop_erp.integrations.prestashop.exceptions import PrestaShopValidationError
+from bop_erp.reliability import get_existing_idempotent_event
 from bop_erp.orders.ingestion import (
 	compute_order_idempotency_key,
 	find_existing_order_mapping,
@@ -27,6 +29,8 @@ DEFAULT_MAX_CHANNELS = 10
 DEFAULT_MAX_ORDERS_PER_CHANNEL = 20
 DEFAULT_GLOBAL_MAX_ORDERS = 50
 DEFAULT_LOOKBACK_HOURS = 48
+DEFAULT_OVERLAP_MINUTES = 30
+DEFAULT_PAGE_SIZE = 20
 
 
 def discover_eligible_connectors(provider: str = IntegrationProvider.PRESTASHOP) -> List[Dict[str, Any]]:
@@ -38,7 +42,16 @@ def discover_eligible_connectors(provider: str = IntegrationProvider.PRESTASHOP)
 		connectors = frappe.get_all(
 			"PrestaShop Connector",
 			filters={"enabled": 1, "read_enabled": 1},
-			fields=["name", "sales_channel", "environment", "base_url", "credential_reference", "eligible_order_states"],
+			fields=[
+				"name",
+				"sales_channel",
+				"environment",
+				"base_url",
+				"credential_reference",
+				"eligible_order_states",
+				"last_order_watermark",
+				"last_order_id",
+			],
 			order_by="sales_channel asc",
 		)
 		safe_connectors = []
@@ -80,102 +93,197 @@ def discover_channel_orders(
 	connector: Dict[str, Any],
 	max_orders: int = DEFAULT_MAX_ORDERS_PER_CHANNEL,
 	lookback_hours: int = DEFAULT_LOOKBACK_HOURS,
+	overlap_minutes: int = DEFAULT_OVERLAP_MINUTES,
+	page_size: int = DEFAULT_PAGE_SIZE,
 	client: Optional[PrestaShopClient] = None,
 ) -> Dict[str, Any]:
 	"""
 	Discovers eligible orders for a single connector/sales channel.
-	Creates inbound Integration Events for new, unmapped eligible orders.
+	Enforces:
+	1. Pre-network host safety verification.
+	2. Connector-specific eligible order states (safe skip if empty).
+	3. Durable watermark tracking with bounded overlap re-read window.
+	4. Deterministic pagination and tie-breaker sorting.
+	5. Canonical inbound Integration Event idempotency (PENDING only).
+	6. Durable watermark persistence surviving worker/scheduler restarts.
 	"""
+	# Re-verify host safety pre-network
+	assert_safe_connector_target(connector["environment"], connector["base_url"])
+
 	sales_channel = connector["sales_channel"]
 	provider = IntegrationProvider.PRESTASHOP
 	raw_states = connector.get("eligible_order_states")
 	eligible_states = [s.strip() for s in str(raw_states).split(",") if s.strip()] if raw_states else []
 
+	if not eligible_states:
+		frappe.logger("bop_erp").warning(
+			f"PrestaShop Connector '{connector.get('name')}' has no configured eligible_order_states. Skipping order discovery."
+		)
+		return {
+			"sales_channel": sales_channel,
+			"orders_seen": 0,
+			"events_created": 0,
+			"duplicate_orders": 0,
+			"ineligible_orders": 0,
+			"warning": "NO_ELIGIBLE_STATES_CONFIGURED",
+		}
+
 	if not client:
 		config = PrestaShopConfig.from_connector_doc(connector)
 		client = PrestaShopClient(config=config)
 
-	# Query orders within lookback window
-	lookback_date = add_to_date(now_datetime(), hours=-lookback_hours, as_string=True)
-	params = {
-		"display": "full",
-		"limit": max_orders,
-		"sort": "[id_DESC]",
-		"filter[date_upd]": f">[{lookback_date}]",
-	}
-
-	try:
-		raw_orders = client._request("GET", "orders", params=params)
-		if isinstance(raw_orders, dict):
-			orders_list = raw_orders.get("orders", [])
-		elif isinstance(raw_orders, list):
-			orders_list = raw_orders
-		else:
-			orders_list = []
-	except Exception as req_err:
-		frappe.logger("bop_erp").error(f"Error querying PrestaShop orders for channel {sales_channel}: {req_err}")
-		orders_list = []
+	# Determine discovery window based on durable watermark + bounded overlap
+	last_watermark = connector.get("last_order_watermark")
+	if last_watermark:
+		try:
+			dt = add_to_date(get_datetime(last_watermark), minutes=-overlap_minutes, as_datetime=True)
+			start_time = dt.strftime("%Y-%m-%d %H:%M:%S")
+		except Exception:
+			dt = add_to_date(now_datetime(), hours=-lookback_hours, as_datetime=True)
+			start_time = dt.strftime("%Y-%m-%d %H:%M:%S")
+	else:
+		dt = add_to_date(now_datetime(), hours=-lookback_hours, as_datetime=True)
+		start_time = dt.strftime("%Y-%m-%d %H:%M:%S")
 
 	orders_seen = 0
 	events_created = 0
 	duplicate_orders = 0
 	ineligible_orders = 0
+	max_observed_date_upd = last_watermark
+	max_observed_order_id = connector.get("last_order_id")
 
-	for o in orders_list:
-		orders_seen += 1
-		order_id = str(o.get("id") or "").strip()
-		if not order_id:
-			continue
-
-		state_id = str(o.get("current_state") or "").strip()
-		if state_id not in eligible_states:
-			ineligible_orders += 1
-			continue
-
-		# Check if already mapped to a Sales Order
-		if find_existing_order_mapping(sales_channel, provider, order_id):
-			duplicate_orders += 1
-			continue
-
-		# Canonical idempotency key
-		idem_key = compute_order_idempotency_key(provider, sales_channel, order_id)
-
-		# Check if Integration Event already exists
-		existing_event = frappe.db.get_value(
-			"Integration Event",
-			{"idempotency_key": idem_key},
-			"name",
-		)
-		if existing_event:
-			duplicate_orders += 1
-			continue
-
-		# Create new inbound Integration Event
-		payload = {
-			"sales_channel": sales_channel,
-			"provider": provider,
-			"external_order_id": order_id,
-			"raw_order": o,
+	offset = 0
+	while orders_seen < max_orders:
+		page_limit = min(page_size, max_orders - orders_seen)
+		params = {
+			"display": "full",
+			"limit": f"{offset},{page_limit}",
+			"sort": "[date_upd_ASC,id_ASC]",
+			"filter[date_upd]": f">[{start_time}]",
 		}
 
-		event_doc = frappe.get_doc({
-			"doctype": "Integration Event",
-			"direction": IntegrationDirection.INBOUND,
-			"provider": provider,
-			"sales_channel": sales_channel,
-			"entity_type": ExternalEntityType.ORDER,
-			"operation": IntegrationOperation.INGEST_ORDER,
-			"external_id": order_id,
-			"idempotency_key": idem_key,
-			"status": IntegrationStatus.PENDING,
-			"request_metadata": json.dumps(payload),
-			"max_attempts": 3,
-		})
 		try:
-			event_doc.insert(ignore_permissions=True)
-			events_created += 1
-		except frappe.DuplicateEntryError:
-			duplicate_orders += 1
+			raw_orders = client._request("GET", "orders", params=params)
+		except PrestaShopValidationError:
+			fallback_params = {
+				"display": "full",
+				"limit": f"{offset},{page_limit}",
+				"sort": "[id_ASC]",
+			}
+			if eligible_states:
+				fallback_params["filter[current_state]"] = f"[{'|'.join(eligible_states)}]"
+			try:
+				raw_orders = client._request("GET", "orders", params=fallback_params)
+			except Exception as fb_err:
+				frappe.logger("bop_erp").error(
+					f"Error querying PrestaShop orders fallback for channel {sales_channel} at offset {offset}: {fb_err}"
+				)
+				break
+		except Exception as req_err:
+			frappe.logger("bop_erp").error(
+				f"Error querying PrestaShop orders for channel {sales_channel} at offset {offset}: {req_err}"
+			)
+			break
+
+		if isinstance(raw_orders, dict):
+			orders_page = raw_orders.get("orders", [])
+		elif isinstance(raw_orders, list):
+			orders_page = raw_orders
+		else:
+			orders_page = []
+
+		if not orders_page:
+			break
+
+		for o in orders_page:
+			order_id = str(o.get("id") or "").strip()
+			if not order_id:
+				continue
+
+			orders_seen += 1
+
+			date_upd = str(o.get("date_upd") or "").strip()
+			if date_upd:
+				if not max_observed_date_upd or date_upd > str(max_observed_date_upd):
+					max_observed_date_upd = date_upd
+					max_observed_order_id = order_id
+				elif date_upd == str(max_observed_date_upd) and order_id:
+					if not max_observed_order_id or int(order_id) > int(max_observed_order_id):
+						max_observed_order_id = order_id
+
+			state_id = str(o.get("current_state") or "").strip()
+			if state_id not in eligible_states:
+				ineligible_orders += 1
+				continue
+
+			# Check if already mapped to a Sales Order
+			if find_existing_order_mapping(sales_channel, provider, order_id):
+				duplicate_orders += 1
+				continue
+
+			# Canonical idempotency key
+			idem_key = compute_order_idempotency_key(provider, sales_channel, order_id)
+
+			# Check if Integration Event already exists
+			existing_event = get_existing_idempotent_event(
+				provider=provider,
+				sales_channel=sales_channel,
+				entity_type=ExternalEntityType.ORDER,
+				operation=IntegrationOperation.INGEST_ORDER,
+				idempotency_key=idem_key,
+			)
+			if existing_event:
+				duplicate_orders += 1
+				continue
+
+			# Create new inbound Integration Event with PENDING status
+			payload = {
+				"sales_channel": sales_channel,
+				"provider": provider,
+				"external_order_id": order_id,
+				"raw_order": o,
+			}
+
+			event_doc = frappe.get_doc({
+				"doctype": "Integration Event",
+				"direction": IntegrationDirection.INBOUND,
+				"provider": provider,
+				"sales_channel": sales_channel,
+				"entity_type": ExternalEntityType.ORDER,
+				"operation": IntegrationOperation.INGEST_ORDER,
+				"external_id": order_id,
+				"idempotency_key": idem_key,
+				"status": IntegrationStatus.PENDING,
+				"request_metadata": json.dumps(payload),
+				"max_attempts": 3,
+			})
+			try:
+				event_doc.insert(ignore_permissions=True)
+				events_created += 1
+			except (frappe.DuplicateEntryError, frappe.ValidationError):
+				duplicate_orders += 1
+
+		if len(orders_page) < page_limit:
+			# Less than requested page size means no more records
+			break
+		offset += len(orders_page)
+
+	# Persist durable discovery watermark if new orders were observed
+	connector_name = connector.get("name")
+	if connector_name and max_observed_date_upd and max_observed_date_upd != last_watermark:
+		try:
+			frappe.db.set_value(
+				"PrestaShop Connector",
+				connector_name,
+				{
+					"last_order_watermark": max_observed_date_upd,
+					"last_order_id": max_observed_order_id,
+				},
+				update_modified=False,
+			)
+			frappe.db.commit()
+		except Exception as save_err:
+			frappe.logger("bop_erp").warning(f"Could not update connector watermark: {save_err}")
 
 	return {
 		"sales_channel": sales_channel,
@@ -183,6 +291,7 @@ def discover_channel_orders(
 		"events_created": events_created,
 		"duplicate_orders": duplicate_orders,
 		"ineligible_orders": ineligible_orders,
+		"last_watermark": str(max_observed_date_upd or ""),
 	}
 
 

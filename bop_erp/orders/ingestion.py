@@ -17,6 +17,7 @@ from bop_erp.constants import (
 	ErrorCategory,
 	TransactionOrigin,
 )
+from bop_erp.safety import assert_safe_connector_target
 from bop_erp.reliability import (
 	claim_event_for_processing,
 	sanitize_metadata,
@@ -422,32 +423,70 @@ def schedule_post_commit_publication(affected_channels: List[str], item_codes: L
 	frappe.db.after_commit(_on_commit)
 
 
+def is_order_ingestion_complete(so_name: str) -> Tuple[bool, List[str]]:
+	"""
+	Audits whether a Sales Order has complete native Stock Reservation Entries
+	for all of its items.
+	Returns (is_complete: bool, missing_details: List[str]).
+	"""
+	if not so_name or not frappe.db.exists("Sales Order", so_name):
+		return False, ["Sales Order does not exist"]
+
+	so_doc = frappe.get_doc("Sales Order", so_name)
+	if so_doc.docstatus != 1:
+		return False, [f"Sales Order '{so_name}' is not submitted (docstatus={so_doc.docstatus})"]
+
+	missing = []
+	for item in so_doc.items:
+		sres = frappe.get_all(
+			"Stock Reservation Entry",
+			filters={
+				"voucher_type": "Sales Order",
+				"voucher_no": so_name,
+				"voucher_detail_no": item.name,
+				"docstatus": 1,
+				"status": ["not in", ["Closed", "Delivered", "Cancelled"]],
+			},
+			fields=["name", "reserved_qty"],
+		)
+		total_reserved = sum(flt(s.get("reserved_qty") if isinstance(s, dict) else getattr(s, "reserved_qty", 0)) for s in sres)
+		if total_reserved < flt(item.qty):
+			missing.append(
+				f"Item {item.item_code} (row {item.name}): required {item.qty}, reserved {total_reserved}"
+			)
+
+	return len(missing) == 0, missing
+
+
 def _ensure_order_reservations(so_doc, sales_channel: str):
 	"""
 	Ensures complete native stock reservations for a Sales Order during crash recovery.
+	Calculates exact missing reservation quantity per line.
 	"""
 	for so_item in so_doc.items:
-		existing_sre = frappe.db.get_value(
+		sres = frappe.get_all(
 			"Stock Reservation Entry",
-			{
+			filters={
 				"voucher_type": "Sales Order",
 				"voucher_no": so_doc.name,
 				"voucher_detail_no": so_item.name,
 				"docstatus": 1,
 				"status": ["not in", ["Closed", "Delivered", "Cancelled"]],
 			},
-			"name",
+			fields=["name", "reserved_qty"],
 		)
-		if not existing_sre:
+		existing_reserved = sum(flt(s.get("reserved_qty") if isinstance(s, dict) else getattr(s, "reserved_qty", 0)) for s in sres)
+		needed_qty = flt(so_item.qty) - existing_reserved
+		if needed_qty > 0:
 			reserve_channel_stock(
 				item_code=so_item.item_code,
 				sales_channel=sales_channel,
-				requested_qty=so_item.qty,
+				requested_qty=needed_qty,
 				voucher_type="Sales Order",
 				voucher_no=so_doc.name,
 				voucher_detail_no=so_item.name,
 				allow_partial=False,
-				idempotency_key=f"SO:{so_doc.name}:{so_item.name}",
+				idempotency_key=f"SO:{so_doc.name}:{so_item.name}:recov",
 				source_doctype="Sales Order",
 				source_document=so_doc.name,
 				source_document_item=so_item.name,
@@ -693,10 +732,11 @@ def process_order_ingestion_event(
 	Authoritative Integration Event worker handler for Inbound Order Ingestion.
 	Enforces:
 	1. Atomic claim & lease fencing.
-	2. Request metadata parsing.
-	3. Replay idempotency.
-	4. Execution through ingest_order_pipeline.
-	5. Fencing-verified event state transition (SUCCEEDED or FAILED/DEAD_LETTER).
+	2. Fresh remote order state verification (re-read at execution time).
+	3. Eligibility verification against connector-configured states.
+	4. Replay idempotency & incomplete submitted Sales Order recovery.
+	5. Execution through ingest_order_pipeline.
+	6. Fencing-verified event state transition (SUCCEEDED, CANCELLED, DEAD_LETTER, FAILED).
 	"""
 	claimed, worker_id, processing_token = claim_event_for_processing(event_name, worker_id=worker_id)
 	if not claimed:
@@ -704,6 +744,15 @@ def process_order_ingestion_event(
 			"success": False,
 			"event_name": event_name,
 			"reason": "CLAIM_REJECTED_ALREADY_CLAIMED_OR_TERMINAL",
+		}
+
+	is_auth, auth_reason = verify_processing_authority(event_name, processing_token)
+	if not is_auth:
+		return {
+			"success": False,
+			"event_name": event_name,
+			"reason": "LOST_PROCESSING_AUTHORITY",
+			"details": auth_reason,
 		}
 
 	event_doc = frappe.get_doc("Integration Event", event_name)
@@ -719,22 +768,45 @@ def process_order_ingestion_event(
 	provider = event_doc.provider or payload.get("provider") or IntegrationProvider.PRESTASHOP
 	external_order_id = event_doc.external_id or payload.get("external_order_id")
 
+	# Initialize client and verify host safety if not passed
+	if not client and sales_channel:
+		connector_dict = frappe.db.get_value(
+			"PrestaShop Connector",
+			{"sales_channel": sales_channel, "enabled": 1},
+			["name", "environment", "base_url", "credential_reference", "eligible_order_states"],
+			as_dict=True,
+		)
+		if connector_dict:
+			assert_safe_connector_target(connector_dict.environment, connector_dict.base_url)
+			config = PrestaShopConfig.from_connector_doc(connector_dict)
+			client = PrestaShopClient(config=config)
+
 	# Check for crash recovery / existing mapping
 	existing_so = find_existing_order_mapping(sales_channel, provider, external_order_id)
 	if existing_so and frappe.db.exists("Sales Order", existing_so):
+		is_auth, auth_reason = verify_processing_authority(event_name, processing_token)
+		if not is_auth:
+			return {
+				"success": False,
+				"event_name": event_name,
+				"reason": "LOST_PROCESSING_AUTHORITY",
+				"details": auth_reason,
+			}
 		so_doc = frappe.get_doc("Sales Order", existing_so)
 		if so_doc.docstatus == 0:
 			so_doc.submit()
 		_ensure_order_reservations(so_doc, sales_channel)
-		if verify_processing_authority(event_name, processing_token):
-			event_doc.db_set({
-				"status": IntegrationStatus.SUCCEEDED,
-				"erp_doctype": "Sales Order",
-				"erp_document": existing_so,
-				"processing_finished_at": get_database_now(),
-				"response_metadata": json.dumps({"reason": "IDEMPOTENT_REPLAY", "sales_order": existing_so}),
-			})
-			frappe.db.commit()
+		is_complete, missing = is_order_ingestion_complete(existing_so)
+		if not is_complete:
+			raise OrderReservationFailedError(f"Incomplete reservations for order {existing_so}: {missing}")
+
+		event_doc.reload()
+		event_doc.associate_erp_document("Sales Order", existing_so)
+		event_doc.mark_succeeded(
+			processing_token,
+			response_metadata={"reason": "IDEMPOTENT_REPLAY", "sales_order": existing_so},
+		)
+		frappe.db.commit()
 		return {
 			"success": True,
 			"event_name": event_name,
@@ -742,28 +814,47 @@ def process_order_ingestion_event(
 			"is_replay": True,
 		}
 
-	# Construct or normalize ExternalOrder
+	# Re-read external order freshness and eligibility at execution time
 	external_order = None
-	if "raw_order" in payload and client:
-		raw_order = payload["raw_order"]
-		raw_lines = payload.get("raw_lines") or client.get_order_details(external_order_id)
-		raw_cust = payload.get("raw_customer") or client.get_customer(raw_order.get("id_customer"))
-		raw_deliv = payload.get("raw_delivery_address") or client.get_address(raw_order.get("id_address_delivery"))
-		raw_inv = payload.get("raw_invoice_address") or client.get_address(raw_order.get("id_address_invoice"))
-		external_order = normalize_prestashop_order(
-			raw_order=raw_order,
-			raw_lines=raw_lines,
-			raw_customer=raw_cust,
-			raw_delivery_address=raw_deliv,
-			raw_invoice_address=raw_inv,
-			sales_channel=sales_channel,
-		)
-	elif client:
-		raw_order = client.get_order(external_order_id)
+	if client:
+		try:
+			raw_order = client.get_order(external_order_id)
+			current_state = str(raw_order.get("current_state", "")).strip()
+		except Exception as req_err:
+			is_auth, _ = verify_processing_authority(event_name, processing_token)
+			if is_auth:
+				event_doc.reload()
+				event_doc.mark_failed(
+					processing_token,
+					ErrorCategory.TRANSIENT,
+					f"Failed to fetch fresh order from PrestaShop: {req_err}"[:250],
+					error_category=ErrorCategory.TRANSIENT,
+				)
+				frappe.db.commit()
+			return {"success": False, "event_name": event_name, "error": str(req_err), "category": "NETWORK"}
+
+		eligible_states = get_eligible_order_states(sales_channel)
+		if not eligible_states or current_state not in eligible_states:
+			is_auth, _ = verify_processing_authority(event_name, processing_token)
+			if is_auth:
+				event_doc.reload()
+				event_doc.cancel(
+					reason=f"Order state '{current_state}' not in eligible states {eligible_states}"[:250],
+					processing_token=processing_token,
+				)
+				frappe.db.commit()
+			return {
+				"success": False,
+				"event_name": event_name,
+				"error": f"Order state '{current_state}' not in eligible states {eligible_states}",
+				"category": "NOT_ELIGIBLE",
+			}
+
 		raw_lines = client.get_order_details(external_order_id)
 		raw_cust = client.get_customer(raw_order.get("id_customer")) if raw_order.get("id_customer") else None
 		raw_deliv = client.get_address(raw_order.get("id_address_delivery")) if raw_order.get("id_address_delivery") else None
 		raw_inv = client.get_address(raw_order.get("id_address_invoice")) if raw_order.get("id_address_invoice") else None
+
 		external_order = normalize_prestashop_order(
 			raw_order=raw_order,
 			raw_lines=raw_lines,
@@ -777,83 +868,89 @@ def process_order_ingestion_event(
 		external_order = _deserialize_external_order(norm_dict)
 
 	if not external_order:
-		if verify_processing_authority(event_name, processing_token):
-			event_doc.db_set({
-				"status": IntegrationStatus.DEAD_LETTER,
-				"last_error_code": ErrorCategory.VALIDATION,
-				"last_error_message": "Cannot reconstruct ExternalOrder payload.",
-				"last_error_at": get_database_now(),
-				"processing_finished_at": get_database_now(),
-			})
+		is_auth, _ = verify_processing_authority(event_name, processing_token)
+		if is_auth:
+			event_doc.reload()
+			event_doc.mark_dead_letter(
+				processing_token,
+				ErrorCategory.VALIDATION,
+				"Cannot reconstruct ExternalOrder payload.",
+			)
 			frappe.db.commit()
 		return {"success": False, "event_name": event_name, "error": "MISSING_PAYLOAD"}
 
 	# Execute ingestion pipeline
 	try:
+		is_auth, auth_reason = verify_processing_authority(event_name, processing_token)
+		if not is_auth:
+			return {
+				"success": False,
+				"event_name": event_name,
+				"reason": "LOST_PROCESSING_AUTHORITY",
+				"details": auth_reason,
+			}
+
 		res = ingest_order_pipeline(external_order, client=client)
 		so_name = res["sales_order"]
 
-		if not verify_processing_authority(event_name, processing_token):
-			return {"success": False, "event_name": event_name, "reason": "LOST_PROCESSING_AUTHORITY"}
+		is_auth, auth_reason = verify_processing_authority(event_name, processing_token)
+		if not is_auth:
+			return {
+				"success": False,
+				"event_name": event_name,
+				"reason": "LOST_PROCESSING_AUTHORITY",
+				"details": auth_reason,
+			}
 
-		event_doc.db_set({
-			"status": IntegrationStatus.SUCCEEDED,
-			"erp_doctype": "Sales Order",
-			"erp_document": so_name,
-			"processing_finished_at": get_database_now(),
-			"response_metadata": json.dumps(res),
-		})
+		is_complete, missing = is_order_ingestion_complete(so_name)
+		if not is_complete:
+			raise OrderReservationFailedError(f"Incomplete reservations for order {so_name}: {missing}")
+
+		event_doc.reload()
+		event_doc.associate_erp_document("Sales Order", so_name)
+		event_doc.mark_succeeded(processing_token, response_metadata=res)
 		frappe.db.commit()
 		return {"success": True, "event_name": event_name, "sales_order": so_name}
 
 	except OrderNotEligibleError as e:
-		if verify_processing_authority(event_name, processing_token):
-			event_doc.db_set({
-				"status": IntegrationStatus.CANCELLED,
-				"last_error_code": ErrorCategory.VALIDATION,
-				"last_error_message": str(e)[:250],
-				"last_error_at": get_database_now(),
-				"processing_finished_at": get_database_now(),
-			})
+		is_auth, _ = verify_processing_authority(event_name, processing_token)
+		if is_auth:
+			event_doc.reload()
+			event_doc.cancel(reason=str(e)[:250], processing_token=processing_token)
 			frappe.db.commit()
 		return {"success": False, "event_name": event_name, "error": str(e), "category": "NOT_ELIGIBLE"}
 
 	except (MissingProductMappingError, InvalidOrderQuantityError, OrderTotalMismatchError) as e:
-		# Non-retryable validation failures go directly to DEAD_LETTER
-		if verify_processing_authority(event_name, processing_token):
-			event_doc.db_set({
-				"status": IntegrationStatus.DEAD_LETTER,
-				"last_error_code": ErrorCategory.VALIDATION,
-				"last_error_message": str(e)[:250],
-				"last_error_at": get_database_now(),
-				"processing_finished_at": get_database_now(),
-			})
+		is_auth, _ = verify_processing_authority(event_name, processing_token)
+		if is_auth:
+			event_doc.reload()
+			event_doc.mark_dead_letter(processing_token, ErrorCategory.VALIDATION, str(e)[:250])
 			frappe.db.commit()
 		return {"success": False, "event_name": event_name, "error": str(e), "category": "NON_RETRYABLE"}
 
 	except (InsufficientOrderStockError, OrderReservationFailedError) as e:
-		# Stock / reservation shortage
-		if verify_processing_authority(event_name, processing_token):
-			event_doc.db_set({
-				"status": IntegrationStatus.FAILED,
-				"last_error_code": ErrorCategory.CONFLICT,
-				"last_error_message": str(e)[:250],
-				"last_error_at": get_database_now(),
-				"processing_finished_at": get_database_now(),
-			})
+		is_auth, _ = verify_processing_authority(event_name, processing_token)
+		if is_auth:
+			event_doc.reload()
+			event_doc.mark_failed(
+				processing_token,
+				ErrorCategory.CONFLICT,
+				str(e)[:250],
+				error_category=ErrorCategory.CONFLICT,
+			)
 			frappe.db.commit()
 		return {"success": False, "event_name": event_name, "error": str(e), "category": "STOCK_SHORTAGE"}
 
 	except Exception as e:
-		# General failure
-		if verify_processing_authority(event_name, processing_token):
-			event_doc.db_set({
-				"status": IntegrationStatus.FAILED,
-				"last_error_code": ErrorCategory.INTERNAL_ERROR,
-				"last_error_message": str(e)[:250],
-				"last_error_at": get_database_now(),
-				"processing_finished_at": get_database_now(),
-			})
+		is_auth, _ = verify_processing_authority(event_name, processing_token)
+		if is_auth:
+			event_doc.reload()
+			event_doc.mark_failed(
+				processing_token,
+				ErrorCategory.INTERNAL_ERROR,
+				str(e)[:250],
+				error_category=ErrorCategory.INTERNAL_ERROR,
+			)
 			frappe.db.commit()
 		return {"success": False, "event_name": event_name, "error": str(e), "category": "ERROR"}
 
