@@ -298,5 +298,15 @@ Variant Import Error: {0},Error al importar variante: {0}
 "Order Reconciliation Watermark","Marca de Agua de Reconciliación de Pedidos"
 "Last Reconciliation Watermark","Última Marca de Agua de Reconciliación"
 "Last Reconciliation Order ID","ID de Último Pedido de Reconciliación"
-
-
+"Pick Ticket","Ticket de Picking"
+"Pick Tickets","Tickets de Picking"
+"Create Pick Ticket","Crear Ticket de Picking"
+"Pick Ticket Ready","Ticket de Picking Listo"
+"Pick Ticket Completed","Ticket de Picking Completado"
+"Pick Ticket Cancelled","Ticket de Picking Cancelado"
+"Picking in Progress","Picking en Progreso"
+"Picked Quantity","Cantidad Recogida"
+"Remaining to Pick","Restante por Recoger"
+"Warehouse Allocation","Asignación de Almacén"
+"Cannot Pick Order","No se Puede Recoger la Orden"
+"Order Not Ready for Picking","Orden No Lista para Picking"

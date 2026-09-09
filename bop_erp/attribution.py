@@ -64,19 +64,22 @@ def validate_submitted_immutability(doc):
 def propagate_attribution_to_pick_list(doc, method=None):
 	channels = set()
 	origins = set()
+	ext_ids = set()
 
 	locations = doc.get("locations") or []
 	for loc in locations:
 		so_id = getattr(loc, "sales_order", None) if not isinstance(loc, dict) else loc.get("sales_order")
 		if so_id:
 			so = frappe.db.get_value(
-				"Sales Order", so_id, ["sales_channel", "transaction_origin"], as_dict=True
+				"Sales Order", so_id, ["sales_channel", "transaction_origin", "external_order_id"], as_dict=True
 			)
 			if so:
 				if so.sales_channel:
 					channels.add(so.sales_channel)
 				if so.transaction_origin:
 					origins.add(so.transaction_origin)
+				if so.external_order_id:
+					ext_ids.add(so.external_order_id)
 
 	# Independent resolution for operational aggregation
 	if len(channels) == 1:
@@ -88,6 +91,11 @@ def propagate_attribution_to_pick_list(doc, method=None):
 		doc.transaction_origin = next(iter(origins))
 	elif len(origins) > 1:
 		doc.transaction_origin = None
+
+	if len(ext_ids) == 1:
+		doc.external_order_id = next(iter(ext_ids))
+	elif len(ext_ids) > 1:
+		doc.external_order_id = None
 
 def propagate_attribution_to_delivery_note(doc, method=None):
 	if getattr(doc, "is_return", 0) and getattr(doc, "return_against", None):

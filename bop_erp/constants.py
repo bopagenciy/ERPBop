@@ -163,3 +163,17 @@ class ExternalOrderStateAction:
 		IGNORE,
 	)
 
+class PickTicketStatus:
+	DRAFT = "DRAFT"
+	READY_TO_PICK = "READY_TO_PICK"
+	PICKING = "PICKING"
+	PICKED = "PICKED"
+	CANCELLED = "CANCELLED"
+
+	ALL = (
+		DRAFT,
+		READY_TO_PICK,
+		PICKING,
+		PICKED,
+		CANCELLED,
+	)

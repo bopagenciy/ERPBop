@@ -56,12 +56,12 @@ def assert_sales_order_ready_for_fulfillment(so_name: Optional[str]) -> None:
 		return
 
 	status = so_data.get("integration_status")
-	if status and status != IntegrationReadinessStatus.READY:
+	if status != IntegrationReadinessStatus.READY:
 		frappe.throw(
 			_(
 				"Operational Guard Violation: Sales Order '{0}' is an imported order in '{1}' status "
 				"and is not READY for operational fulfillment (Pick List / Delivery Note / Shipment)."
-			).format(so_name, status),
+			).format(so_name, status or "NONE"),
 			exc=OperationalGuardError,
 			title=_("Operational Guard Blocked"),
 		)
