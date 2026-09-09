@@ -704,3 +704,145 @@ class TestOrderStateReconciliationUnit(FrappeTestCase):
 			# Second call was capped to 7 - 5 = 2
 			second_call_max = mock_disc.call_args_list[1][1]["max_orders"]
 			self.assertEqual(second_call_max, 2)
+
+	# ==================================================
+	# 11. EXPIRED WORKER AUTHORITY & SAFETY INVARIANTS
+	# ==================================================
+	def test_25_expired_worker_authority_blocks_reconciliation(self):
+		"""An expired worker lease blocks Sales Order cancellation, reservation release, and outbox persistence."""
+		event = frappe.get_doc({
+			"doctype": "Integration Event",
+			"direction": IntegrationDirection.INBOUND,
+			"provider": self.provider,
+			"sales_channel": self.sales_channel,
+			"entity_type": ExternalEntityType.ORDER,
+			"operation": IntegrationOperation.RECONCILE_ORDER_STATE,
+			"external_id": "EXP-ORD-01",
+			"idempotency_key": "EXP-KEY-001",
+			"status": IntegrationStatus.PENDING,
+			"request_metadata": json.dumps({"external_state_id": "6"}),
+		}).insert(ignore_permissions=True)
+		frappe.db.commit()
+
+		mock_so = MagicMock(docstatus=1)
+
+		with patch("bop_erp.orders.reconciliation.find_existing_order_mapping", return_value="SO-EXP-001"), \
+		     patch("frappe.db.exists", return_value=True), \
+		     patch("frappe.get_doc", return_value=mock_so), \
+		     patch("bop_erp.orders.reconciliation.execute_sales_order_cancellation") as mock_cancel, \
+		     patch("bop_erp.orders.reconciliation.verify_processing_authority") as mock_auth:
+
+			# Worker claims event initially, but authority verification fails (expired lease / lost authority)
+			mock_auth.return_value = (False, "LEASE_EXPIRED")
+
+			res = process_order_state_reconciliation_event(event.name, worker_id="worker-expired-01")
+			self.assertFalse(res["success"])
+			self.assertEqual(res["reason"], "LOST_PROCESSING_AUTHORITY")
+
+			# Zero SO cancellation invoked
+			mock_cancel.assert_not_called()
+			mock_so.cancel.assert_not_called()
+
+		frappe.db.delete("Integration Event", {"name": event.name})
+		frappe.db.commit()
+
+	# ==================================================
+	# 12. EMPTY CONFIGURATION SAFETY
+	# ==================================================
+	def test_26_empty_config_safety_blocks_cancellation(self):
+		"""
+		When connector has no cancellation_order_states and no review_order_states configured,
+		remote order state 6 does NOT trigger automatic cancellation or reservation release.
+		It routes safely to REVIEW_REQUIRED as an unmapped state.
+		"""
+		with patch("frappe.db.get_value") as mock_get_val:
+			# Mock connector with empty string or None for cancellation and review states
+			mock_get_val.return_value = {
+				"cancellation_order_states": "",
+				"review_order_states": "",
+				"eligible_order_states": "2,3",
+			}
+
+			action, label = resolve_external_order_state_action("EMPTY-CONF-CH", self.provider, "6")
+			self.assertEqual(action, ExternalOrderStateAction.REVIEW_REQUIRED)
+			self.assertEqual(label, "Unmapped State")
+			self.assertNotEqual(action, ExternalOrderStateAction.CANCEL_BEFORE_FULFILLMENT)
+
+			action_7, label_7 = resolve_external_order_state_action("EMPTY-CONF-CH", self.provider, "7")
+			self.assertEqual(action_7, ExternalOrderStateAction.REVIEW_REQUIRED)
+
+			action_8, label_8 = resolve_external_order_state_action("EMPTY-CONF-CH", self.provider, "8")
+			self.assertEqual(action_8, ExternalOrderStateAction.REVIEW_REQUIRED)
+
+	# ==================================================
+	# 13. STATE FLAP / FRESH-READ CHECK
+	# ==================================================
+	def test_27_state_flap_fresh_read_prevents_stale_cancellation(self):
+		"""
+		If discovery created an event for cancellation (state 6), but the remote order flapped back
+		to Active (e.g. 2) before the worker executed, the worker acts on the fresh remote state,
+		not the stale event payload.
+		"""
+		event = frappe.get_doc({
+			"doctype": "Integration Event",
+			"direction": IntegrationDirection.INBOUND,
+			"provider": self.provider,
+			"sales_channel": self.sales_channel,
+			"entity_type": ExternalEntityType.ORDER,
+			"operation": IntegrationOperation.RECONCILE_ORDER_STATE,
+			"external_id": "FLAP-ORD-01",
+			"idempotency_key": "FLAP-KEY-001",
+			"status": IntegrationStatus.PENDING,
+			"request_metadata": json.dumps({
+				"sales_channel": self.sales_channel,
+				"provider": self.provider,
+				"external_order_id": "FLAP-ORD-01",
+				"external_state_id": "6",  # Stale payload says Canceled
+				"external_updated_at": "2026-09-09 10:00:00",
+			}),
+		}).insert(ignore_permissions=True)
+		frappe.db.commit()
+
+		mock_client = MagicMock(spec=PrestaShopClient)
+		# Fresh remote read reveals customer re-activated / state is actually 2 (Payment accepted)
+		mock_client.get_order.return_value = {
+			"id": "FLAP-ORD-01",
+			"current_state": "2",
+			"date_upd": "2026-09-09 10:15:00",
+		}
+		mock_client.get_order_details.return_value = []
+		mock_client.get_customer.return_value = None
+		mock_client.get_address.return_value = None
+
+		mock_so = MagicMock(
+			docstatus=1,
+			items=[],
+			currency="USD",
+			net_total=0.0,
+			grand_total=0.0,
+			name="SO-FLAP-001",
+		)
+
+		original_get_doc = frappe.get_doc
+
+		def get_doc_side_effect(doctype, *args, **kwargs):
+			if doctype == "Sales Order":
+				return mock_so
+			return original_get_doc(doctype, *args, **kwargs)
+
+		with patch("bop_erp.orders.reconciliation.find_existing_order_mapping", return_value="SO-FLAP-001"), \
+		     patch("frappe.db.exists", return_value=True), \
+		     patch("frappe.get_doc", side_effect=get_doc_side_effect), \
+		     patch("bop_erp.orders.reconciliation.execute_sales_order_cancellation") as mock_cancel, \
+		     patch("frappe.db.set_value") as mock_set_val:
+
+			res = process_order_state_reconciliation_event(event.name, client=mock_client)
+			self.assertTrue(res["success"])
+			self.assertEqual(res["action"], ExternalOrderStateAction.ACTIVE)
+
+			# Cancellation was strictly NOT executed because fresh state was 2, not 6!
+			mock_cancel.assert_not_called()
+			mock_so.cancel.assert_not_called()
+
+		frappe.db.delete("Integration Event", {"name": event.name})
+		frappe.db.commit()

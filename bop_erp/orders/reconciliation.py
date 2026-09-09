@@ -75,34 +75,40 @@ def resolve_external_order_state_action(
 			as_dict=True,
 		)
 		if conn:
-			# 1. Cancellation states (e.g. 6)
-			raw_canc = conn.get("cancellation_order_states") or "6"
+			# 1. Cancellation states
+			raw_canc = conn.get("cancellation_order_states") or ""
 			canc_states = [s.strip() for s in str(raw_canc).split(",") if s.strip()]
-			if clean_state in canc_states:
+			if canc_states and clean_state in canc_states:
 				return ExternalOrderStateAction.CANCEL_BEFORE_FULFILLMENT, "Canceled"
 
-			# 2. Review states (e.g. 7=Refunded, 8=Payment error)
-			raw_rev = conn.get("review_order_states") or "7,8"
+			# 2. Review states
+			raw_rev = conn.get("review_order_states") or ""
 			rev_states = [s.strip() for s in str(raw_rev).split(",") if s.strip()]
-			if clean_state in rev_states:
+			if rev_states and clean_state in rev_states:
 				state_label = "Refunded" if clean_state == "7" else "Payment Error" if clean_state == "8" else "Review Required"
 				return ExternalOrderStateAction.REVIEW_REQUIRED, state_label
 
-			# 3. Active / eligible states (e.g. 2, 3, 4, 5, 9, 11)
+			# 3. Active / eligible states
 			raw_elig = conn.get("eligible_order_states") or ""
 			elig_states = [s.strip() for s in str(raw_elig).split(",") if s.strip()]
-			if clean_state in elig_states:
+			if elig_states and clean_state in elig_states:
 				return ExternalOrderStateAction.ACTIVE, "Active"
 
 			# States 4 (Shipped) and 5 (Delivered) are active fulfillment states
 			if clean_state in ("4", "5"):
 				return ExternalOrderStateAction.ACTIVE, "Fulfillment Completed"
 
-			# Default unpaid/pending validation states
+			# Pre-payment / unpaid states to ignore
 			if clean_state in ("1", "10", "12", "13"):
 				return ExternalOrderStateAction.IGNORE, "Ignored Pre-payment State"
 
-	# Fallback safe behavior: if unrecognized, route to REVIEW_REQUIRED
+			# If connector has no cancellation states configured, warn and never assume state 6 is cancellation
+			if not canc_states:
+				frappe.logger("bop_erp").warning(
+					f"PrestaShop Connector for channel '{sales_channel}' has no cancellation_order_states configured."
+				)
+
+	# Fallback safe behavior: unconfigured or unmapped state routes safely to REVIEW_REQUIRED
 	return ExternalOrderStateAction.REVIEW_REQUIRED, "Unmapped State"
 
 

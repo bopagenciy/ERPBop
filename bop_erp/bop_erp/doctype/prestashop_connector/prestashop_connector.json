@@ -101,15 +101,13 @@
    "label": "Eligible Order States"
   },
   {
-   "default": "6",
-   "description": "Comma-separated list of PrestaShop order state IDs representing external cancellation before fulfillment (e.g. 6=Canceled).",
+   "description": "Comma-separated list of PrestaShop order state IDs representing external cancellation before fulfillment (e.g. 6=Canceled). Must be explicitly configured per connector.",
    "fieldname": "cancellation_order_states",
    "fieldtype": "Data",
    "label": "Cancellation Order States"
   },
   {
-   "default": "7,8",
-   "description": "Comma-separated list of PrestaShop order state IDs requiring manual operational review (e.g. 7=Refunded, 8=Payment error).",
+   "description": "Comma-separated list of PrestaShop order state IDs requiring manual operational review (e.g. 7=Refunded, 8=Payment error). Must be explicitly configured per connector.",
    "fieldname": "review_order_states",
    "fieldtype": "Data",
    "label": "Review Order States"

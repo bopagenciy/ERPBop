@@ -405,15 +405,13 @@ class TestOrderStateReconciliationLive(unittest.TestCase):
 		self._safe_delete_sales_order(so.name)
 
 	# ==================================================
-	# SCENARIO B & C: Shared Inventory Restoration across A & B; C Excluded
+	# SCENARIO B: Shared Inventory Restoration across A & B
 	# ==================================================
 	def test_02_shared_two_channel_inventory_returns_atp_on_both_channels(self):
 		"""
-		Scenario B & C:
+		Scenario B:
 		Channel A and Channel B share the same warehouse.
-		Channel C has an independent unrelated warehouse.
-		Cancelling order on Channel A creates outbound publication intents for BOTH A and B,
-		while Channel C is strictly excluded.
+		Cancelling order on Channel A creates outbound publication intents for BOTH A and B.
 		"""
 		# Setup Channel B on shared warehouse
 		if not frappe.db.exists("Sales Channel", self.channel_b):
@@ -436,6 +434,54 @@ class TestOrderStateReconciliationLive(unittest.TestCase):
 				"allow_sellable_stock": 1,
 			}).insert(ignore_permissions=True)
 
+		so, sre = self._create_ready_order_with_reservation("LIVE-ORD-02", qty=3.0)
+
+		# Execute cancellation
+		cancel_res = execute_sales_order_cancellation(
+			so_name=so.name,
+			external_order_id="LIVE-ORD-02",
+			sales_channel=self.channel_a,
+			provider=IntegrationProvider.PRESTASHOP,
+			state_id="6",
+			state_name="Canceled",
+		)
+		self.assertTrue(cancel_res["success"])
+
+		# Verify affected channels list contains A and B
+		affected_channels = cancel_res["affected_channels"]
+		self.assertIn(self.channel_a, affected_channels)
+		self.assertIn(self.channel_b, affected_channels)
+
+		# Verify outbox events were persisted for A and B
+		ev_a = frappe.db.exists("Integration Event", {
+			"sales_channel": self.channel_a,
+			"direction": IntegrationDirection.OUTBOUND,
+			"entity_type": ExternalEntityType.INVENTORY,
+			"erp_document": self.item_code,
+		})
+		ev_b = frappe.db.exists("Integration Event", {
+			"sales_channel": self.channel_b,
+			"direction": IntegrationDirection.OUTBOUND,
+			"entity_type": ExternalEntityType.INVENTORY,
+			"erp_document": self.item_code,
+		})
+
+		self.assertTrue(bool(ev_a))
+		self.assertTrue(bool(ev_b))
+
+		# Clean up
+		self._safe_delete_sales_order(so.name)
+
+	# ==================================================
+	# SCENARIO C: Unrelated Channel Excluded from Publication Outbox
+	# ==================================================
+	def test_03_unrelated_channel_c_excluded_from_publication(self):
+		"""
+		Scenario C:
+		Channel C has an independent unrelated warehouse.
+		Cancelling order on Channel A (using shared warehouse) must strictly exclude Channel C
+		from affected channels and outbound publication outbox.
+		"""
 		# Setup Channel C on unrelated warehouse
 		if not frappe.db.exists("Sales Channel", self.channel_c):
 			frappe.get_doc({
@@ -457,12 +503,12 @@ class TestOrderStateReconciliationLive(unittest.TestCase):
 				"allow_sellable_stock": 1,
 			}).insert(ignore_permissions=True)
 
-		so, sre = self._create_ready_order_with_reservation("LIVE-ORD-02", qty=3.0)
+		so, sre = self._create_ready_order_with_reservation("LIVE-ORD-03", qty=3.0)
 
 		# Execute cancellation
 		cancel_res = execute_sales_order_cancellation(
 			so_name=so.name,
-			external_order_id="LIVE-ORD-02",
+			external_order_id="LIVE-ORD-03",
 			sales_channel=self.channel_a,
 			provider=IntegrationProvider.PRESTASHOP,
 			state_id="6",
@@ -470,34 +516,17 @@ class TestOrderStateReconciliationLive(unittest.TestCase):
 		)
 		self.assertTrue(cancel_res["success"])
 
-		# Verify affected channels list contains A and B, but NOT C
+		# Verify Channel C is strictly excluded from affected channels
 		affected_channels = cancel_res["affected_channels"]
-		self.assertIn(self.channel_a, affected_channels)
-		self.assertIn(self.channel_b, affected_channels)
 		self.assertNotIn(self.channel_c, affected_channels)
 
-		# Verify outbox events were persisted for A and B
-		ev_a = frappe.db.exists("Integration Event", {
-			"sales_channel": self.channel_a,
-			"direction": IntegrationDirection.OUTBOUND,
-			"entity_type": ExternalEntityType.INVENTORY,
-			"erp_document": self.item_code,
-		})
-		ev_b = frappe.db.exists("Integration Event", {
-			"sales_channel": self.channel_b,
-			"direction": IntegrationDirection.OUTBOUND,
-			"entity_type": ExternalEntityType.INVENTORY,
-			"erp_document": self.item_code,
-		})
+		# Verify NO outbox event was created for Channel C
 		ev_c = frappe.db.exists("Integration Event", {
 			"sales_channel": self.channel_c,
 			"direction": IntegrationDirection.OUTBOUND,
 			"entity_type": ExternalEntityType.INVENTORY,
 			"erp_document": self.item_code,
 		})
-
-		self.assertTrue(bool(ev_a))
-		self.assertTrue(bool(ev_b))
 		self.assertFalse(bool(ev_c))
 
 		# Clean up
