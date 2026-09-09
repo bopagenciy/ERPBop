@@ -130,13 +130,34 @@ class TestOrderStateReconciliationLive(unittest.TestCase):
 		except Exception:
 			pass
 
-		# Clean up channels, inventory sources, connectors
+		# 1. Clean up channels, inventory sources, connectors
 		for ch in [cls.channel_a, cls.channel_b, cls.channel_c]:
 			frappe.db.delete("Integration Event", {"sales_channel": ch})
 			frappe.db.delete("External ID Mapping", {"sales_channel": ch})
 			frappe.db.delete("Channel Inventory Source", {"sales_channel": ch})
 			frappe.db.delete("PrestaShop Connector", {"sales_channel": ch})
 			frappe.db.delete("Sales Channel", {"name": ch})
+
+		# 2. Clean up any lingering SREs and references for Phase 1L test item
+		for sre in frappe.db.get_all("Stock Reservation Entry", filters={"item_code": cls.item_code}, fields=["name", "docstatus"]):
+			if sre.docstatus == 1:
+				frappe.db.set_value("Stock Reservation Entry", sre.name, "docstatus", 2)
+			frappe.delete_doc("Stock Reservation Entry", sre.name, force=True, ignore_permissions=True)
+
+		frappe.db.delete("Inventory Reservation Reference", {"item_code": cls.item_code})
+
+		# 3. Clean fixture Bins for the test warehouses and test item
+		test_whs = [cls.wh_shared, cls.wh_unrelated]
+		for wh in test_whs:
+			bin_name = frappe.db.get_value("Bin", {"item_code": cls.item_code, "warehouse": wh}, "name")
+			if bin_name:
+				frappe.delete_doc("Bin", bin_name, force=True, ignore_permissions=True)
+		frappe.db.delete("Bin", {"item_code": cls.item_code, "warehouse": ["in", test_whs]})
+
+		# 4. Clean synthetic test warehouses
+		for wh in test_whs:
+			if frappe.db.exists("Warehouse", wh):
+				frappe.delete_doc("Warehouse", wh, force=True, ignore_permissions=True)
 
 		frappe.db.commit()
 		super().tearDownClass()
@@ -221,6 +242,33 @@ class TestOrderStateReconciliationLive(unittest.TestCase):
 		self._set_warehouse_stock(self.item_code, self.wh_shared, 10.0)
 		frappe.db.commit()
 
+	def tearDown(self):
+		# 1. Clean any lingering Delivery Notes
+		for dn in frappe.db.get_all("Delivery Note", filters={"customer": ["like", "%"]}, fields=["name", "docstatus"]):
+			if dn.docstatus == 1:
+				frappe.db.set_value("Delivery Note", dn.name, "docstatus", 2)
+			frappe.delete_doc("Delivery Note", dn.name, force=True, ignore_permissions=True)
+
+		# 2. Clean test Sales Orders and their SREs
+		for so in frappe.db.get_all("Sales Order", filters={"sales_channel": ["like", "CHAN-RECON%"]}, fields=["name"]):
+			self._safe_delete_sales_order(so.name)
+
+		# 3. Clean any lingering SREs and references for test item
+		for sre in frappe.db.get_all("Stock Reservation Entry", filters={"item_code": self.item_code}, fields=["name", "docstatus"]):
+			if sre.docstatus == 1:
+				frappe.db.set_value("Stock Reservation Entry", sre.name, "docstatus", 2)
+			frappe.delete_doc("Stock Reservation Entry", sre.name, force=True, ignore_permissions=True)
+		frappe.db.delete("Inventory Reservation Reference", {"item_code": self.item_code})
+
+		# 4. Clean fixture Bins for test warehouses and test item
+		for wh in [self.wh_shared, self.wh_unrelated]:
+			bin_name = frappe.db.get_value("Bin", {"item_code": self.item_code, "warehouse": wh}, "name")
+			if bin_name:
+				frappe.delete_doc("Bin", bin_name, force=True, ignore_permissions=True)
+
+		frappe.db.commit()
+		super().tearDown()
+
 	def _set_warehouse_stock(self, item_code: str, warehouse: str, qty: float):
 		bin_name = frappe.db.get_value("Bin", {"item_code": item_code, "warehouse": warehouse}, "name")
 		if bin_name:
@@ -237,6 +285,12 @@ class TestOrderStateReconciliationLive(unittest.TestCase):
 			return
 		frappe.db.delete("External ID Mapping", {"erp_doctype": "Sales Order", "erp_document": so_name})
 		frappe.db.delete("Inventory Reservation Reference", {"source_doctype": "Sales Order", "source_document": so_name})
+
+		for sre in frappe.db.get_all("Stock Reservation Entry", filters={"voucher_no": so_name}, fields=["name", "docstatus"]):
+			if sre.docstatus == 1:
+				frappe.db.set_value("Stock Reservation Entry", sre.name, "docstatus", 2)
+			frappe.delete_doc("Stock Reservation Entry", sre.name, force=True, ignore_permissions=True)
+
 		docstatus = frappe.db.get_value("Sales Order", so_name, "docstatus")
 		if docstatus == 1:
 			frappe.db.set_value("Sales Order", so_name, "docstatus", 2)
