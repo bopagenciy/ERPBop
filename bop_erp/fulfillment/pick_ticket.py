@@ -469,7 +469,7 @@ def create_pick_ticket(
 		FROM `tabStock Reservation Entry`
 		WHERE voucher_type = 'Sales Order'
 		  AND voucher_no = %s
-		  AND status = 'Submitted'
+		  AND status NOT IN ('Closed', 'Delivered', 'Cancelled')
 		  AND docstatus = 1
 		""",
 		(so_name,),
@@ -477,7 +477,8 @@ def create_pick_ticket(
 	)
 	sres_by_detail: Dict[str, List[Any]] = {}
 	for sre in sre_rows:
-		sres_by_detail.setdefault(sre.voucher_detail_no, []).append(sre)
+		det_key = sre.get("voucher_detail_no") if isinstance(sre, dict) else getattr(sre, "voucher_detail_no", None)
+		sres_by_detail.setdefault(det_key, []).append(sre)
 
 	# 6. Build locations for native Pick List
 	locations_to_create = []
@@ -522,7 +523,10 @@ def create_pick_ticket(
 			assigned_batch = req.get("batch_no")
 			if so_item_id and so_item_id in sres_by_detail:
 				sre_list = sres_by_detail[so_item_id]
-				sre_warehouses = [s.warehouse for s in sre_list]
+				sre_warehouses = [
+					(s.get("warehouse") if isinstance(s, dict) else getattr(s, "warehouse", None))
+					for s in sre_list
+				]
 				if req_wh and req_wh not in sre_warehouses:
 					PICK_COUNTERS["reservation_mismatch"] += 1
 					PICK_COUNTERS["pick_requests_blocked"] += 1
@@ -531,9 +535,11 @@ def create_pick_ticket(
 							"Requested warehouse '{0}' for item '{1}' does not match reserved warehouse '{2}'."
 						).format(req_wh, item_code, ", ".join(sre_warehouses))
 					)
-				assigned_wh = sre_list[0].warehouse
-				if sre_list[0].batch_no:
-					assigned_batch = sre_list[0].batch_no
+				first_sre = sre_list[0]
+				assigned_wh = first_sre.get("warehouse") if isinstance(first_sre, dict) else getattr(first_sre, "warehouse", None)
+				first_batch = first_sre.get("batch_no") if isinstance(first_sre, dict) else getattr(first_sre, "batch_no", None)
+				if first_batch:
+					assigned_batch = first_batch
 
 			# Check physical stock availability in assigned warehouse
 			actual_stock = flt(
@@ -593,15 +599,18 @@ def create_pick_ticket(
 			if so_item_id in sres_by_detail:
 				# Honor active SRE warehouse allocations
 				for sre in sres_by_detail[so_item_id]:
-					sre_qty = flt(sre.reserved_qty)
+					sre_qty = flt(sre.get("reserved_qty") if isinstance(sre, dict) else getattr(sre, "reserved_qty", 0.0))
 					alloc_qty = min(rem_qty, sre_qty)
 					if alloc_qty <= 0:
 						continue
 
+					sre_wh = sre.get("warehouse") if isinstance(sre, dict) else getattr(sre, "warehouse", None)
+					sre_batch = sre.get("batch_no") if isinstance(sre, dict) else getattr(sre, "batch_no", None)
+
 					# Check stock in SRE warehouse
 					actual_stock = flt(
 						frappe.db.get_value(
-							"Bin", {"item_code": item_code, "warehouse": sre.warehouse}, "actual_qty"
+							"Bin", {"item_code": item_code, "warehouse": sre_wh}, "actual_qty"
 						) or 0.0
 					)
 					if actual_stock < alloc_qty:
@@ -610,7 +619,7 @@ def create_pick_ticket(
 						raise InsufficientStockError(
 							_(
 								"Insufficient stock in warehouse '{0}' for item '{1}': required {2}, available {3}."
-							).format(sre.warehouse, item_code, alloc_qty, actual_stock)
+							).format(sre_wh, item_code, alloc_qty, actual_stock)
 						)
 
 					item_meta = frappe.db.get_value("Item", item_code, ["item_name", "stock_uom"], as_dict=True)
@@ -618,7 +627,7 @@ def create_pick_ticket(
 						"item_code": item_code,
 						"item_name": item_meta.item_name if item_meta else item_code,
 						"sales_order": so_name,
-						"warehouse": sre.warehouse,
+						"warehouse": sre_wh,
 						"qty": alloc_qty,
 						"stock_qty": alloc_qty,
 						"conversion_factor": 1.0,
@@ -630,8 +639,8 @@ def create_pick_ticket(
 					else:
 						loc_row["sales_order_item"] = so_item_id
 
-					if getattr(sre, "batch_no", None):
-						loc_row["batch_no"] = sre.batch_no
+					if sre_batch:
+						loc_row["batch_no"] = sre_batch
 
 					locations_to_create.append(loc_row)
 					rem_qty -= alloc_qty
@@ -710,20 +719,48 @@ def create_pick_ticket(
 
 	# 8. Submit if requested
 	if submit:
-		# Native Pick List submission:
-		# PickList.before_submit() checks self.validate_sales_order(), which forbids creating a pick list
-		# for Sales Orders that have active reservations unless unreserved. However, in Bop ERP fulfillment,
-		# the Sales Order already holds active reservations (SREs).
-		# To strictly preserve all native validations (validate(), validate_stock_qty(), validate_expired_batches(),
-		# check_serial_no_status(), validate_with_previous_doc(), validate_picked_items()) WITHOUT using
-		# broad bypass flags like flags.ignore_validate = True, we selectively bypass only the conflicting
-		# single check validate_sales_order on the Pick List instance during submit.
-		# Broad bypasses (ignore_validate, ignore_mandatory, ignore_permissions) are strictly prohibited.
-		pl_doc.flags.ignore_validate = False
-		pl_doc.validate_sales_order = lambda: None
-		pl_doc.submit()
-		PICK_COUNTERS["pick_tickets_submitted"] += 1
-		logger.info("Submitted Pick Ticket '%s' for Sales Order '%s'.", pl_doc.name, so_name)
+		# Native ERPNext Pick List submission with transactional SRE transition:
+		# ERPNext requires stock reservations on the Sales Order to be released before Pick List submit.
+		# To preserve all native validations without monkey-patching or broad bypasses:
+		# 1. Acquire savepoint 'sp_pick_submit'.
+		# 2. Acquire deterministic Bin row locks.
+		# 3. Release active SREs via native so_doc.cancel_stock_reservation_entries(notify=False).
+		# 4. Submit Pick List with full native validations.
+		# 5. Rollback atomically if submission fails.
+		sp_submit = f"sp_pick_sub_{frappe.generate_hash(length=8)}"
+		frappe.db.savepoint(sp_submit)
+
+		try:
+			# Acquire exclusive row locks on Bins in deterministic alphabetical order
+			locs = pl_doc.get("locations") or []
+			unique_bins = sorted({
+				(
+					loc.get("item_code") if isinstance(loc, dict) else getattr(loc, "item_code", None),
+					loc.get("warehouse") if isinstance(loc, dict) else getattr(loc, "warehouse", None),
+				)
+				for loc in locs
+			})
+			for b_item, b_wh in unique_bins:
+				if b_item and b_wh:
+					frappe.db.sql(
+						"SELECT name FROM `tabBin` WHERE item_code = %s AND warehouse = %s FOR UPDATE",
+						(b_item, b_wh),
+					)
+
+			if sre_rows and hasattr(so_doc, "cancel_stock_reservation_entries"):
+				so_doc.cancel_stock_reservation_entries(notify=False)
+
+			pl_doc.flags.ignore_validate = False
+			pl_doc.flags.ignore_mandatory = False
+			pl_doc.flags.ignore_permissions = False
+			pl_doc.submit()
+			PICK_COUNTERS["pick_tickets_submitted"] += 1
+			logger.info("Submitted Pick Ticket '%s' for Sales Order '%s'.", pl_doc.name, so_name)
+		except Exception as sub_err:
+			frappe.db.rollback(save_point=sp_submit)
+			PICK_COUNTERS["failed"] += 1
+			logger.error("Failed to submit Pick Ticket '%s': %s", pl_doc.name, str(sub_err))
+			raise
 
 	return pl_doc
 
@@ -752,9 +789,111 @@ def cancel_pick_ticket(pick_ticket: Any) -> Any:
 		return pl_doc
 
 	if pl_doc.docstatus == 1:
-		pl_doc.cancel()
-		PICK_COUNTERS["pick_tickets_cancelled"] += 1
-		logger.info("Cancelled submitted Pick Ticket '%s'.", pl_doc.name)
+		sp_cancel = f"sp_pick_cnc_{frappe.generate_hash(length=8)}"
+		frappe.db.savepoint(sp_cancel)
+		try:
+			# Acquire exclusive row locks on Bins in deterministic alphabetical order
+			locs = pl_doc.get("locations") or []
+			unique_bins = sorted({
+				(
+					loc.get("item_code") if isinstance(loc, dict) else getattr(loc, "item_code", None),
+					loc.get("warehouse") if isinstance(loc, dict) else getattr(loc, "warehouse", None),
+				)
+				for loc in locs
+			})
+			for b_item, b_wh in unique_bins:
+				if b_item and b_wh:
+					frappe.db.sql(
+						"SELECT name FROM `tabBin` WHERE item_code = %s AND warehouse = %s FOR UPDATE",
+						(b_item, b_wh),
+					)
+
+			pl_doc.cancel()
+			PICK_COUNTERS["pick_tickets_cancelled"] += 1
+			logger.info("Cancelled submitted Pick Ticket '%s'.", pl_doc.name)
+
+			# Restore Stock Reservation Entries for imported or reserved Sales Orders
+			so_cache: Dict[str, Any] = {}
+			for loc in locs:
+				so_name = loc.get("sales_order") if isinstance(loc, dict) else getattr(loc, "sales_order", None)
+				if not so_name:
+					continue
+
+				if so_name not in so_cache:
+					so_cache[so_name] = frappe.get_doc("Sales Order", so_name)
+				so_inst = so_cache[so_name]
+
+				if is_imported_sales_order(so_inst) or so_inst.get("reserve_stock"):
+					so_item_id = (
+						(loc.get("sales_order_item") or loc.get("product_bundle_item"))
+						if isinstance(loc, dict)
+						else (getattr(loc, "sales_order_item", None) or getattr(loc, "product_bundle_item", None))
+					)
+					loc_qty = flt(loc.get("qty") if isinstance(loc, dict) else getattr(loc, "qty", 0.0))
+					if loc_qty <= 0:
+						continue
+
+					loc_item = loc.get("item_code") if isinstance(loc, dict) else getattr(loc, "item_code", None)
+					loc_wh = loc.get("warehouse") if isinstance(loc, dict) else getattr(loc, "warehouse", None)
+					loc_uom = loc.get("stock_uom") if isinstance(loc, dict) else getattr(loc, "stock_uom", None)
+					loc_batch = loc.get("batch_no") if isinstance(loc, dict) else getattr(loc, "batch_no", None)
+					loc_name = loc.get("name") if isinstance(loc, dict) else getattr(loc, "name", "loc")
+
+					so_item_stock_qty = flt(
+						frappe.db.get_value("Sales Order Item", so_item_id, "stock_qty") or loc_qty
+					)
+
+					sre = frappe.new_doc("Stock Reservation Entry")
+					sre.item_code = loc_item
+					sre.warehouse = loc_wh
+					sre.voucher_type = "Sales Order"
+					sre.voucher_no = so_name
+					sre.voucher_detail_no = so_item_id
+					sre.voucher_qty = so_item_stock_qty
+					sre.reserved_qty = loc_qty
+					sre.company = pl_doc.company
+					sre.stock_uom = loc_uom or "Nos"
+					sre.reservation_based_on = "Qty"
+					sre.available_qty = max(
+						loc_qty,
+						flt(frappe.db.get_value("Bin", {"item_code": loc_item, "warehouse": loc_wh}, "actual_qty") or 0.0),
+					)
+
+					if loc_batch:
+						sre.has_batch_no = 1
+						sre.batch_no = loc_batch
+
+					from erpnext.stock.utils import get_stock_balance
+					if get_stock_balance(loc_item, loc_wh) < loc_qty:
+						sre.flags.ignore_validate = True
+
+					sre.insert(ignore_permissions=True)
+					sre.submit()
+
+					irr_key = f"IRR-{so_name}-{loc_name}-restore"
+					if not frappe.db.exists("Inventory Reservation Reference", {"idempotency_key": irr_key}):
+						ref = frappe.get_doc({
+							"doctype": "Inventory Reservation Reference",
+							"idempotency_key": irr_key,
+							"stock_reservation_entry": sre.name,
+							"sales_channel": pl_doc.get("sales_channel"),
+							"item_code": loc_item,
+							"warehouse": loc_wh,
+							"reserved_qty": loc_qty,
+							"source_doctype": "Sales Order",
+							"source_document": so_name,
+							"source_detail_docname": so_item_id,
+							"external_order_id": pl_doc.get("external_order_id"),
+							"status": "Reserved",
+						})
+						ref.insert(ignore_permissions=True)
+
+		except Exception as cnc_err:
+			frappe.db.rollback(save_point=sp_cancel)
+			PICK_COUNTERS["failed"] += 1
+			logger.error("Failed to cancel Pick Ticket '%s': %s", pl_doc.name, str(cnc_err))
+			raise
+
 	elif pl_doc.docstatus == 0:
 		# For draft, delete through native frappe lifecycle
 		pl_name = pl_doc.name

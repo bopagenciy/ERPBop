@@ -719,3 +719,108 @@ class TestPickTicketUnit(FrappeTestCase):
 			with self.assertRaises(frappe.ValidationError):
 				pl.validate_stock_qty()
 
+	# -------------------------------------------------------------------------
+	# 27. Zero runtime monkey-patching of Pick List validation methods
+	# -------------------------------------------------------------------------
+	def test_27_zero_monkeypatching_of_native_pick_list_methods(self):
+		"""
+		Phase 1M.2 Hardening Proof:
+		Neither create_pick_ticket nor cancel_pick_ticket monkeypatches
+		validate_sales_order, validate, or before_submit.
+		"""
+		from erpnext.stock.doctype.pick_list.pick_list import PickList
+
+		so = self._make_mock_so()
+		mock_pl = frappe._dict(
+			name="PL-M2-CHECK",
+			company=so.company,
+			locations=[],
+			flags=frappe._dict(),
+			append=lambda f, r: mock_pl.locations.append(r),
+			insert=MagicMock(),
+			submit=MagicMock(),
+		)
+
+		original_vso = PickList.validate_sales_order
+
+		with patch("frappe.db.sql", return_value=[]), \
+		     patch("bop_erp.fulfillment.pick_ticket.assert_sales_order_ready_for_picking", return_value=so), \
+		     patch("bop_erp.fulfillment.pick_ticket.get_remaining_to_pick") as mock_rem, \
+		     patch("frappe.db.get_value") as mock_gv, \
+		     patch("frappe.new_doc", return_value=mock_pl):
+
+			mock_rem.return_value = {
+				"total_remaining": 5.0,
+				"items": [{
+					"sales_order_item": "SOI-001",
+					"item_code": "SKU-STOCK-01",
+					"warehouse": "Stores - _TC",
+					"remaining_to_pick": 5.0,
+					"is_stock_item": True,
+				}],
+			}
+			mock_gv.side_effect = lambda dt, name_or_filt, field=None, *args, **kwargs: (
+				10.0 if dt == "Bin" else frappe._dict(item_name="Item 1", stock_uom="Nos")
+			)
+
+			pl = create_pick_ticket(so.name, submit=True)
+
+			# Ensure validate_sales_order was never replaced with a lambda or mock
+			self.assertNotIn("validate_sales_order", pl)
+			self.assertEqual(PickList.validate_sales_order, original_vso)
+
+	# -------------------------------------------------------------------------
+	# 28. Native SRE release transition executed on submit
+	# -------------------------------------------------------------------------
+	def test_28_native_sre_release_transition_on_submit(self):
+		"""
+		Phase 1M.2 Hardening Proof:
+		When active SREs exist on the Sales Order, they are released using
+		native so_doc.cancel_stock_reservation_entries(notify=False) prior to submit.
+		"""
+		so = self._make_mock_so()
+		so.cancel_stock_reservation_entries = MagicMock()
+		mock_pl = frappe._dict(
+			name="PL-M2-SRE-CHECK",
+			company=so.company,
+			locations=[],
+			flags=frappe._dict(),
+			append=lambda f, r: mock_pl.locations.append(r),
+			insert=MagicMock(),
+			submit=MagicMock(),
+		)
+
+		mock_sres = [{"name": "SRE-001", "item_code": "SKU-STOCK-01", "warehouse": "Stores - _TC", "voucher_detail_no": "SOI-001", "reserved_qty": 5.0}]
+
+		def sql_side_effect(query, params=None, *args, **kwargs):
+			if "tabStock Reservation Entry" in query:
+				return mock_sres
+			return []
+
+		with patch("frappe.db.sql", side_effect=sql_side_effect), \
+		     patch("bop_erp.fulfillment.pick_ticket.assert_sales_order_ready_for_picking", return_value=so), \
+		     patch("bop_erp.fulfillment.pick_ticket.get_remaining_to_pick") as mock_rem, \
+		     patch("frappe.db.get_value") as mock_gv, \
+		     patch("frappe.new_doc", return_value=mock_pl):
+
+			mock_rem.return_value = {
+				"total_remaining": 5.0,
+				"items": [{
+					"sales_order_item": "SOI-001",
+					"item_code": "SKU-STOCK-01",
+					"warehouse": "Stores - _TC",
+					"remaining_to_pick": 5.0,
+					"is_stock_item": True,
+				}],
+			}
+			mock_gv.side_effect = lambda dt, name_or_filt, field=None, *args, **kwargs: (
+				10.0 if dt == "Bin" else frappe._dict(item_name="Item 1", stock_uom="Nos")
+			)
+
+			pl = create_pick_ticket(so.name, submit=True)
+
+			so.cancel_stock_reservation_entries.assert_called_once_with(notify=False)
+			mock_pl.submit.assert_called_once()
+
+
+

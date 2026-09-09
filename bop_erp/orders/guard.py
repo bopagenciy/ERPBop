@@ -71,13 +71,77 @@ def assert_sales_order_ready_for_fulfillment(so_name: Optional[str]) -> None:
 
 		is_complete, missing = is_order_ingestion_complete(so_name)
 		if not is_complete:
-			frappe.throw(
-				_(
-					"Operational Guard Violation: Sales Order '{0}' has incomplete stock reservations: {1}."
-				).format(so_name, "; ".join(missing)),
-				exc=OperationalGuardError,
-				title=_("Operational Guard Incomplete Reservations"),
-			)
+			# If SREs are missing, check if this SO is actively covered by downstream fulfillment
+			# (Pick List allocations or deliveries)
+			is_covered = _check_sales_order_fulfillment_coverage(so_name)
+			if not is_covered:
+				frappe.throw(
+					_(
+						"Operational Guard Violation: Sales Order '{0}' has incomplete stock reservations: {1}."
+					).format(so_name, "; ".join(missing)),
+					exc=OperationalGuardError,
+					title=_("Operational Guard Incomplete Reservations"),
+				)
+
+
+def _check_sales_order_fulfillment_coverage(so_name: str) -> bool:
+	"""
+	Checks whether unreserved items on a Sales Order are fully covered by active Pick Lists or delivery.
+	When ERPNext transitions from Stock Reservation Entries to Pick List, SREs are unreserved
+	prior to Pick List submission. During and after this transition, the Sales Order items are covered
+	by Pick List Item allocations (docstatus 0 or 1, status not Cancelled).
+	"""
+	from frappe.utils import flt
+
+	so_doc = frappe.get_doc("Sales Order", so_name)
+	items_to_check = getattr(so_doc, "packed_items", None) or so_doc.get("items") or []
+	if not items_to_check:
+		return False
+
+	for item in items_to_check:
+		req_qty = flt(item.qty if not isinstance(item, dict) else item.get("qty", 0.0))
+		if req_qty <= 0:
+			continue
+
+		item_name = item.name if not isinstance(item, dict) else item.get("name")
+
+		# 1. Active SREs
+		sres = frappe.get_all(
+			"Stock Reservation Entry",
+			filters={
+				"voucher_type": "Sales Order",
+				"voucher_no": so_name,
+				"voucher_detail_no": item_name,
+				"docstatus": 1,
+				"status": ["not in", ["Closed", "Delivered", "Cancelled"]],
+			},
+			fields=["reserved_qty"],
+		)
+		sre_qty = sum(flt(s.get("reserved_qty") if isinstance(s, dict) else getattr(s, "reserved_qty", 0)) for s in sres)
+
+		# 2. Active Pick Lists (draft docstatus=0 or submitted docstatus=1)
+		pl_res = frappe.db.sql(
+			"""
+			SELECT SUM(pli.qty) as pick_qty
+			FROM `tabPick List Item` pli
+			JOIN `tabPick List` pl ON pl.name = pli.parent
+			WHERE pli.sales_order = %s
+			  AND (pli.sales_order_item = %s OR pli.product_bundle_item = %s)
+			  AND pl.docstatus IN (0, 1)
+			  AND pl.status NOT IN ('Cancelled')
+			""",
+			(so_name, item_name, item_name),
+			as_dict=True,
+		)
+		pl_qty = flt(pl_res[0].pick_qty) if pl_res and pl_res[0].pick_qty else 0.0
+
+		# 3. Delivered qty
+		deliv_qty = flt(item.delivered_qty if not isinstance(item, dict) else item.get("delivered_qty", 0.0))
+
+		if (sre_qty + pl_qty + deliv_qty) < req_qty:
+			return False
+
+	return True
 
 
 def validate_operational_guard(doc, method=None) -> None:
