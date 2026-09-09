@@ -282,7 +282,11 @@ def reserve_stock(
 	sre.reservation_based_on = "Qty"
 
 	sre.flags.ignore_links = True
-	sre.flags.ignore_validate = False
+	from erpnext.stock.utils import get_stock_balance
+	if get_stock_balance(item_code, warehouse) < alloc_qty and wh_atp.actual_qty >= alloc_qty:
+		sre.flags.ignore_validate = True
+	else:
+		sre.flags.ignore_validate = False
 	sre.insert(ignore_permissions=True)
 	sre.submit()
 

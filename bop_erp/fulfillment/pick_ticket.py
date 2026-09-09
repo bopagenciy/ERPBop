@@ -488,6 +488,20 @@ def create_pick_ticket(
 
 	if requested_lines is not None:
 		# Caller specified exact lines
+		# Phase 1M Policy A: Automated submitted Pick Tickets must cover the complete remaining
+		# fulfillment scope of the Sales Order. Partial-scope picking is supported ONLY in Draft (submit=False).
+		if submit:
+			total_requested = sum(flt(r.get("qty")) for r in requested_lines)
+			if total_requested < remaining_info["total_remaining"]:
+				PICK_COUNTERS["pick_requests_blocked"] += 1
+				raise PartialPickBlockedError(
+					_(
+						"Partial-scope pick submission blocked: automated submitted Pick Tickets must cover "
+						"the complete remaining fulfillment scope of Sales Order '{0}' (requested: {1}, remaining: {2}). "
+						"Partial picks may only be saved in Draft status."
+					).format(so_name, total_requested, remaining_info["total_remaining"])
+				)
+
 		if not allow_partial:
 			# Verify all pickable items are present and cover total remaining
 			req_so_items = {r.get("sales_order_item") for r in requested_lines if r.get("sales_order_item")}
@@ -839,54 +853,21 @@ def cancel_pick_ticket(pick_ticket: Any) -> Any:
 					loc_batch = loc.get("batch_no") if isinstance(loc, dict) else getattr(loc, "batch_no", None)
 					loc_name = loc.get("name") if isinstance(loc, dict) else getattr(loc, "name", "loc")
 
-					so_item_stock_qty = flt(
-						frappe.db.get_value("Sales Order Item", so_item_id, "stock_qty") or loc_qty
+					from bop_erp.inventory.reservations import reserve_stock
+
+					reserve_stock(
+						item_code=loc_item,
+						warehouse=loc_wh,
+						requested_qty=loc_qty,
+						voucher_type="Sales Order",
+						voucher_no=so_name,
+						voucher_detail_no=so_item_id,
+						allow_partial=False,
+						idempotency_key=f"IRR-{so_name}-{loc_name}-restore",
+						source_doctype="Sales Order",
+						source_document=so_name,
+						source_document_item=so_item_id,
 					)
-
-					sre = frappe.new_doc("Stock Reservation Entry")
-					sre.item_code = loc_item
-					sre.warehouse = loc_wh
-					sre.voucher_type = "Sales Order"
-					sre.voucher_no = so_name
-					sre.voucher_detail_no = so_item_id
-					sre.voucher_qty = so_item_stock_qty
-					sre.reserved_qty = loc_qty
-					sre.company = pl_doc.company
-					sre.stock_uom = loc_uom or "Nos"
-					sre.reservation_based_on = "Qty"
-					sre.available_qty = max(
-						loc_qty,
-						flt(frappe.db.get_value("Bin", {"item_code": loc_item, "warehouse": loc_wh}, "actual_qty") or 0.0),
-					)
-
-					if loc_batch:
-						sre.has_batch_no = 1
-						sre.batch_no = loc_batch
-
-					from erpnext.stock.utils import get_stock_balance
-					if get_stock_balance(loc_item, loc_wh) < loc_qty:
-						sre.flags.ignore_validate = True
-
-					sre.insert(ignore_permissions=True)
-					sre.submit()
-
-					irr_key = f"IRR-{so_name}-{loc_name}-restore"
-					if not frappe.db.exists("Inventory Reservation Reference", {"idempotency_key": irr_key}):
-						ref = frappe.get_doc({
-							"doctype": "Inventory Reservation Reference",
-							"idempotency_key": irr_key,
-							"stock_reservation_entry": sre.name,
-							"sales_channel": pl_doc.get("sales_channel"),
-							"item_code": loc_item,
-							"warehouse": loc_wh,
-							"reserved_qty": loc_qty,
-							"source_doctype": "Sales Order",
-							"source_document": so_name,
-							"source_detail_docname": so_item_id,
-							"external_order_id": pl_doc.get("external_order_id"),
-							"status": "Reserved",
-						})
-						ref.insert(ignore_permissions=True)
 
 		except Exception as cnc_err:
 			frappe.db.rollback(save_point=sp_cancel)

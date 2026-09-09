@@ -657,10 +657,25 @@ class TestPickTicketLive(unittest.TestCase):
 		sre2.insert(ignore_permissions=True)
 		sre2.submit()
 
+		# Update stock_qty and Bins to align reservation status
+		frappe.db.set_value("Sales Order", so.name, "status", "To Deliver and Bill")
+		frappe.db.set_value("Sales Order Item", so.items[0].name, "stock_qty", 2.0)
+		frappe.db.set_value("Sales Order Item", so.items[1].name, "stock_qty", 3.0)
+		frappe.db.set_value(
+			"Bin",
+			{"item_code": self.item_code, "warehouse": self.wh_shared},
+			{"reserved_stock": 2.0, "reserved_qty": 2.0},
+		)
+		frappe.db.set_value(
+			"Bin",
+			{"item_code": self.item_code_2, "warehouse": self.wh_secondary},
+			{"reserved_stock": 3.0, "reserved_qty": 3.0},
+		)
 		frappe.db.commit()
 
-		# Create Pick Ticket
-		pl = create_pick_ticket(so.name)
+		# Create & submit Pick Ticket: reservations transition safely to Pick List
+		pl = create_pick_ticket(so.name, submit=True)
+		self.assertEqual(pl.docstatus, 1)
 		self.assertEqual(len(pl.locations), 2)
 
 		# Assert exact warehouse mapping matches SRE allocations
@@ -671,6 +686,20 @@ class TestPickTicketLive(unittest.TestCase):
 		self.assertEqual(flt(loc1.qty), 2.0)
 		self.assertEqual(loc2.warehouse, self.wh_secondary)
 		self.assertEqual(flt(loc2.qty), 3.0)
+
+		# Cancel Pick Ticket: supported reservation service restores Item A -> Wh A, Item B -> Wh B
+		cancelled_pl = cancel_pick_ticket(pl.name)
+		self.assertEqual(cancelled_pl.docstatus, 2)
+
+		sres = frappe.db.get_all(
+			"Stock Reservation Entry",
+			filters={"voucher_no": so.name, "docstatus": 1},
+			fields=["item_code", "warehouse", "reserved_qty"],
+		)
+		self.assertEqual(len(sres), 2)
+		sre_wh_map = {s.item_code: (s.warehouse, flt(s.reserved_qty)) for s in sres}
+		self.assertEqual(sre_wh_map[self.item_code], (self.wh_shared, 2.0))
+		self.assertEqual(sre_wh_map[self.item_code_2], (self.wh_secondary, 3.0))
 
 	# =========================================================================
 	# Scenario G: Non-READY imported order blocks pick ticket

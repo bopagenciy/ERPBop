@@ -31,6 +31,7 @@ from bop_erp.fulfillment import (
 )
 from bop_erp.orders.reconciliation import audit_sales_order_cancellation_safety
 from bop_erp.safety import assert_safe_connector_target, assert_safe_write_target, ConnectorSafetyError
+from bop_erp.inventory.exceptions import InsufficientStockToReserveError
 
 
 class TestPickTicketUnit(FrappeTestCase):
@@ -821,6 +822,276 @@ class TestPickTicketUnit(FrappeTestCase):
 
 			so.cancel_stock_reservation_entries.assert_called_once_with(notify=False)
 			mock_pl.submit.assert_called_once()
+
+	# -------------------------------------------------------------------------
+	# 29. Partial-scope pick submission blocked under Policy A
+	# -------------------------------------------------------------------------
+	def test_29_partial_scope_pick_submission_blocked_under_policy_a(self):
+		"""
+		Phase 1M.3 Pick Scope Safety Proof (Policy A):
+		Sales Order has Item A (qty 5) and Item B (qty 5).
+		If requested_lines covers only Item A:
+		- submit=True is blocked with PartialPickBlockedError.
+		- submit=False succeeds as Draft Pick Ticket.
+		"""
+		so = self._make_mock_so(
+			items=[
+				frappe._dict(name="SOI-001", item_code="SKU-A", qty=5.0, delivered_qty=0.0, picked_qty=0.0, warehouse="WH-A"),
+				frappe._dict(name="SOI-002", item_code="SKU-B", qty=5.0, delivered_qty=0.0, picked_qty=0.0, warehouse="WH-B"),
+			]
+		)
+		mock_pl = frappe._dict(
+			name="PL-PARTIAL-001",
+			company=so.company,
+			locations=[],
+			flags=frappe._dict(),
+			docstatus=0,
+			append=lambda f, r: mock_pl.locations.append(r),
+			insert=MagicMock(),
+			submit=MagicMock(),
+		)
+
+		partial_lines = [
+			{"sales_order_item": "SOI-001", "item_code": "SKU-A", "warehouse": "WH-A", "qty": 5.0}
+		]
+
+		with patch("frappe.db.sql", return_value=[]), \
+		     patch("bop_erp.fulfillment.pick_ticket.assert_sales_order_ready_for_picking", return_value=so), \
+		     patch("bop_erp.fulfillment.pick_ticket.get_remaining_to_pick") as mock_rem, \
+		     patch("frappe.db.get_value") as mock_gv, \
+		     patch("frappe.new_doc", return_value=mock_pl):
+
+			mock_rem.return_value = {
+				"total_remaining": 10.0,
+				"items": [
+					{"sales_order_item": "SOI-001", "item_code": "SKU-A", "warehouse": "WH-A", "remaining_to_pick": 5.0, "is_stock_item": True},
+					{"sales_order_item": "SOI-002", "item_code": "SKU-B", "warehouse": "WH-B", "remaining_to_pick": 5.0, "is_stock_item": True},
+				],
+			}
+			mock_gv.side_effect = lambda dt, name_or_filt, field=None, *args, **kwargs: (
+				10.0 if dt == "Bin" else frappe._dict(item_name="Item", stock_uom="Nos")
+			)
+
+			# 1. submit=True must raise PartialPickBlockedError under Policy A
+			with self.assertRaises(PartialPickBlockedError):
+				create_pick_ticket(so.name, requested_lines=partial_lines, allow_partial=True, submit=True)
+
+			# 2. submit=False must succeed as Draft
+			pl_draft = create_pick_ticket(so.name, requested_lines=partial_lines, allow_partial=True, submit=False)
+			self.assertEqual(pl_draft.name, "PL-PARTIAL-001")
+			self.assertEqual(pl_draft.docstatus, 0)
+
+	# -------------------------------------------------------------------------
+	# 30. Restoration failure atomicity rollback
+	# -------------------------------------------------------------------------
+	def test_30_restoration_failure_atomicity_rollback(self):
+		"""
+		Phase 1M.3 Restoration Failure Atomicity Proof:
+		Failure during reserve_stock after Pick List cancel rolls back to savepoint.
+		Pick List remains submitted, no partial SRE recreation committed.
+		"""
+		mock_pl = frappe._dict(
+			name="PL-RESTORE-FAIL",
+			docstatus=1,
+			company="_Test Company",
+			locations=[{
+				"name": "LOC-001",
+				"item_code": "SKU-STOCK-01",
+				"warehouse": "Stores - _TC",
+				"qty": 5.0,
+				"stock_uom": "Nos",
+				"sales_order": "SO-TEST-001",
+				"sales_order_item": "SOI-001",
+			}],
+			cancel=MagicMock(),
+		)
+		so = self._make_mock_so()
+
+		with patch("frappe.db.exists", return_value=True), \
+		     patch("frappe.get_doc", side_effect=lambda dt, name=None: mock_pl if dt == "Pick List" else so), \
+		     patch("frappe.db.savepoint") as mock_sp, \
+		     patch("frappe.db.rollback") as mock_rb, \
+		     patch("frappe.db.sql", return_value=[]), \
+		     patch("bop_erp.inventory.reservations.reserve_stock", side_effect=RuntimeError("Simulated SRE restoration failure")):
+
+			with self.assertRaises(RuntimeError):
+				cancel_pick_ticket(mock_pl)
+
+			# Verify savepoint was rolled back
+			mock_sp.assert_called_once()
+			sp_name = mock_sp.call_args[0][0]
+			mock_rb.assert_called_once_with(save_point=sp_name)
+			counters = get_pick_counters()
+			self.assertGreaterEqual(counters["failed"], 1)
+
+	# -------------------------------------------------------------------------
+	# 31. Submit failure atomicity rollback
+	# -------------------------------------------------------------------------
+	def test_31_submit_failure_atomicity_rollback(self):
+		"""
+		Phase 1M.3 Submit Failure Atomicity Proof:
+		SRE release succeeds, but pl_doc.submit() fails.
+		Transaction rolls back to sp_submit savepoint, leaving Pick List draft.
+		"""
+		so = self._make_mock_so()
+		so.cancel_stock_reservation_entries = MagicMock()
+
+		mock_pl = frappe._dict(
+			name="PL-SUBMIT-FAIL",
+			company=so.company,
+			locations=[],
+			flags=frappe._dict(),
+			append=lambda f, r: mock_pl.locations.append(r),
+			insert=MagicMock(),
+			submit=MagicMock(side_effect=frappe.ValidationError("Simulated Pick List submit failure")),
+		)
+
+		mock_sres = [{"name": "SRE-001", "item_code": "SKU-STOCK-01", "warehouse": "Stores - _TC", "voucher_detail_no": "SOI-001", "reserved_qty": 5.0}]
+
+		def sql_side_effect(query, params=None, *args, **kwargs):
+			if "tabStock Reservation Entry" in query:
+				return mock_sres
+			return []
+
+		with patch("frappe.db.sql", side_effect=sql_side_effect), \
+		     patch("bop_erp.fulfillment.pick_ticket.assert_sales_order_ready_for_picking", return_value=so), \
+		     patch("bop_erp.fulfillment.pick_ticket.get_remaining_to_pick") as mock_rem, \
+		     patch("frappe.db.get_value") as mock_gv, \
+		     patch("frappe.db.savepoint") as mock_sp, \
+		     patch("frappe.db.rollback") as mock_rb, \
+		     patch("frappe.new_doc", return_value=mock_pl):
+
+			mock_rem.return_value = {
+				"total_remaining": 5.0,
+				"items": [{
+					"sales_order_item": "SOI-001",
+					"item_code": "SKU-STOCK-01",
+					"warehouse": "Stores - _TC",
+					"remaining_to_pick": 5.0,
+					"is_stock_item": True,
+				}],
+			}
+			mock_gv.side_effect = lambda dt, name_or_filt, field=None, *args, **kwargs: (
+				10.0 if dt == "Bin" else frappe._dict(item_name="Item 1", stock_uom="Nos")
+			)
+
+			with self.assertRaises(frappe.ValidationError):
+				create_pick_ticket(so.name, submit=True)
+
+			# Verify savepoint acquired and rolled back
+			mock_sp.assert_called_once()
+			sp_name = mock_sp.call_args[0][0]
+			mock_rb.assert_called_once_with(save_point=sp_name)
+			counters = get_pick_counters()
+			self.assertGreaterEqual(counters["failed"], 1)
+
+	# -------------------------------------------------------------------------
+	# 32. Concurrent competing reservation blocks oversell
+	# -------------------------------------------------------------------------
+	def test_32_concurrent_competing_reservation_blocks_oversell(self):
+		"""
+		Phase 1M.3 Concurrent Competing Reservation Safety:
+		When Worker A transitions SRE to Pick Ticket, Worker B attempts to reserve
+		the same physical stock for another order.
+		Because available ATP = 0, Worker B is rejected with InsufficientStockToReserveError.
+		"""
+		from bop_erp.inventory.reservations import reserve_stock
+
+		mock_atp = frappe._dict(
+			actual_qty=5.0,
+			effective_reserved_qty=5.0,
+			safety_stock_qty=0.0,
+			candidate_atp_qty=0.0,
+		)
+
+		with patch("bop_erp.inventory.reservations.get_warehouse_atp", return_value=mock_atp), \
+		     patch("bop_erp.inventory.reservations.lock_inventory_scope"):
+
+			# Worker B requests 3 units -> must raise InsufficientStockToReserveError
+			with self.assertRaises(InsufficientStockToReserveError):
+				reserve_stock(
+					item_code="SKU-STOCK-01",
+					warehouse="Stores - _TC",
+					requested_qty=3.0,
+					voucher_type="Sales Order",
+					voucher_no="SO-WORKER-B",
+					voucher_detail_no="SOI-WB-001",
+					allow_partial=False,
+				)
+
+	# -------------------------------------------------------------------------
+	# 33. Multi-warehouse reservation restoration preserves exact warehouse
+	# -------------------------------------------------------------------------
+	def test_33_multi_warehouse_reservation_restoration_exact_warehouse(self):
+		"""
+		Phase 1M.3 Multi-Warehouse Restoration Proof:
+		Pick Ticket with items across multiple warehouses:
+		Item A -> WH-A (qty 2)
+		Item B -> WH-B (qty 3)
+		When cancelled, reserve_stock is invoked for each item targeting its
+		original warehouse exactly. Zero warehouse drift.
+		"""
+		mock_pl = frappe._dict(
+			name="PL-MULTI-RESTORE",
+			docstatus=1,
+			company="_Test Company",
+			locations=[
+				{
+					"name": "LOC-001",
+					"item_code": "SKU-A",
+					"warehouse": "WH-A",
+					"qty": 2.0,
+					"stock_uom": "Nos",
+					"sales_order": "SO-MULTI-001",
+					"sales_order_item": "SOI-A",
+				},
+				{
+					"name": "LOC-002",
+					"item_code": "SKU-B",
+					"warehouse": "WH-B",
+					"qty": 3.0,
+					"stock_uom": "Nos",
+					"sales_order": "SO-MULTI-001",
+					"sales_order_item": "SOI-B",
+				},
+			],
+			cancel=MagicMock(),
+		)
+		so = self._make_mock_so(
+			name="SO-MULTI-001",
+			items=[
+				frappe._dict(name="SOI-A", item_code="SKU-A", qty=2.0, delivered_qty=0.0, picked_qty=0.0, warehouse="WH-A"),
+				frappe._dict(name="SOI-B", item_code="SKU-B", qty=3.0, delivered_qty=0.0, picked_qty=0.0, warehouse="WH-B"),
+			]
+		)
+
+		with patch("frappe.db.exists", return_value=True), \
+		     patch("frappe.get_doc", side_effect=lambda dt, name=None: mock_pl if dt == "Pick List" else so), \
+		     patch("frappe.db.savepoint"), \
+		     patch("frappe.db.sql", return_value=[]), \
+		     patch("bop_erp.inventory.reservations.reserve_stock") as mock_reserve:
+
+			cancelled = cancel_pick_ticket(mock_pl)
+
+			self.assertEqual(cancelled.name, "PL-MULTI-RESTORE")
+			self.assertEqual(mock_reserve.call_count, 2)
+
+			# Verify call 1: Item A restored to WH-A
+			call1 = mock_reserve.call_args_list[0][1]
+			self.assertEqual(call1["item_code"], "SKU-A")
+			self.assertEqual(call1["warehouse"], "WH-A")
+			self.assertEqual(call1["requested_qty"], 2.0)
+			self.assertEqual(call1["voucher_no"], "SO-MULTI-001")
+			self.assertEqual(call1["voucher_detail_no"], "SOI-A")
+
+			# Verify call 2: Item B restored to WH-B
+			call2 = mock_reserve.call_args_list[1][1]
+			self.assertEqual(call2["item_code"], "SKU-B")
+			self.assertEqual(call2["warehouse"], "WH-B")
+			self.assertEqual(call2["requested_qty"], 3.0)
+			self.assertEqual(call2["voucher_no"], "SO-MULTI-001")
+			self.assertEqual(call2["voucher_detail_no"], "SOI-B")
+
 
 
 
