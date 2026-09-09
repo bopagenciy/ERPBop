@@ -474,6 +474,11 @@ class TestPickTicketLive(unittest.TestCase):
 		self.assertEqual(pl.docstatus, 1)
 		self.assertEqual(get_pick_ticket_status(pl), PickTicketStatus.PICKING)
 
+		# Phase 1M.1 Hardening Assertion: flags.ignore_validate must NOT be True
+		self.assertFalse(bool(pl.flags.get("ignore_validate")), "flags.ignore_validate must be False on submitted Pick List")
+		self.assertFalse(bool(pl.flags.get("ignore_mandatory")), "flags.ignore_mandatory must be False on submitted Pick List")
+		self.assertFalse(bool(pl.flags.get("ignore_permissions")), "flags.ignore_permissions must be False on submitted Pick List")
+
 		# Invariant: ATP is strictly unchanged (still 7.0)
 		atp_after = get_channel_atp(self.item_code, self.channel_a)
 		self.assertEqual(atp_after.aggregate_atp_qty, 7.0)

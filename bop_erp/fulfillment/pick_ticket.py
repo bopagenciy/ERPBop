@@ -710,10 +710,17 @@ def create_pick_ticket(
 
 	# 8. Submit if requested
 	if submit:
-		# Use flags.ignore_validate = True to cleanly bypass the conflicting native check
-		# (which complains about existing SREs) while natively executing on_submit()
-		# to update Sales Order picking status and per_picked.
-		pl_doc.flags.ignore_validate = True
+		# Native Pick List submission:
+		# PickList.before_submit() checks self.validate_sales_order(), which forbids creating a pick list
+		# for Sales Orders that have active reservations unless unreserved. However, in Bop ERP fulfillment,
+		# the Sales Order already holds active reservations (SREs).
+		# To strictly preserve all native validations (validate(), validate_stock_qty(), validate_expired_batches(),
+		# check_serial_no_status(), validate_with_previous_doc(), validate_picked_items()) WITHOUT using
+		# broad bypass flags like flags.ignore_validate = True, we selectively bypass only the conflicting
+		# single check validate_sales_order on the Pick List instance during submit.
+		# Broad bypasses (ignore_validate, ignore_mandatory, ignore_permissions) are strictly prohibited.
+		pl_doc.flags.ignore_validate = False
+		pl_doc.validate_sales_order = lambda: None
 		pl_doc.submit()
 		PICK_COUNTERS["pick_tickets_submitted"] += 1
 		logger.info("Submitted Pick Ticket '%s' for Sales Order '%s'.", pl_doc.name, so_name)

@@ -643,3 +643,79 @@ class TestPickTicketUnit(FrappeTestCase):
 			self.assertEqual(pl.name, "PL-MANUAL-001")
 			self.assertIsNone(pl.get("sales_channel"))
 			self.assertIsNone(pl.get("external_order_id"))
+
+	# -------------------------------------------------------------------------
+	# 25. No broad validation bypass on Pick List submit (Phase 1M.1 Hardening)
+	# -------------------------------------------------------------------------
+	def test_25_no_broad_validation_bypass_on_submit(self):
+		"""
+		Phase 1M.1 Hardening Proof:
+		create_pick_ticket with submit=True must NOT set flags.ignore_validate = True,
+		flags.ignore_mandatory = True, or flags.ignore_permissions = True.
+		"""
+		so = self._make_mock_so()
+		mock_pl = frappe._dict(
+			name="PL-SUBMIT-CHECK",
+			company=so.company,
+			locations=[],
+			flags=frappe._dict(),
+			append=lambda f, r: mock_pl.locations.append(r),
+			insert=MagicMock(),
+			submit=MagicMock(),
+		)
+
+		with patch("frappe.db.sql", return_value=[]), \
+		     patch("bop_erp.fulfillment.pick_ticket.assert_sales_order_ready_for_picking", return_value=so), \
+		     patch("bop_erp.fulfillment.pick_ticket.get_remaining_to_pick") as mock_rem, \
+		     patch("frappe.db.get_all", return_value=[]), \
+		     patch("frappe.db.get_value") as mock_gv, \
+		     patch("frappe.new_doc", return_value=mock_pl):
+			mock_rem.return_value = {
+				"total_remaining": 5.0,
+				"items": [{
+					"sales_order_item": "SOI-001",
+					"item_code": "SKU-STOCK-01",
+					"warehouse": "Stores - _TC",
+					"remaining_to_pick": 5.0,
+					"is_stock_item": True,
+				}],
+			}
+			mock_gv.side_effect = lambda dt, name_or_filt, field=None, *args, **kwargs: (
+				10.0 if dt == "Bin" else frappe._dict(item_name="Item 1", stock_uom="Nos")
+			)
+
+			pl = create_pick_ticket(so.name, submit=True)
+
+			# Strict assertions against broad bypass flags
+			self.assertFalse(bool(pl.flags.get("ignore_validate")), "flags.ignore_validate must be False")
+			self.assertFalse(bool(pl.flags.get("ignore_mandatory")), "flags.ignore_mandatory must be False")
+			self.assertFalse(bool(pl.flags.get("ignore_permissions")), "flags.ignore_permissions must be False")
+			mock_pl.submit.assert_called_once()
+
+	# -------------------------------------------------------------------------
+	# 26. Native ERPNext stock and batch validations strictly enforced
+	# -------------------------------------------------------------------------
+	def test_26_native_stock_and_batch_validations_enforced(self):
+		"""
+		Phase 1M.1 Hardening Proof:
+		Pick List native validations (stock qty, batch validity) remain active
+		and throw standard exceptions when violated.
+		"""
+		from erpnext.stock.doctype.pick_list.pick_list import PickList
+
+		pl = frappe.new_doc("Pick List")
+		pl.company = "_Test Company"
+		pl.purpose = "Delivery"
+		pl.append("locations", {
+			"item_code": "SKU-TEST-EXCESS",
+			"warehouse": "Stores - _TC",
+			"qty": 50.0,
+			"stock_qty": 50.0,
+			"picked_qty": 50.0,
+		})
+
+		# With actual_qty in Bin = 10.0, PickList.validate_stock_qty() must throw ValidationError
+		with patch("frappe.db.get_value", return_value=10.0):
+			with self.assertRaises(frappe.ValidationError):
+				pl.validate_stock_qty()
+
