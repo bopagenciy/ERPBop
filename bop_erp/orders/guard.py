@@ -13,6 +13,13 @@ class OperationalGuardError(frappe.ValidationError):
 	pass
 
 
+def audit_sales_order_cancellation_safety(so_name: str):
+	"""Re-export audit_sales_order_cancellation_safety from reconciliation module."""
+	from bop_erp.orders.reconciliation import audit_sales_order_cancellation_safety as _audit
+	return _audit(so_name)
+
+
+
 def assert_sales_order_ready_for_fulfillment(so_name: Optional[str]) -> None:
 	"""
 	Audits whether a Sales Order is operationally eligible for downstream fulfillment

@@ -90,7 +90,7 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Operation",
-   "options": "CREATE\nUPDATE\nDELETE\nUPSERT\nSYNC\nWEBHOOK\nINGEST_ORDER",
+   "options": "CREATE\nUPDATE\nDELETE\nUPSERT\nSYNC\nWEBHOOK\nINGEST_ORDER\nRECONCILE_ORDER_STATE",
    "reqd": 1
   },
   {

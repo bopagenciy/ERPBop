@@ -15,6 +15,8 @@
   "write_enabled",
   "webhook_enabled",
   "eligible_order_states",
+  "cancellation_order_states",
+  "review_order_states",
   "section_break_network",
   "timeout_seconds",
   "verify_tls",
@@ -24,7 +26,11 @@
   "section_break_discovery",
   "last_order_watermark",
   "column_break_discovery",
-  "last_order_id"
+  "last_order_id",
+  "section_break_reconciliation",
+  "last_reconciliation_watermark",
+  "column_break_reconciliation",
+  "last_reconciliation_order_id"
  ],
  "fields": [
   {
@@ -95,6 +101,20 @@
    "label": "Eligible Order States"
   },
   {
+   "default": "6",
+   "description": "Comma-separated list of PrestaShop order state IDs representing external cancellation before fulfillment (e.g. 6=Canceled).",
+   "fieldname": "cancellation_order_states",
+   "fieldtype": "Data",
+   "label": "Cancellation Order States"
+  },
+  {
+   "default": "7,8",
+   "description": "Comma-separated list of PrestaShop order state IDs requiring manual operational review (e.g. 7=Refunded, 8=Payment error).",
+   "fieldname": "review_order_states",
+   "fieldtype": "Data",
+   "label": "Review Order States"
+  },
+  {
    "fieldname": "section_break_network",
    "fieldtype": "Section Break",
    "label": "Network & Health"
@@ -147,6 +167,27 @@
    "fieldname": "last_order_id",
    "fieldtype": "Data",
    "label": "Last Order ID"
+  },
+  {
+   "fieldname": "section_break_reconciliation",
+   "fieldtype": "Section Break",
+   "label": "Order Reconciliation Watermark"
+  },
+  {
+   "description": "Timestamp of the latest successfully reconciled order date_upd",
+   "fieldname": "last_reconciliation_watermark",
+   "fieldtype": "Datetime",
+   "label": "Last Reconciliation Watermark"
+  },
+  {
+   "fieldname": "column_break_reconciliation",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "External order ID tie-breaker for the latest reconciliation watermark",
+   "fieldname": "last_reconciliation_order_id",
+   "fieldtype": "Data",
+   "label": "Last Reconciliation Order ID"
   }
  ],
  "index_web_pages_for_search": 1,

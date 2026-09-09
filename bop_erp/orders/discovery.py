@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Bop Agency and Contributors
 # See license.txt
 
+import hashlib
 import json
 from typing import Any, Dict, List, Optional
 import frappe
@@ -389,3 +390,331 @@ def enqueue_multichannel_order_discovery(
 		global_max_orders=global_max_orders,
 		now=frappe.flags.in_test or False,
 	)
+
+
+def compute_order_reconciliation_idempotency_key(
+	provider: str,
+	sales_channel: str,
+	external_order_id: str,
+	external_state_id: str,
+	external_updated_at: str,
+) -> str:
+	"""
+	Canonical SHA-256 idempotency key for Inbound Order State Reconciliation.
+	Distinguishes a specific observed external order state version.
+	[RECONCILE_ORDER_STATE, provider, sales_channel, ORDER, external_order_id, external_state_id, external_updated_at]
+	"""
+	clean_prov = str(provider).strip().upper()
+	clean_ch = str(sales_channel).strip()
+	clean_id = str(external_order_id).strip()
+	clean_state = str(external_state_id).strip()
+	clean_dt = str(external_updated_at).strip()
+	tuple_data = [
+		IntegrationOperation.RECONCILE_ORDER_STATE,
+		clean_prov,
+		clean_ch,
+		ExternalEntityType.ORDER,
+		clean_id,
+		clean_state,
+		clean_dt,
+	]
+	raw_json = json.dumps(tuple_data, ensure_ascii=False, separators=(",", ":"))
+	return hashlib.sha256(raw_json.encode("utf-8")).hexdigest()
+
+
+def discover_channel_order_reconciliations(
+	connector: Dict[str, Any],
+	max_orders: int = DEFAULT_MAX_ORDERS_PER_CHANNEL,
+	lookback_hours: int = DEFAULT_LOOKBACK_HOURS,
+	overlap_minutes: int = DEFAULT_OVERLAP_MINUTES,
+	page_size: int = DEFAULT_PAGE_SIZE,
+	client: Optional[PrestaShopClient] = None,
+) -> Dict[str, Any]:
+	"""
+	Discovers updated order states for already-imported orders on a single connector.
+	Enforces:
+	1. Pre-network host safety assertion.
+	2. Durable watermark tracking based on last_reconciliation_watermark + bounded overlap.
+	3. Only targets orders with existing active External ID Mapping.
+	4. Deterministic idempotency key matching exact (order_id, state_id, date_upd).
+	5. Creates PENDING RECONCILE_ORDER_STATE events.
+	6. Updates durable connector watermark upon progress.
+	"""
+	assert_safe_connector_target(connector["environment"], connector["base_url"])
+
+	sales_channel = connector["sales_channel"]
+	provider = IntegrationProvider.PRESTASHOP
+
+	if not client:
+		config = PrestaShopConfig.from_connector_doc(connector)
+		client = PrestaShopClient(config=config)
+
+	# Bounded overlap window
+	last_watermark = connector.get("last_reconciliation_watermark")
+	if last_watermark:
+		try:
+			dt = add_to_date(get_datetime(last_watermark), minutes=-overlap_minutes, as_datetime=True)
+			start_time = dt.strftime("%Y-%m-%d %H:%M:%S")
+		except Exception:
+			dt = add_to_date(now_datetime(), hours=-lookback_hours, as_datetime=True)
+			start_time = dt.strftime("%Y-%m-%d %H:%M:%S")
+	else:
+		dt = add_to_date(now_datetime(), hours=-lookback_hours, as_datetime=True)
+		start_time = dt.strftime("%Y-%m-%d %H:%M:%S")
+
+	orders_seen = 0
+	events_created = 0
+	duplicate_events = 0
+	unmapped_orders = 0
+	already_converged_orders = 0
+	max_observed_date_upd = last_watermark
+	max_observed_order_id = connector.get("last_reconciliation_order_id")
+
+	offset = 0
+	while orders_seen < max_orders:
+		page_limit = min(page_size, max_orders - orders_seen)
+		params = {
+			"display": "full",
+			"limit": f"{offset},{page_limit}",
+			"sort": "[date_upd_ASC,id_ASC]",
+			"filter[date_upd]": f">[{start_time}]",
+		}
+
+		try:
+			raw_orders = client._request("GET", "orders", params=params)
+		except PrestaShopValidationError:
+			fallback_params = {
+				"display": "full",
+				"limit": f"{offset},{page_limit}",
+				"sort": "[id_ASC]",
+			}
+			try:
+				raw_orders = client._request("GET", "orders", params=fallback_params)
+			except Exception as fb_err:
+				frappe.logger("bop_erp").error(
+					f"Error querying PrestaShop order reconciliations fallback for {sales_channel}: {fb_err}"
+				)
+				break
+		except Exception as req_err:
+			frappe.logger("bop_erp").error(
+				f"Error querying PrestaShop order reconciliations for {sales_channel}: {req_err}"
+			)
+			break
+
+		if isinstance(raw_orders, dict):
+			orders_page = raw_orders.get("orders", [])
+		elif isinstance(raw_orders, list):
+			orders_page = raw_orders
+		else:
+			orders_page = []
+
+		if not orders_page:
+			break
+
+		for o in orders_page:
+			order_id = str(o.get("id") or "").strip()
+			if not order_id:
+				continue
+
+			orders_seen += 1
+
+			date_upd = str(o.get("date_upd") or "").strip()
+			if date_upd:
+				if not max_observed_date_upd or date_upd > str(max_observed_date_upd):
+					max_observed_date_upd = date_upd
+					max_observed_order_id = order_id
+				elif date_upd == str(max_observed_date_upd) and order_id:
+					if not max_observed_order_id or int(order_id) > int(max_observed_order_id):
+						max_observed_order_id = order_id
+
+			# Requirement 5 & 8: Only process orders that already have an active Sales Order mapping
+			existing_so = find_existing_order_mapping(sales_channel, provider, order_id)
+			if not existing_so:
+				unmapped_orders += 1
+				continue
+
+			state_id = str(o.get("current_state") or "").strip()
+
+			# Check if already converged to this exact state in ERP
+			so_state, so_state_upd = frappe.db.get_value(
+				"Sales Order",
+				existing_so,
+				["external_order_state", "external_order_state_updated_at"],
+			) or (None, None)
+
+			if str(so_state or "").strip() == state_id and str(so_state_upd or "").strip() == date_upd:
+				already_converged_orders += 1
+				continue
+
+			# Canonical idempotency key for this observed state
+			idem_key = compute_order_reconciliation_idempotency_key(
+				provider=provider,
+				sales_channel=sales_channel,
+				external_order_id=order_id,
+				external_state_id=state_id,
+				external_updated_at=date_upd,
+			)
+
+			# Deduplication: check existing Integration Event
+			existing_event = get_existing_idempotent_event(
+				provider=provider,
+				sales_channel=sales_channel,
+				entity_type=ExternalEntityType.ORDER,
+				operation=IntegrationOperation.RECONCILE_ORDER_STATE,
+				idempotency_key=idem_key,
+			)
+			if existing_event:
+				duplicate_events += 1
+				continue
+
+			payload = {
+				"sales_channel": sales_channel,
+				"provider": provider,
+				"external_order_id": order_id,
+				"external_state_id": state_id,
+				"external_updated_at": date_upd,
+				"existing_sales_order": existing_so,
+				"raw_order": o,
+			}
+
+			event_doc = frappe.get_doc({
+				"doctype": "Integration Event",
+				"direction": IntegrationDirection.INBOUND,
+				"provider": provider,
+				"sales_channel": sales_channel,
+				"entity_type": ExternalEntityType.ORDER,
+				"operation": IntegrationOperation.RECONCILE_ORDER_STATE,
+				"external_id": order_id,
+				"erp_doctype": "Sales Order",
+				"erp_document": existing_so,
+				"idempotency_key": idem_key,
+				"status": IntegrationStatus.PENDING,
+				"request_metadata": json.dumps(payload),
+				"max_attempts": 3,
+			})
+			event_doc.flags.ignore_links = True
+			try:
+				event_doc.insert(ignore_permissions=True)
+				events_created += 1
+			except (frappe.DuplicateEntryError, frappe.ValidationError):
+				duplicate_events += 1
+
+		if len(orders_page) < page_limit:
+			break
+		offset += len(orders_page)
+
+	# Persist durable reconciliation watermark
+	connector_name = connector.get("name")
+	if connector_name and max_observed_date_upd and max_observed_date_upd != last_watermark:
+		try:
+			frappe.db.set_value(
+				"PrestaShop Connector",
+				connector_name,
+				{
+					"last_reconciliation_watermark": max_observed_date_upd,
+					"last_reconciliation_order_id": max_observed_order_id,
+				},
+				update_modified=False,
+			)
+			frappe.db.commit()
+		except Exception as save_err:
+			frappe.logger("bop_erp").warning(f"Could not update connector reconciliation watermark: {save_err}")
+
+	return {
+		"sales_channel": sales_channel,
+		"orders_seen": orders_seen,
+		"events_created": events_created,
+		"duplicate_events": duplicate_events,
+		"unmapped_orders": unmapped_orders,
+		"already_converged_orders": already_converged_orders,
+		"last_reconciliation_watermark": str(max_observed_date_upd or ""),
+	}
+
+
+def discover_multichannel_order_reconciliations(
+	max_channels: int = DEFAULT_MAX_CHANNELS,
+	max_orders_per_channel: int = DEFAULT_MAX_ORDERS_PER_CHANNEL,
+	global_max_orders: int = DEFAULT_GLOBAL_MAX_ORDERS,
+	lookback_hours: int = DEFAULT_LOOKBACK_HOURS,
+	provider: str = IntegrationProvider.PRESTASHOP,
+	clients_by_channel: Optional[Dict[str, PrestaShopClient]] = None,
+) -> Dict[str, Any]:
+	"""
+	Provider-neutral global coordinator for multichannel order state reconciliation discovery.
+	Enforces fair round-robin cursor rotation across active connectors.
+	"""
+	all_connectors = discover_eligible_connectors(provider=provider)
+	if not all_connectors:
+		return {
+			"channels_seen": 0,
+			"channels_processed": 0,
+			"orders_seen": 0,
+			"events_created": 0,
+			"channel_results": {},
+		}
+
+	ordered_connectors = get_fair_channel_order(all_connectors, cache_key="order_reconciliation_cursor")
+	connectors_to_process = ordered_connectors[:max_channels]
+
+	total_orders_seen = 0
+	total_events_created = 0
+	channel_results = {}
+	last_processed_idx = 0
+
+	for idx, conn in enumerate(connectors_to_process):
+		ch = conn["sales_channel"]
+		if total_events_created >= global_max_orders:
+			break
+
+		remaining_global = global_max_orders - total_events_created
+		channel_max = min(max_orders_per_channel, remaining_global)
+
+		cli = clients_by_channel.get(ch) if clients_by_channel else None
+
+		try:
+			res = discover_channel_order_reconciliations(
+				connector=conn,
+				max_orders=channel_max,
+				lookback_hours=lookback_hours,
+				client=cli,
+			)
+			channel_results[ch] = res
+			total_orders_seen += res["orders_seen"]
+			total_events_created += res["events_created"]
+			last_processed_idx = idx
+		except Exception as e:
+			frappe.logger("bop_erp").error(f"Reconciliation discovery error on channel {ch}: {e}")
+			channel_results[ch] = {"error": str(e), "events_created": 0}
+
+	# Update fair rotating cursor in cache
+	if connectors_to_process:
+		original_idx = all_connectors.index(connectors_to_process[last_processed_idx])
+		frappe.cache().set_value("order_reconciliation_cursor", original_idx, expires_in_sec=86400)
+
+	frappe.db.commit()
+
+	return {
+		"channels_seen": len(all_connectors),
+		"channels_processed": len(channel_results),
+		"orders_seen": total_orders_seen,
+		"events_created": total_events_created,
+		"channel_results": channel_results,
+	}
+
+
+def enqueue_multichannel_order_reconciliation(
+	max_channels: int = DEFAULT_MAX_CHANNELS,
+	max_orders_per_channel: int = DEFAULT_MAX_ORDERS_PER_CHANNEL,
+	global_max_orders: int = DEFAULT_GLOBAL_MAX_ORDERS,
+):
+	"""Enqueues multichannel order state reconciliation discovery to the default background queue."""
+	frappe.enqueue(
+		"bop_erp.orders.discovery.discover_multichannel_order_reconciliations",
+		queue="default",
+		timeout=300,
+		max_channels=max_channels,
+		max_orders_per_channel=max_orders_per_channel,
+		global_max_orders=global_max_orders,
+		now=frappe.flags.in_test or False,
+	)
+

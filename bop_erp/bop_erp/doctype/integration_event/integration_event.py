@@ -242,4 +242,5 @@ class IntegrationEvent(Document):
 	def associate_erp_document(self, erp_doctype, erp_document):
 		self.erp_doctype = erp_doctype
 		self.erp_document = erp_document
+		self.flags.ignore_links = True
 		self.save()

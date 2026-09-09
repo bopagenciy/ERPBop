@@ -56,7 +56,7 @@
   "insert_after": "integration_correlation_id",
   "label": "Integration Status",
   "name": "Sales Order-integration_status",
-  "options": "INGESTION_PENDING\nRESERVATION_PENDING\nREADY\nFAILED_REVIEW"
+  "options": "INGESTION_PENDING\nRESERVATION_PENDING\nREADY\nFAILED_REVIEW\nCANCELLATION_PENDING\nCANCELLED\nCHANGE_REVIEW_REQUIRED"
  },
  {
   "allow_on_submit": 1,
@@ -78,6 +78,37 @@
   "label": "Latest Integration Event",
   "name": "Sales Order-latest_integration_event",
   "options": "Integration Event"
+ },
+ {
+  "allow_on_submit": 1,
+  "doctype": "Custom Field",
+  "dt": "Sales Order",
+  "fieldname": "external_order_state",
+  "fieldtype": "Data",
+  "in_list_view": 1,
+  "insert_after": "latest_integration_event",
+  "label": "External Order State",
+  "name": "Sales Order-external_order_state"
+ },
+ {
+  "allow_on_submit": 1,
+  "doctype": "Custom Field",
+  "dt": "Sales Order",
+  "fieldname": "external_order_state_name",
+  "fieldtype": "Data",
+  "insert_after": "external_order_state",
+  "label": "External Order State Name",
+  "name": "Sales Order-external_order_state_name"
+ },
+ {
+  "allow_on_submit": 1,
+  "doctype": "Custom Field",
+  "dt": "Sales Order",
+  "fieldname": "external_order_state_updated_at",
+  "fieldtype": "Datetime",
+  "insert_after": "external_order_state_name",
+  "label": "External Order State Updated At",
+  "name": "Sales Order-external_order_state_updated_at"
  },
  {
   "allow_on_submit": 0,
