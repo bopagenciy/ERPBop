@@ -1,4 +1,4 @@
-﻿# Copyright (c) 2026, Bop Agency and Contributors
+# Copyright (c) 2026, Bop Agency and Contributors
 # See license.txt
 
 import frappe
@@ -42,3 +42,34 @@ class CompanyMismatchError(SalesInvoiceError):
 class InvoicingFinancialReconciliationError(SalesInvoiceError):
 	"""Raised when financial reconciliation against upstream document totals fails."""
 	pass
+
+
+class PaymentReconciliationError(frappe.ValidationError):
+	"""Base exception for all Bop Payment Entry and External Payment Reconciliation operations."""
+	pass
+
+
+class PaymentEligibilityError(PaymentReconciliationError):
+	"""Raised when an external payment or its target invoice/order is not eligible for reconciliation."""
+	pass
+
+
+class DuplicatePaymentError(PaymentReconciliationError):
+	"""Raised when duplicate payment entry creation is attempted without convergence."""
+	pass
+
+
+class PaymentAccountMismatchError(PaymentReconciliationError):
+	"""Raised when clearing accounts, party accounts, or company bounds do not match."""
+	pass
+
+
+class OverpaymentBlockedError(PaymentReconciliationError):
+	"""Raised when payment allocation exceeds eligible invoice outstanding amount."""
+	pass
+
+
+class PaymentMappingDriftError(PaymentReconciliationError):
+	"""Raised when canonical External ID Mapping drifts or conflicts during payment processing."""
+	pass
+

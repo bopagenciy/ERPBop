@@ -1,14 +1,20 @@
-﻿# Copyright (c) 2026, Bop Agency and Contributors
+# Copyright (c) 2026, Bop Agency and Contributors
 # See license.txt
 
 from bop_erp.accounts.exceptions import (
 	CompanyMismatchError,
 	DeliveryNoteNotReadyForInvoicingError,
+	DuplicatePaymentError,
 	DuplicateSalesInvoiceError,
 	InvoicingFinancialReconciliationError,
 	MissingFulfillmentEvidenceError,
 	OrderNotEligibleForInvoicingError,
 	OverbillingBlockedError,
+	OverpaymentBlockedError,
+	PaymentAccountMismatchError,
+	PaymentEligibilityError,
+	PaymentMappingDriftError,
+	PaymentReconciliationError,
 	SalesInvoiceError,
 )
 from bop_erp.accounts.invoice import (
@@ -21,15 +27,35 @@ from bop_erp.accounts.invoice import (
 	reset_invoice_counters,
 	submit_sales_invoice,
 )
+from bop_erp.accounts.payments import (
+	ExternalPaymentRecord,
+	ExternalPaymentStatus,
+	PAYMENT_COUNTERS,
+	assert_payment_reconciliation_eligibility,
+	cancel_payment_entry,
+	compute_external_payment_idempotency_key,
+	get_payment_counters,
+	plan_invoice_allocations,
+	reconcile_external_payment,
+	reset_payment_counters,
+	resolve_clearing_account_for_payment,
+	submit_payment_entry,
+)
 
 __all__ = [
 	"CompanyMismatchError",
 	"DeliveryNoteNotReadyForInvoicingError",
+	"DuplicatePaymentError",
 	"DuplicateSalesInvoiceError",
 	"InvoicingFinancialReconciliationError",
 	"MissingFulfillmentEvidenceError",
 	"OrderNotEligibleForInvoicingError",
 	"OverbillingBlockedError",
+	"OverpaymentBlockedError",
+	"PaymentAccountMismatchError",
+	"PaymentEligibilityError",
+	"PaymentMappingDriftError",
+	"PaymentReconciliationError",
 	"SalesInvoiceError",
 	"INVOICE_COUNTERS",
 	"assert_sales_invoice_eligibility",
@@ -39,4 +65,17 @@ __all__ = [
 	"get_invoice_counters",
 	"reset_invoice_counters",
 	"submit_sales_invoice",
+	"ExternalPaymentRecord",
+	"ExternalPaymentStatus",
+	"PAYMENT_COUNTERS",
+	"assert_payment_reconciliation_eligibility",
+	"cancel_payment_entry",
+	"compute_external_payment_idempotency_key",
+	"get_payment_counters",
+	"plan_invoice_allocations",
+	"reconcile_external_payment",
+	"reset_payment_counters",
+	"resolve_clearing_account_for_payment",
+	"submit_payment_entry",
 ]
+
