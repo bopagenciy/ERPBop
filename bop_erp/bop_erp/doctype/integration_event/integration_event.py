@@ -165,6 +165,7 @@ class IntegrationEvent(Document):
 		self.lease_expires_at = None
 		if response_metadata:
 			self.response_metadata = sanitize_metadata(response_metadata)
+		self.flags.ignore_links = True
 		self.save()
 
 	def mark_failed(self, processing_token, error_code, error_message, error_category=None, delay_seconds=None):
@@ -210,6 +211,7 @@ class IntegrationEvent(Document):
 				delay_seconds = 60
 
 		self.next_retry_at = now + timedelta(seconds=int(delay_seconds))
+		self.flags.ignore_links = True
 		self.save()
 
 	def _mark_dead_letter_internal(self, error_code, error_message):
@@ -222,6 +224,7 @@ class IntegrationEvent(Document):
 		self.processing_token = None
 		self.lease_expires_at = None
 		self.next_retry_at = None
+		self.flags.ignore_links = True
 		self.save()
 
 	def cancel(self, reason=None, processing_token=None):
@@ -237,6 +240,7 @@ class IntegrationEvent(Document):
 		# Idempotency key remains reserved
 		if reason:
 			self.last_error_message = _("Cancelled: {0}").format(reason)
+		self.flags.ignore_links = True
 		self.save()
 
 	def associate_erp_document(self, erp_doctype, erp_document):

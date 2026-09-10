@@ -13,10 +13,13 @@
   "enabled",
   "read_enabled",
   "write_enabled",
+  "order_state_write_enabled",
   "webhook_enabled",
   "eligible_order_states",
   "cancellation_order_states",
   "review_order_states",
+  "shipping_state_id",
+  "delivered_state_id",
   "section_break_network",
   "timeout_seconds",
   "verify_tls",
@@ -90,6 +93,13 @@
   },
   {
    "default": "0",
+   "description": "Enables outbound order fulfillment status writeback to PrestaShop. Disabled by default.",
+   "fieldname": "order_state_write_enabled",
+   "fieldtype": "Check",
+   "label": "Order State Write Enabled"
+  },
+  {
+   "default": "0",
    "fieldname": "webhook_enabled",
    "fieldtype": "Check",
    "label": "Webhook Enabled"
@@ -111,6 +121,18 @@
    "fieldname": "review_order_states",
    "fieldtype": "Data",
    "label": "Review Order States"
+  },
+  {
+   "description": "PrestaShop order state ID representing Shipped fulfillment. Store-specific configuration (no default).",
+   "fieldname": "shipping_state_id",
+   "fieldtype": "Data",
+   "label": "Shipping State ID"
+  },
+  {
+   "description": "PrestaShop order state ID representing Delivered fulfillment. Store-specific configuration (no default).",
+   "fieldname": "delivered_state_id",
+   "fieldtype": "Data",
+   "label": "Delivered State ID"
   },
   {
    "fieldname": "section_break_network",

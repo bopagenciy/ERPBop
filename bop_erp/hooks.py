@@ -32,6 +32,8 @@ doc_events = {
 			"bop_erp.attribution.validate_transaction_attribution",
 			"bop_erp.orders.guard.validate_operational_guard",
 		],
+		"on_submit": "bop_erp.orders.fulfillment_writeback.handle_delivery_note_submit",
+		"on_cancel": "bop_erp.orders.fulfillment_writeback.handle_delivery_note_cancel",
 	},
 	"Shipment": {
 		"before_insert": "bop_erp.attribution.propagate_attribution_to_shipment",
@@ -56,6 +58,7 @@ scheduler_events = {
 	"cron": {
 		"*/5 * * * *": [
 			"bop_erp.inventory.scheduler.enqueue_inventory_publication_dispatcher",
+			"bop_erp.orders.fulfillment_writeback.enqueue_order_fulfillment_writeback_dispatcher",
 		],
 	},
 }

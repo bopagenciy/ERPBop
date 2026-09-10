@@ -511,3 +511,155 @@ class PrestaShopClient:
 
 	def get_order_state(self, state_id: Any) -> Dict[str, Any]:
 		return self._get_resource("order_states", state_id)
+
+	def get_order_histories_for_order(self, order_id: Any) -> List[Dict[str, Any]]:
+		"""Fetches order_history records for a given order ID."""
+		return self._list_resource("order_histories", limit=100, filters={"id_order": order_id}, display="full")
+
+	def update_order_state(
+		self,
+		order_id: Any,
+		target_state_id: Any,
+		send_email: bool = False,
+		pre_write_hook: Optional[Any] = None,
+	) -> Dict[str, Any]:
+		"""
+		Updates the state of a PrestaShop order by creating an order_history record via Webservice.
+		Enforces:
+		- Runtime host safety re-check
+		- write_enabled and order_state_write_enabled capability check
+		- Validation of order_id and target_state_id
+		- Error classification (401/403, 404, 429, 400, 5xx, timeout)
+		- Secret redaction
+		"""
+		# 1. Runtime Safety & Host validation
+		self.config.assert_safe()
+
+		# 2. Scoped Write Permission Check
+		if not getattr(self.config, "write_enabled", False) or not getattr(self.config, "order_state_write_enabled", False):
+			raise PrestaShopError(
+				f"PrestaShop order state write operation rejected: order state writes are disabled for channel '{self.config.sales_channel}'.",
+				sensitive_token=self._api_key,
+			)
+
+		if not order_id or not target_state_id:
+			raise PrestaShopValidationError(
+				f"Both order_id and target_state_id are required to update order state (got order_id={order_id}, target_state_id={target_state_id})",
+				sensitive_token=self._api_key,
+			)
+
+		# 3. Pre-write hook (e.g. for testing authority races before network mutation)
+		if pre_write_hook is not None:
+			pre_write_hook()
+
+		# 4. Construct minimal, canonical XML payload for order_histories
+		xml_payload = (
+			f'<?xml version="1.0" encoding="UTF-8"?>\n'
+			f'<prestashop xmlns:xlink="http://www.w3.org/1999/xlink">\n'
+			f'  <order_history>\n'
+			f'    <id_order>{int(order_id)}</id_order>\n'
+			f'    <id_order_state>{int(target_state_id)}</id_order_state>\n'
+			f'  </order_history>\n'
+			f'</prestashop>'
+		)
+
+		url = self._build_url("order_histories")
+		headers = {
+			"Content-Type": "text/xml",
+			"Accept": "text/xml",
+			"User-Agent": "Bop-ERP-Connector/1.0",
+		}
+		params = {}
+		if send_email:
+			params["sendemail"] = "1"
+
+		try:
+			resp = self.session.post(
+				url=url,
+				params=params,
+				data=xml_payload.encode("utf-8"),
+				headers=headers,
+				timeout=self.config.timeout_seconds,
+				verify=self.config.verify_tls,
+			)
+		except (requests.ConnectionError, requests.Timeout) as conn_err:
+			safe_url = sanitize_url_for_logging(url)
+			raise PrestaShopTransientError(
+				f"Network connectivity/timeout failure during POST {safe_url}: {conn_err}",
+				sensitive_token=self._api_key,
+			) from conn_err
+		except requests.RequestException as req_err:
+			safe_url = sanitize_url_for_logging(url)
+			raise PrestaShopError(
+				f"Unexpected HTTP error during POST {safe_url}: {req_err}",
+				sensitive_token=self._api_key,
+			) from req_err
+
+		status = resp.status_code
+		safe_url = sanitize_url_for_logging(url)
+
+		if status in (401, 403, 405):
+			raise PrestaShopAuthError(
+				f"Authentication/permission rejected ({status}) for POST {safe_url}: {resp.text[:200]}",
+				status_code=status,
+				response_body=resp.text,
+				sensitive_token=self._api_key,
+			)
+		if status == 404:
+			raise PrestaShopNotFoundError(
+				f"Resource not found (404) at POST {safe_url}",
+				status_code=status,
+				response_body=resp.text,
+				sensitive_token=self._api_key,
+			)
+		if status == 429:
+			retry_after = None
+			ra_hdr = resp.headers.get("Retry-After")
+			if ra_hdr:
+				try:
+					retry_after = int(ra_hdr)
+				except (ValueError, TypeError):
+					pass
+			raise PrestaShopRateLimitError(
+				f"Rate limit exceeded (429) at POST {safe_url}",
+				status_code=status,
+				response_body=resp.text,
+				sensitive_token=self._api_key,
+				retry_after=retry_after,
+			)
+		if status in (400, 422):
+			raise PrestaShopValidationError(
+				f"Validation error ({status}) at POST {safe_url}: {resp.text[:300]}",
+				status_code=status,
+				response_body=resp.text,
+				sensitive_token=self._api_key,
+			)
+		if status >= 500:
+			raise PrestaShopServerError(
+				f"PrestaShop server error ({status}) at POST {safe_url}: {resp.text[:300]}",
+				status_code=status,
+				response_body=resp.text,
+				sensitive_token=self._api_key,
+			)
+
+		# Parse created order history ID from XML response if possible
+		history_id = None
+		try:
+			import xml.etree.ElementTree as ET
+			res_root = ET.fromstring(resp.text)
+			hist_elem = res_root.find("order_history")
+			if hist_elem is not None:
+				id_elem = hist_elem.find("id")
+				if id_elem is not None and id_elem.text:
+					history_id = int(id_elem.text.strip())
+		except Exception:
+			pass
+
+		return {
+			"order_id": int(order_id),
+			"target_state_id": int(target_state_id),
+			"order_history_id": history_id,
+			"changed": True,
+			"status_code": status,
+		}
+

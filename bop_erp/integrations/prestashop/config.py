@@ -3,6 +3,7 @@
 
 import os
 from dataclasses import dataclass
+from typing import Optional
 import frappe
 from frappe import _
 
@@ -23,6 +24,9 @@ class PrestaShopConfig:
 	verify_tls: bool = True
 	read_enabled: bool = True
 	write_enabled: bool = False
+	order_state_write_enabled: bool = False
+	shipping_state_id: Optional[str] = None
+	delivered_state_id: Optional[str] = None
 
 	def assert_safe(self):
 		"""Validates safety constraints against target base URL and environment."""
@@ -64,4 +68,7 @@ class PrestaShopConfig:
 			verify_tls=bool(doc.verify_tls),
 			read_enabled=bool(doc.read_enabled),
 			write_enabled=bool(doc.write_enabled),
+			order_state_write_enabled=bool(getattr(doc, "order_state_write_enabled", False)),
+			shipping_state_id=str(doc.shipping_state_id).strip() if getattr(doc, "shipping_state_id", None) else None,
+			delivered_state_id=str(doc.delivered_state_id).strip() if getattr(doc, "delivered_state_id", None) else None,
 		)
