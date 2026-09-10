@@ -177,3 +177,16 @@ class PickTicketStatus:
 		PICKED,
 		CANCELLED,
 	)
+
+class ShippingTicketStatus:
+	DRAFT = "DRAFT"
+	READY_TO_SHIP = "READY_TO_SHIP"
+	SHIPPED = "SHIPPED"
+	CANCELLED = "CANCELLED"
+
+	ALL = (
+		DRAFT,
+		READY_TO_SHIP,
+		SHIPPED,
+		CANCELLED,
+	)

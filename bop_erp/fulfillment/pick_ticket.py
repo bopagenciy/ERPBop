@@ -578,6 +578,7 @@ def create_pick_ticket(
 				"warehouse": assigned_wh,
 				"qty": pick_qty,
 				"stock_qty": pick_qty,
+				"picked_qty": pick_qty,
 				"conversion_factor": 1.0,
 				"uom": item_meta.stock_uom if item_meta else "Nos",
 				"stock_uom": item_meta.stock_uom if item_meta else "Nos",
@@ -644,6 +645,7 @@ def create_pick_ticket(
 						"warehouse": sre_wh,
 						"qty": alloc_qty,
 						"stock_qty": alloc_qty,
+						"picked_qty": alloc_qty,
 						"conversion_factor": 1.0,
 						"uom": item_meta.stock_uom if item_meta else "Nos",
 						"stock_uom": item_meta.stock_uom if item_meta else "Nos",
@@ -693,6 +695,7 @@ def create_pick_ticket(
 					"warehouse": assigned_wh,
 					"qty": rem_qty,
 					"stock_qty": rem_qty,
+					"picked_qty": rem_qty,
 					"conversion_factor": 1.0,
 					"uom": item_meta.stock_uom if item_meta else "Nos",
 					"stock_uom": item_meta.stock_uom if item_meta else "Nos",
@@ -715,6 +718,7 @@ def create_pick_ticket(
 	pl_doc.company = so_doc.company
 	pl_doc.purpose = "Delivery"
 	pl_doc.customer = so_doc.customer
+	pl_doc.pick_manually = 1
 
 	# Inherit attribution
 	if so_doc.sales_channel:
