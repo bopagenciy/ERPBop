@@ -102,8 +102,12 @@ class TestOrderFulfillmentWritebackLive(unittest.TestCase):
 				"write_enabled": 1,
 				"base_url": "http://prestashop-test",
 				"order_state_write_enabled": 1,
+				"order_state_send_email": 0,
 				"shipping_state_id": "4",
 				"delivered_state_id": "5",
+				"cancellation_order_states": "6",
+				"review_order_states": "7,8",
+				"eligible_order_states": "2,3,11",
 				"timeout_seconds": 15,
 			})
 			connector_doc.flags.ignore_validate = True
@@ -111,8 +115,12 @@ class TestOrderFulfillmentWritebackLive(unittest.TestCase):
 		else:
 			frappe.db.set_value("PrestaShop Connector", cls.connector_name, {
 				"order_state_write_enabled": 1,
+				"order_state_send_email": 0,
 				"shipping_state_id": "4",
 				"delivered_state_id": "5",
+				"cancellation_order_states": "6",
+				"review_order_states": "7,8",
+				"eligible_order_states": "2,3,11",
 				"base_url": "http://prestashop-test",
 			})
 
@@ -129,8 +137,12 @@ class TestOrderFulfillmentWritebackLive(unittest.TestCase):
 				"write_enabled": 1,
 				"base_url": "http://prestashop-test",
 				"order_state_write_enabled": 1,
+				"order_state_send_email": 0,
 				"shipping_state_id": "4",
 				"delivered_state_id": "5",
+				"cancellation_order_states": "6",
+				"review_order_states": "7,8",
+				"eligible_order_states": "2,3,11",
 				"timeout_seconds": 15,
 			})
 			connector_b.flags.ignore_validate = True

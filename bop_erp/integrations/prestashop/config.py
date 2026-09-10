@@ -25,8 +25,12 @@ class PrestaShopConfig:
 	read_enabled: bool = True
 	write_enabled: bool = False
 	order_state_write_enabled: bool = False
+	order_state_send_email: bool = False
 	shipping_state_id: Optional[str] = None
 	delivered_state_id: Optional[str] = None
+	cancellation_order_states: Optional[str] = None
+	review_order_states: Optional[str] = None
+	eligible_order_states: Optional[str] = None
 
 	def assert_safe(self):
 		"""Validates safety constraints against target base URL and environment."""
@@ -69,6 +73,10 @@ class PrestaShopConfig:
 			read_enabled=bool(doc.read_enabled),
 			write_enabled=bool(doc.write_enabled),
 			order_state_write_enabled=bool(getattr(doc, "order_state_write_enabled", False)),
+			order_state_send_email=bool(getattr(doc, "order_state_send_email", False)),
 			shipping_state_id=str(doc.shipping_state_id).strip() if getattr(doc, "shipping_state_id", None) else None,
 			delivered_state_id=str(doc.delivered_state_id).strip() if getattr(doc, "delivered_state_id", None) else None,
+			cancellation_order_states=str(doc.cancellation_order_states).strip() if getattr(doc, "cancellation_order_states", None) else None,
+			review_order_states=str(doc.review_order_states).strip() if getattr(doc, "review_order_states", None) else None,
+			eligible_order_states=str(doc.eligible_order_states).strip() if getattr(doc, "eligible_order_states", None) else None,
 		)

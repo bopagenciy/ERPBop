@@ -14,6 +14,7 @@
   "read_enabled",
   "write_enabled",
   "order_state_write_enabled",
+  "order_state_send_email",
   "webhook_enabled",
   "eligible_order_states",
   "cancellation_order_states",
@@ -97,6 +98,13 @@
    "fieldname": "order_state_write_enabled",
    "fieldtype": "Check",
    "label": "Order State Write Enabled"
+  },
+  {
+   "default": "0",
+   "description": "If enabled, appends ?sendemail=1 to order_histories POST requests. PrestaShop state configuration and mail templates determine whether customer notifications are dispatched. Keep disabled (0) to suppress customer-facing fulfillment emails.",
+   "fieldname": "order_state_send_email",
+   "fieldtype": "Check",
+   "label": "Order State Send Email"
   },
   {
    "default": "0",

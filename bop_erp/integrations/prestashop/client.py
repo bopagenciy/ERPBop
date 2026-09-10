@@ -520,7 +520,7 @@ class PrestaShopClient:
 		self,
 		order_id: Any,
 		target_state_id: Any,
-		send_email: bool = False,
+		send_email: Optional[bool] = None,
 		pre_write_hook: Optional[Any] = None,
 	) -> Dict[str, Any]:
 		"""
@@ -531,7 +531,10 @@ class PrestaShopClient:
 		- Validation of order_id and target_state_id
 		- Error classification (401/403, 404, 429, 400, 5xx, timeout)
 		- Secret redaction
+		- Explicit, connector-scoped customer email dispatch policy (defaulting to config.order_state_send_email)
 		"""
+		if send_email is None:
+			send_email = getattr(self.config, "order_state_send_email", False)
 		# 1. Runtime Safety & Host validation
 		self.config.assert_safe()
 

@@ -91,10 +91,12 @@ class TestOrderFulfillmentWritebackUnit(FrappeTestCase):
 				"read_enabled": 1,
 				"write_enabled": 0,
 				"order_state_write_enabled": 1,
+				"order_state_send_email": 0,
 				"shipping_state_id": "4",
 				"delivered_state_id": "5",
 				"cancellation_order_states": "6",
 				"review_order_states": "7,8",
+				"eligible_order_states": "2,3,11",
 			}).insert(ignore_permissions=True)
 
 	def tearDown(self):
@@ -144,13 +146,17 @@ class TestOrderFulfillmentWritebackUnit(FrappeTestCase):
 			self.assertIn(event.status, (IntegrationStatus.FAILED, IntegrationStatus.DEAD_LETTER))
 			self.assertEqual(event.last_error_code, "SHIPPING_STATE_NOT_CONFIGURED")
 
+		frappe.db.set_value("PrestaShop Connector", self.connector_name, "shipping_state_id", "4")
+
 	# 2. no universal state default
 	def test_02_no_universal_state_default(self):
 		meta = frappe.get_meta("PrestaShop Connector")
 		shipping_field = meta.get_field("shipping_state_id")
 		delivered_field = meta.get_field("delivered_state_id")
+		email_field = meta.get_field("order_state_send_email")
 		self.assertIsNone(shipping_field.default, "shipping_state_id must NOT have a universal default")
 		self.assertIsNone(delivered_field.default, "delivered_state_id must NOT have a universal default")
+		self.assertEqual(str(email_field.default), "0", "order_state_send_email must default to 0 (disabled)")
 
 	# 3. semantic state mapping
 	def test_03_semantic_state_mapping(self):
@@ -159,6 +165,119 @@ class TestOrderFulfillmentWritebackUnit(FrappeTestCase):
 		self.assertEqual(connector.delivered_state_id, "5")
 		self.assertEqual(connector.cancellation_order_states, "6")
 		self.assertEqual(connector.review_order_states, "7,8")
+		self.assertEqual(connector.eligible_order_states, "2,3,11")
+
+	# 3b. arbitrary semantic state configuration proves no universal defaults
+	def test_03b_arbitrary_semantic_state_configuration(self):
+		"""
+		Proves that outbound writeback safety semantics are completely configuration-driven.
+		A store configured with arbitrary IDs:
+		  SHIPPED = 42
+		  DELIVERED = 43
+		  CANCELED = 99
+		  REFUNDED = 77
+		  PAYMENT_ERROR = 88
+		  ELIGIBLE = 101,102
+		correctly identifies all states without hardcoded universal defaults.
+		"""
+		frappe.db.set_value("PrestaShop Connector", self.connector_name, {
+			"shipping_state_id": "42",
+			"delivered_state_id": "43",
+			"cancellation_order_states": "99",
+			"review_order_states": "77,88",
+			"eligible_order_states": "101,102",
+		})
+
+		with patch("bop_erp.orders.fulfillment_writeback.frappe.db.get_value") as mock_gv:
+			mock_gv.side_effect = self._mock_db_fresh_reads
+
+			# A: Remote state 42 -> Already SHIPPED (NO-OP)
+			ev_a = self._create_test_event("order-arb-42")
+			cl_a = self._create_mock_client(current_state="42")
+			res_a = process_order_fulfillment_writeback_event(ev_a.name, client=cl_a)
+			self.assertTrue(res_a)
+			ev_a.reload()
+			self.assertEqual(ev_a.status, IntegrationStatus.SUCCEEDED)
+			meta_a = json.loads(ev_a.response_metadata or "{}")
+			self.assertTrue(meta_a.get("noop"))
+			cl_a.update_order_state.assert_not_called()
+
+			# B: Remote state 43 -> Already DELIVERED (NO-OP, no regression)
+			ev_b = self._create_test_event("order-arb-43")
+			cl_b = self._create_mock_client(current_state="43")
+			res_b = process_order_fulfillment_writeback_event(ev_b.name, client=cl_b)
+			self.assertTrue(res_b)
+			ev_b.reload()
+			self.assertEqual(ev_b.status, IntegrationStatus.SUCCEEDED)
+			meta_b = json.loads(ev_b.response_metadata or "{}")
+			self.assertTrue(meta_b.get("noop"))
+			cl_b.update_order_state.assert_not_called()
+
+			# C: Remote state 99 -> CANCELED (blocked)
+			ev_c = self._create_test_event("order-arb-99")
+			cl_c = self._create_mock_client(current_state="99")
+			res_c = process_order_fulfillment_writeback_event(ev_c.name, client=cl_c)
+			self.assertFalse(res_c)
+			ev_c.reload()
+			self.assertIn(ev_c.status, (IntegrationStatus.FAILED, IntegrationStatus.DEAD_LETTER))
+			self.assertEqual(ev_c.last_error_code, "REMOTE_CANCELED")
+			cl_c.update_order_state.assert_not_called()
+
+			# D: Remote state 77 -> REFUNDED (review required, blocked)
+			ev_d = self._create_test_event("order-arb-77")
+			cl_d = self._create_mock_client(current_state="77")
+			res_d = process_order_fulfillment_writeback_event(ev_d.name, client=cl_d)
+			self.assertFalse(res_d)
+			ev_d.reload()
+			self.assertEqual(ev_d.last_error_code, "REMOTE_REVIEW_REQUIRED")
+			cl_d.update_order_state.assert_not_called()
+
+			# E: Remote state 88 -> PAYMENT_ERROR (review required, blocked)
+			ev_e = self._create_test_event("order-arb-88")
+			cl_e = self._create_mock_client(current_state="88")
+			res_e = process_order_fulfillment_writeback_event(ev_e.name, client=cl_e)
+			self.assertFalse(res_e)
+			ev_e.reload()
+			self.assertEqual(ev_e.last_error_code, "REMOTE_REVIEW_REQUIRED")
+			cl_e.update_order_state.assert_not_called()
+
+			# F: PrestaShop standard defaults 4, 6, 7 (which are UNMAPPED in this arbitrary connector)
+			# MUST NOT be treated as shipped or canceled; MUST fail safe as unmapped state!
+			ev_f = self._create_test_event("order-arb-6")
+			cl_f = self._create_mock_client(current_state="6")
+			res_f = process_order_fulfillment_writeback_event(ev_f.name, client=cl_f)
+			self.assertFalse(res_f)
+			ev_f.reload()
+			self.assertEqual(ev_f.last_error_code, "REMOTE_REVIEW_REQUIRED")
+			cl_f.update_order_state.assert_not_called()
+
+			# G: Remote state 101 -> ELIGIBLE active order, successfully transitions to 42
+			ev_g = self._create_test_event("order-arb-101")
+			cl_g = self._create_mock_client(current_state="101")
+			cl_g.update_order_state.return_value = {
+				"order_id": "order-arb-101",
+				"target_state_id": 42,
+				"order_history_id": 9991,
+				"changed": True,
+			}
+			res_g = process_order_fulfillment_writeback_event(ev_g.name, client=cl_g)
+			self.assertTrue(res_g)
+			ev_g.reload()
+			self.assertEqual(ev_g.status, IntegrationStatus.SUCCEEDED)
+			cl_g.update_order_state.assert_called_once_with(
+				order_id="order-arb-101",
+				target_state_id=42,
+				send_email=False,
+			)
+
+		# Restore connector configuration
+		frappe.db.set_value("PrestaShop Connector", self.connector_name, {
+			"shipping_state_id": "4",
+			"delivered_state_id": "5",
+			"cancellation_order_states": "6",
+			"review_order_states": "7,8",
+			"eligible_order_states": "2,3,11",
+		})
 
 	# 4. eligible submitted Delivery Note creates durable event
 	def test_04_eligible_submitted_delivery_note_creates_durable_event(self):
@@ -736,6 +855,60 @@ class TestOrderFulfillmentWritebackUnit(FrappeTestCase):
 			mock_logger.warning.assert_called()
 			log_text = mock_logger.warning.call_args[0][0]
 			self.assertIn("Manual operational review required", log_text)
+
+	# 36. email writeback policy respects order_state_send_email
+	def test_36_email_writeback_policy(self):
+		frappe.db.set_value("PrestaShop Connector", self.connector_name, "order_state_send_email", 0)
+		event_0 = self._create_test_event("1036-off")
+		mock_cl_0 = self._create_mock_client(current_state="2")
+
+		with patch("bop_erp.orders.fulfillment_writeback.frappe.db.get_value") as mock_gv:
+			mock_gv.side_effect = self._mock_db_fresh_reads
+			res0 = process_order_fulfillment_writeback_event(event_0.name, client=mock_cl_0)
+			self.assertTrue(res0)
+			mock_cl_0.update_order_state.assert_called_once_with(
+				order_id="1036-off",
+				target_state_id=4,
+				send_email=False,
+			)
+
+		# Now enable order_state_send_email = 1
+		frappe.db.set_value("PrestaShop Connector", self.connector_name, "order_state_send_email", 1)
+		event_1 = self._create_test_event("1036-on")
+		mock_cl_1 = self._create_mock_client(current_state="2")
+
+		with patch("bop_erp.orders.fulfillment_writeback.frappe.db.get_value") as mock_gv:
+			mock_gv.side_effect = self._mock_db_fresh_reads
+			res1 = process_order_fulfillment_writeback_event(event_1.name, client=mock_cl_1)
+			self.assertTrue(res1)
+			mock_cl_1.update_order_state.assert_called_once_with(
+				order_id="1036-on",
+				target_state_id=4,
+				send_email=True,
+			)
+
+		frappe.db.set_value("PrestaShop Connector", self.connector_name, "order_state_send_email", 0)
+
+	# 37. concurrent duplicate outbox idempotency key blocked at db level
+	def test_37_concurrent_duplicate_idempotency_key_blocked_at_db(self):
+		event_1 = self._create_test_event("1037")
+		self.assertIsNotNone(event_1.active_idempotency_key)
+
+		# Bypass frappe validate() to simulate concurrent DB race
+		event_2 = frappe.get_doc({
+			"doctype": "Integration Event",
+			"event_id": str(frappe.generate_hash()),
+			"provider": IntegrationProvider.PRESTASHOP,
+			"sales_channel": self.sales_channel,
+			"direction": IntegrationDirection.OUTBOUND,
+			"operation": IntegrationOperation.UPDATE_ORDER_FULFILLMENT_STATE,
+			"entity_type": ExternalEntityType.ORDER,
+			"external_id": "1037",
+			"status": IntegrationStatus.PENDING,
+			"idempotency_key": "DIFFERENT-KEY-SAME-ACTIVE-HASH",
+			"active_idempotency_key": event_1.active_idempotency_key, # Injected collision
+		})
+		self.assertRaises(Exception, event_2.db_insert)
 
 	# --- Test Helpers ---
 	def _create_test_event(self, order_id, channel=None, status=IntegrationStatus.PENDING):

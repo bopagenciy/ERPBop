@@ -486,7 +486,7 @@ def process_order_fulfillment_writeback_event(
 			for s in (connector.cancellation_order_states or "").split(",")
 			if s.strip().isdigit()
 		}
-		if remote_current_state in cancellation_states or remote_current_state == 6:  # 6=Canceled standard
+		if cancellation_states and remote_current_state in cancellation_states:
 			event_doc.mark_failed(
 				processing_token=processing_token,
 				error_code="REMOTE_CANCELED",
@@ -507,7 +507,7 @@ def process_order_fulfillment_writeback_event(
 			for s in (connector.review_order_states or "").split(",")
 			if s.strip().isdigit()
 		}
-		if remote_current_state in review_states or remote_current_state in (7, 8):  # 7=Refunded, 8=Payment error
+		if review_states and remote_current_state in review_states:
 			event_doc.mark_failed(
 				processing_token=processing_token,
 				error_code="REMOTE_REVIEW_REQUIRED",
@@ -519,6 +519,41 @@ def process_order_fulfillment_writeback_event(
 				"PrestaShop order '%s' is in review state (%s). Writeback blocked.",
 				event_doc.external_id,
 				remote_current_state,
+			)
+			return False
+
+		# Policy E: Remote Ineligible / Unmapped state -> Fail safe to review
+		eligible_states = {
+			int(s.strip())
+			for s in (connector.eligible_order_states or "").split(",")
+			if s.strip().isdigit()
+		}
+		if eligible_states and remote_current_state not in eligible_states:
+			event_doc.mark_failed(
+				processing_token=processing_token,
+				error_code="REMOTE_REVIEW_REQUIRED",
+				error_message=f"PrestaShop order '{event_doc.external_id}' is in unmapped/ineligible state ({remote_current_state}). Overwrite blocked.",
+				error_category=ErrorCategory.NON_RETRYABLE,
+			)
+			ORDER_WRITEBACK_COUNTERS["order_state_writes_blocked_remote_state"] += 1
+			logger.warning(
+				"PrestaShop order '%s' is in unmapped/ineligible state (%s). Writeback blocked.",
+				event_doc.external_id,
+				remote_current_state,
+			)
+			return False
+
+		if not cancellation_states and not eligible_states:
+			event_doc.mark_failed(
+				processing_token=processing_token,
+				error_code="SEMANTIC_STATES_NOT_CONFIGURED",
+				error_message=f"PrestaShop connector for channel '{event_doc.sales_channel}' has no semantic order states (cancellation/eligible) configured. Writeback blocked.",
+				error_category=ErrorCategory.NON_RETRYABLE,
+			)
+			ORDER_WRITEBACK_COUNTERS["order_state_writes_permanent_failed"] += 1
+			logger.warning(
+				"PrestaShop connector for channel '%s' lacks semantic state configuration. Writeback blocked.",
+				event_doc.sales_channel,
 			)
 			return False
 
@@ -538,11 +573,12 @@ def process_order_fulfillment_writeback_event(
 			return False
 
 		# 8. Execute Remote Order State Mutation (Section 2, 50)
+		send_email = bool(getattr(connector, "order_state_send_email", False))
 		ORDER_WRITEBACK_COUNTERS["order_state_writes_attempted"] += 1
 		res = client.update_order_state(
 			order_id=event_doc.external_id,
 			target_state_id=target_state_id,
-			send_email=False,
+			send_email=send_email,
 		)
 
 		ORDER_WRITEBACK_COUNTERS["order_state_writes_succeeded"] += 1

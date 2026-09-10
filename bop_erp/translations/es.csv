@@ -334,3 +334,4 @@ Variant Import Error: {0},Error al importar variante: {0}
 "Order State Write Enabled","Escritura de Estado de Pedido Habilitada"
 "Shipping State ID","ID de Estado de Envío"
 "Delivered State ID","ID de Estado de Entrega"
+"Order State Send Email","Enviar Correo en Cambio de Estado de Pedido"
