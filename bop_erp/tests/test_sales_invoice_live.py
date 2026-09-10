@@ -238,6 +238,11 @@ class TestSalesInvoiceLive(unittest.TestCase):
 
 		frappe.db.commit()
 
+	@classmethod
+	def tearDownClass(cls):
+		cls._cleanup_module_fixtures()
+		super().tearDownClass()
+
 	def setUp(self):
 		super().setUp()
 		reset_invoice_counters()

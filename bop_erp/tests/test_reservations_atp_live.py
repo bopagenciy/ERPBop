@@ -6,6 +6,7 @@ import time
 import unittest
 import frappe
 from frappe.utils import flt
+from erpnext.stock.utils import get_stock_balance
 
 from bop_erp.inventory.availability import (
 	get_atp_breakdown,
@@ -303,13 +304,22 @@ class TestReservationsATPLive(unittest.TestCase):
 			self._created_recos = []
 		super().tearDown()
 
-	def _set_physical_stock(self, item_code, warehouse, qty, valuation_rate=10.0):
+	def _set_physical_stock(self, item_code, warehouse, qty, valuation_rate=10.0, posting_date=None, posting_time=None):
 		"""Helper to adjust physical stock using native Stock Reconciliation."""
+		import datetime
+		site_now = frappe.utils.now_datetime()
+		effective_dt = site_now - datetime.timedelta(seconds=10)
+		p_date = posting_date or effective_dt.strftime("%Y-%m-%d")
+		p_time = posting_time or effective_dt.strftime("%H:%M:%S")
+
 		reco = frappe.get_doc({
 			"doctype": "Stock Reconciliation",
 			"company": self.company,
 			"purpose": "Opening Stock",
 			"expense_account": self.diff_account,
+			"set_posting_time": 1,
+			"posting_date": p_date,
+			"posting_time": p_time,
 			"items": [
 				{
 					"item_code": item_code,
@@ -326,17 +336,26 @@ class TestReservationsATPLive(unittest.TestCase):
 		self._created_recos.append(reco.name)
 		return reco.name
 
-	def _setup_stock(self, warehouse, qty, valuation_rate=10.0):
+	def _setup_stock(self, warehouse, qty, valuation_rate=10.0, posting_date=None, posting_time=None):
 		"""Convenience helper to set stock for default self.item_code."""
-		return self._set_physical_stock(self.item_code, warehouse, qty, valuation_rate=valuation_rate)
+		return self._set_physical_stock(self.item_code, warehouse, qty, valuation_rate=valuation_rate, posting_date=posting_date, posting_time=posting_time)
 
-	def _set_serialized_stock(self, item_code, warehouse, serial_nos, valuation_rate=10.0):
+	def _set_serialized_stock(self, item_code, warehouse, serial_nos, valuation_rate=10.0, posting_date=None, posting_time=None):
 		"""Helper to adjust physical stock for serialized items."""
+		import datetime
+		site_now = frappe.utils.now_datetime()
+		effective_dt = site_now - datetime.timedelta(seconds=10)
+		p_date = posting_date or effective_dt.strftime("%Y-%m-%d")
+		p_time = posting_time or effective_dt.strftime("%H:%M:%S")
+
 		reco = frappe.get_doc({
 			"doctype": "Stock Reconciliation",
 			"company": self.company,
 			"purpose": "Opening Stock",
 			"expense_account": self.diff_account,
+			"set_posting_time": 1,
+			"posting_date": p_date,
+			"posting_time": p_time,
 			"items": [
 				{
 					"item_code": item_code,
@@ -355,8 +374,14 @@ class TestReservationsATPLive(unittest.TestCase):
 		self._created_recos.append(reco.name)
 		return reco.name
 
-	def _set_batch_stock(self, item_code, warehouse, batch_no, qty, valuation_rate=10.0):
+	def _set_batch_stock(self, item_code, warehouse, batch_no, qty, valuation_rate=10.0, posting_date=None, posting_time=None):
 		"""Helper to adjust physical stock for batch items."""
+		import datetime
+		site_now = frappe.utils.now_datetime()
+		effective_dt = site_now - datetime.timedelta(seconds=10)
+		p_date = posting_date or effective_dt.strftime("%Y-%m-%d")
+		p_time = posting_time or effective_dt.strftime("%H:%M:%S")
+
 		if not frappe.db.exists("Batch", batch_no):
 			frappe.get_doc({
 				"doctype": "Batch",
@@ -368,6 +393,9 @@ class TestReservationsATPLive(unittest.TestCase):
 			"company": self.company,
 			"purpose": "Opening Stock",
 			"expense_account": self.diff_account,
+			"set_posting_time": 1,
+			"posting_date": p_date,
+			"posting_time": p_time,
 			"items": [
 				{
 					"item_code": item_code,
@@ -386,20 +414,22 @@ class TestReservationsATPLive(unittest.TestCase):
 		self._created_recos.append(reco.name)
 		return reco.name
 
-	def _cleanup_stock(self, reco_names):
+	def _cleanup_stock(self, reco_names=None):
 		"""Helper to cancel and purge test stock reconciliations."""
-		if not reco_names:
-			return
-		if isinstance(reco_names, str):
-			reco_names = [reco_names]
+		reco_list = []
+		if reco_names:
+			reco_list = [reco_names] if isinstance(reco_names, str) else list(reco_names)
+
 		test_items = [self.item_code, self.serial_item, self.batch_item, self.bundle_parent, self.bundle_comp1, self.bundle_comp2]
 		test_whs = [self.wh_miami, self.wh_orlando, self.wh_quarantine]
-		frappe.db.delete("Stock Ledger Entry", {"voucher_no": ["in", reco_names]})
+		if reco_list:
+			frappe.db.delete("Stock Ledger Entry", {"voucher_no": ["in", reco_list]})
+			frappe.db.delete("GL Entry", {"voucher_no": ["in", reco_list]})
+			frappe.db.delete("GL Entry", {"against_voucher": ["in", reco_list]})
+			frappe.db.delete("Stock Reconciliation Item", {"parent": ["in", reco_list]})
+			frappe.db.delete("Stock Reconciliation", {"name": ["in", reco_list]})
+
 		frappe.db.delete("Stock Ledger Entry", {"warehouse": ["in", test_whs]})
-		frappe.db.delete("GL Entry", {"voucher_no": ["in", reco_names]})
-		frappe.db.delete("GL Entry", {"against_voucher": ["in", reco_names]})
-		frappe.db.delete("Stock Reconciliation Item", {"parent": ["in", reco_names]})
-		frappe.db.delete("Stock Reconciliation", {"name": ["in", reco_names]})
 		frappe.db.delete("Bin", {"warehouse": ["in", test_whs]})
 		frappe.db.delete("Bin", {"item_code": ["in", test_items]})
 		frappe.db.delete("Stock Reservation Entry", {"item_code": ["in", test_items]})
@@ -2216,8 +2246,18 @@ class TestReservationsATPLive(unittest.TestCase):
 		2. Sales Order targets Quarantine (outside sellable pool) for 5 units.
 		   This SO target outside the pool does NOT burden the sellable channel pool.
 		"""
+		# Establish clean test fixture isolation deterministically before setting physical stock
+		self._cleanup_stock()
+
 		reco_m = self._setup_stock(self.wh_miami, 15.0)
 		reco_q = self._setup_stock(self.wh_quarantine, 10.0)
+
+		# Explicitly verify physical stock balance is effective and visible before SRE creation
+		bal_q = get_stock_balance(self.item_code, self.wh_quarantine)
+		self.assertEqual(bal_q, 10.0, "Physical stock in Quarantine must be 10.0 before SRE creation")
+		bal_m = get_stock_balance(self.item_code, self.wh_miami)
+		self.assertEqual(bal_m, 15.0, "Physical stock in Miami must be 15.0 before SRE creation")
+
 		so1 = None
 		sre1_q = None
 		so_out = None
