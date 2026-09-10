@@ -13,6 +13,7 @@ from bop_erp.constants import (
 )
 from bop_erp.accounts import (
 	CompanyMismatchError,
+	OrderNotEligibleForInvoicingError,
 	OverbillingBlockedError,
 	SalesInvoiceError,
 	assert_sales_invoice_eligibility,
@@ -583,6 +584,74 @@ class TestSalesInvoiceLive(unittest.TestCase):
 		is_safe, reasons = audit_sales_order_cancellation_safety(so.name)
 		self.assertFalse(is_safe, "Submitted Sales Invoice must block automatic Sales Order cancellation")
 		self.assertTrue(any("Sales Invoice" in r for r in reasons))
+
+	# =========================================================================
+	# SCENARIO M: Mapping drift protection blocks invoice creation live
+	# =========================================================================
+	def test_scenario_m_mapping_drift_blocks_invoice_creation(self):
+		so, dn = self._create_so_and_dn("1P-EXT-M-001", qty=2.0)
+
+		# Deactivate the canonical External ID Mapping to simulate mapping drift
+		frappe.db.set_value(
+			"External ID Mapping",
+			{"external_id": "1P-EXT-M-001", "sales_channel": self.sales_channel},
+			"active",
+			0,
+		)
+		frappe.db.commit()
+
+		with self.assertRaises(OrderNotEligibleForInvoicingError) as ctx:
+			create_sales_invoice_from_fulfillment(dn.name)
+		self.assertIn("Mapping Drift Violation", str(ctx.exception))
+
+		# Restore active mapping and verify invoice creation succeeds
+		frappe.db.set_value(
+			"External ID Mapping",
+			{"external_id": "1P-EXT-M-001", "sales_channel": self.sales_channel},
+			"active",
+			1,
+		)
+		frappe.db.commit()
+
+		si = create_sales_invoice_from_fulfillment(dn.name)
+		self.assertEqual(si.docstatus, 0)
+		self.assertEqual(si.external_order_id, "1P-EXT-M-001")
+
+	# =========================================================================
+	# SCENARIO N: Cancelled invoice restores billable scope live
+	# =========================================================================
+	def test_scenario_n_cancelled_invoice_restores_billable_scope(self):
+		# Create delivery note with 3.0 items
+		so, dn = self._create_so_and_dn("1P-EXT-N-001", qty=3.0)
+
+		# Bill partial scope 2.0 and submit
+		si1 = create_sales_invoice_from_fulfillment(
+			dn.name,
+			requested_lines=[{"dn_detail": dn.items[0].name, "qty": 2.0}],
+			submit=True,
+		)
+		self.assertEqual(si1.docstatus, 1)
+
+		# Delivery Note remaining billable is now 1.0; attempting to bill 2.0 is blocked
+		with self.assertRaises(OverbillingBlockedError):
+			create_sales_invoice_from_fulfillment(
+				dn.name,
+				requested_lines=[{"dn_detail": dn.items[0].name, "qty": 2.0}],
+			)
+
+		# Cancel the submitted Sales Invoice
+		cancel_sales_invoice(si1.name)
+		self.assertEqual(si1.reload().docstatus, 2)
+
+		# Billable scope is now fully restored to 3.0
+		# Invoicing 3.0 now succeeds
+		si2 = create_sales_invoice_from_fulfillment(
+			dn.name,
+			requested_lines=[{"dn_detail": dn.items[0].name, "qty": 3.0}],
+			submit=True,
+		)
+		self.assertEqual(si2.docstatus, 1)
+		self.assertEqual(si2.items[0].qty, 3.0)
 
 	# =========================================================================
 	# SCENARIO L: Fixture cleanup proof

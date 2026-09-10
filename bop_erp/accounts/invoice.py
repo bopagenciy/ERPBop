@@ -214,6 +214,37 @@ def assert_sales_invoice_eligibility(
 					_("Imported Sales Order '{0}' is missing external_order_id.").format(so_name)
 				)
 
+			# Canonical External ID Mapping validation (prevent mapping drift)
+			ext_id = str(so_doc.external_order_id)
+			mapping = frappe.db.get_value(
+				"External ID Mapping",
+				{
+					"sales_channel": so_doc.sales_channel,
+					"external_entity_type": "ORDER",
+					"external_id": ext_id,
+					"erp_doctype": "Sales Order",
+					"erp_document": so_name,
+					"active": 1,
+				},
+				["name", "provider"],
+				as_dict=True,
+			)
+			if not mapping:
+				INVOICE_COUNTERS["invoices_blocked"] += 1
+				raise OrderNotEligibleForInvoicingError(
+					_(
+						"Mapping Drift Violation: Sales Order '{0}' does not have an active canonical ORDER mapping for channel '{1}' and external ID '{2}'."
+					).format(so_name, so_doc.sales_channel, ext_id)
+				)
+
+			if so_doc.get("integration_provider") and mapping.provider != so_doc.integration_provider:
+				INVOICE_COUNTERS["invoices_blocked"] += 1
+				raise OrderNotEligibleForInvoicingError(
+					_(
+						"Mapping Drift Violation: Sales Order '{0}' provider '{1}' does not match active canonical mapping provider '{2}'."
+					).format(so_name, so_doc.integration_provider, mapping.provider)
+				)
+
 	return dn_doc, so_doc
 
 
@@ -266,21 +297,33 @@ def create_sales_invoice_from_fulfillment(
 	)
 
 	if existing_si_rows:
-		existing_si_name = existing_si_rows[0].get("name")
-		existing_docstatus = existing_si_rows[0].get("docstatus")
+		# If an in-flight draft Sales Invoice exists, converge to it (or submit on demand)
+		draft_rows = [r for r in existing_si_rows if r.get("docstatus") == 0]
+		if draft_rows:
+			draft_si_name = draft_rows[0].get("name")
+			if submit:
+				draft_si = frappe.get_doc("Sales Invoice", draft_si_name)
+				return submit_sales_invoice(draft_si)
 
-		if submit and existing_docstatus == 0:
-			# Existing draft can be submitted
-			existing_si = frappe.get_doc("Sales Invoice", existing_si_name)
-			return submit_sales_invoice(existing_si)
+			INVOICE_COUNTERS["invoices_reused"] += 1
+			INVOICE_COUNTERS["concurrent_replay"] += 1
+			logger.info("Converged to existing draft Sales Invoice '%s' for Delivery Note '%s'.", draft_si_name, dn_name)
+			return frappe.get_doc("Sales Invoice", draft_si_name)
 
-		INVOICE_COUNTERS["invoices_reused"] += 1
-		INVOICE_COUNTERS["concurrent_replay"] += 1
-		logger.info("Converged to existing Sales Invoice '%s' for Delivery Note '%s'.", existing_si_name, dn_name)
-		return frappe.get_doc("Sales Invoice", existing_si_name)
+		# For submitted invoices (docstatus = 1):
+		# Replay/convergence ONLY applies when no specific invoicing scope (requested_lines) is specified.
+		# If requested_lines is specified, the caller is asking to bill specific fulfilled scope,
+		# which must be evaluated against remaining unbilled quantities.
+		if requested_lines is None:
+			existing_si_name = existing_si_rows[0].get("name")
+			INVOICE_COUNTERS["invoices_reused"] += 1
+			INVOICE_COUNTERS["concurrent_replay"] += 1
+			logger.info("Converged to existing Sales Invoice '%s' for Delivery Note '%s'.", existing_si_name, dn_name)
+			return frappe.get_doc("Sales Invoice", existing_si_name)
 
 	# 3. Check for Overbilling: ensure unbilled quantity > 0 on Delivery Note items
 	unbilled_qty_found = False
+	remaining_by_dn_detail = {}
 	for it in dn_doc.items:
 		# Calculate already billed qty from submitted Sales Invoices
 		billed_rows = frappe.db.sql(
@@ -294,10 +337,10 @@ def create_sales_invoice_from_fulfillment(
 			(it.name,),
 		)
 		billed = flt(billed_rows[0][0]) if billed_rows and billed_rows[0] and billed_rows[0][0] is not None else 0.0
-		remaining = flt(it.qty) - billed
+		remaining = max(0.0, flt(it.qty) - billed)
+		remaining_by_dn_detail[it.name] = remaining
 		if remaining > 0.0001:
 			unbilled_qty_found = True
-			break
 
 	if not unbilled_qty_found:
 		INVOICE_COUNTERS["overbilling_blocked"] += 1
@@ -342,12 +385,14 @@ def create_sales_invoice_from_fulfillment(
 
 			if match_key is not None:
 				req_qty = req_map[match_key]
-				if req_qty > flt(item.qty):
+				remaining_allowed = remaining_by_dn_detail.get(item.dn_detail, flt(item.qty))
+				max_allowed = min(flt(item.qty), remaining_allowed)
+				if req_qty > max_allowed + 0.0001:
 					INVOICE_COUNTERS["overbilling_blocked"] += 1
 					INVOICE_COUNTERS["invoices_blocked"] += 1
 					raise OverbillingBlockedError(
-						_("Requested quantity {0} exceeds delivered quantity {1} for item '{2}'.").format(
-							req_qty, item.qty, item.item_code
+						_("Requested quantity {0} exceeds available unbilled quantity {1} for item '{2}'.").format(
+							req_qty, max_allowed, item.item_code
 						)
 					)
 				item.qty = req_qty

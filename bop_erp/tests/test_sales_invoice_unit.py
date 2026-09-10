@@ -48,6 +48,24 @@ class TestSalesInvoiceUnit(FrappeTestCase):
 		super().setUp()
 		reset_invoice_counters()
 
+		# Patch frappe.db.get_value to simulate valid canonical External ID Mapping for unit tests
+		self._orig_db_get_value = frappe.db.get_value
+
+		def _mock_get_value(doctype, filters=None, fieldname=None, as_dict=False, **kwargs):
+			if doctype == "External ID Mapping":
+				if isinstance(filters, dict) and filters.get("external_id") == "DRIFTED-EXT":
+					return None
+				if isinstance(filters, dict) and filters.get("external_id") == "DRIFTED-PROV":
+					return frappe._dict({"name": "MAP-DRIFT", "provider": "OTHER_PROVIDER"}) if as_dict else "MAP-DRIFT"
+				return frappe._dict({"name": "MAP-001", "provider": "prestashop"}) if as_dict else "MAP-001"
+			return self._orig_db_get_value(doctype, filters=filters, fieldname=fieldname, as_dict=as_dict, **kwargs)
+
+		frappe.db.get_value = _mock_get_value
+
+	def tearDown(self):
+		frappe.db.get_value = self._orig_db_get_value
+		super().tearDown()
+
 	def _make_mock_so(
 		self,
 		name="SO-TEST-1P-001",
@@ -650,3 +668,102 @@ class TestSalesInvoiceUnit(FrappeTestCase):
 		     patch("frappe.get_doc", return_value=si):
 			with self.assertRaises(SalesInvoiceError):
 				submit_sales_invoice(si)
+
+	# -------------------------------------------------------------------------
+	# 31. Phase 1P.1 Mapping drift protection blocks invoice creation
+	# -------------------------------------------------------------------------
+	def test_31_mapping_drift_blocks_invoice_creation(self):
+		so = self._make_mock_so(external_order_id="DRIFTED-EXT")
+		dn = self._make_mock_dn(external_order_id="DRIFTED-EXT")
+
+		with patch("frappe.db.exists", return_value=True), \
+		     patch("frappe.get_doc", side_effect=self._get_doc_mock(so, dn, None)):
+			with self.assertRaises(OrderNotEligibleForInvoicingError) as ctx:
+				assert_sales_invoice_eligibility(dn.name, so.name)
+			self.assertIn("Mapping Drift Violation", str(ctx.exception))
+
+		# Also test provider mismatch drift
+		so2 = self._make_mock_so(external_order_id="DRIFTED-PROV")
+		so2.integration_provider = "prestashop"
+		dn2 = self._make_mock_dn(external_order_id="DRIFTED-PROV")
+		with patch("frappe.db.exists", return_value=True), \
+		     patch("frappe.get_doc", side_effect=self._get_doc_mock(so2, dn2, None)):
+			with self.assertRaises(OrderNotEligibleForInvoicingError) as ctx:
+				assert_sales_invoice_eligibility(dn2.name, so2.name)
+			self.assertIn("Mapping Drift Violation", str(ctx.exception))
+
+	# -------------------------------------------------------------------------
+	# 32. Phase 1P.1 Cancelled invoice restores billable scope
+	# -------------------------------------------------------------------------
+	def test_32_cancelled_invoice_restores_billable_scope(self):
+		# Delivery note has 3.0 qty.
+		# When docstatus=1 invoice exists for 2.0, remaining billable is 1.0.
+		# When that invoice is cancelled (docstatus=2), remaining billable returns to 3.0.
+		dn = self._make_mock_dn()
+		so = self._make_mock_so()
+		si = self._make_mock_si(docstatus=0)
+
+		# Case A: 2.0 billed via active submitted SI (docstatus=1)
+		with patch("frappe.db.sql") as mock_sql, \
+		     patch("frappe.db.exists", return_value=True), \
+		     patch("frappe.get_doc", side_effect=self._get_doc_mock(so, dn, si)), \
+		     patch("erpnext.stock.doctype.delivery_note.delivery_note.make_sales_invoice", return_value=si), \
+		     patch("bop_erp.accounts.invoice._reconcile_invoice_financials"):
+			# existing SI query returns empty (no draft/submitted linked)
+			# billed_rows query returns 2.0
+			mock_sql.side_effect = [
+				[(dn.name,)],      # lock dn
+				[(so.name,)],      # lock so
+				[],                # existing_si_rows
+				[(2.0,)],          # billed_rows -> remaining = 1.0 (unbilled_qty_found = True)
+			]
+			si_res = create_sales_invoice_from_fulfillment(dn.name)
+			self.assertIsNotNone(si_res)
+
+		# Case B: Invoice was cancelled -> docstatus=1 query returns 0.0 billed
+		with patch("frappe.db.sql") as mock_sql, \
+		     patch("frappe.db.exists", return_value=True), \
+		     patch("frappe.get_doc", side_effect=self._get_doc_mock(so, dn, si)), \
+		     patch("erpnext.stock.doctype.delivery_note.delivery_note.make_sales_invoice", return_value=si), \
+		     patch("bop_erp.accounts.invoice._reconcile_invoice_financials"):
+			mock_sql.side_effect = [
+				[(dn.name,)],      # lock dn
+				[(so.name,)],      # lock so
+				[],                # existing_si_rows (cancelled SI is docstatus=2 so not returned)
+				[(0.0,)],          # billed_rows -> remaining = 3.0 (fully restored billable scope)
+			]
+			si_res = create_sales_invoice_from_fulfillment(dn.name)
+			self.assertIsNotNone(si_res)
+
+	# -------------------------------------------------------------------------
+	# 33. Phase 1P.1 Draft invoice converges and submits on demand
+	# -------------------------------------------------------------------------
+	def test_33_draft_invoice_convergence_and_submission(self):
+		dn = self._make_mock_dn()
+		so = self._make_mock_so()
+		si = self._make_mock_si(name="ACC-SINV-DRAFT-01", docstatus=0)
+
+		# When create_sales_invoice_from_fulfillment called without submit=True -> returns draft
+		with patch("frappe.db.sql") as mock_sql, \
+		     patch("frappe.db.exists", return_value=True), \
+		     patch("frappe.get_doc", side_effect=self._get_doc_mock(so, dn, si)):
+			mock_sql.side_effect = [
+				[(dn.name,)],      # lock dn
+				[(so.name,)],      # lock so
+				[{"name": "ACC-SINV-DRAFT-01", "docstatus": 0, "status": "Draft"}], # existing_si_rows
+			]
+			res = create_sales_invoice_from_fulfillment(dn.name, submit=False)
+			self.assertEqual(res.name, "ACC-SINV-DRAFT-01")
+
+		# When create_sales_invoice_from_fulfillment called with submit=True -> submits the draft
+		with patch("frappe.db.sql") as mock_sql, \
+		     patch("frappe.db.exists", return_value=True), \
+		     patch("frappe.get_doc", side_effect=self._get_doc_mock(so, dn, si)), \
+		     patch("bop_erp.accounts.invoice.submit_sales_invoice", return_value=si) as mock_submit:
+			mock_sql.side_effect = [
+				[(dn.name,)],      # lock dn
+				[(so.name,)],      # lock so
+				[{"name": "ACC-SINV-DRAFT-01", "docstatus": 0, "status": "Draft"}], # existing_si_rows
+			]
+			res = create_sales_invoice_from_fulfillment(dn.name, submit=True)
+			mock_submit.assert_called_once()
