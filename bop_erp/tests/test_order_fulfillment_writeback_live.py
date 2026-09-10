@@ -54,6 +54,8 @@ class TestOrderFulfillmentWritebackLive(unittest.TestCase):
 	L. Fixture cleanup & synthetic order restoration.
 	"""
 
+	MODULE_CHANNEL_PREFIX = "TEST-LIVE-CH-"
+
 	@classmethod
 	def setUpClass(cls):
 		super().setUpClass()
@@ -61,9 +63,12 @@ class TestOrderFulfillmentWritebackLive(unittest.TestCase):
 			frappe.init("frontend")
 			frappe.connect()
 
+		# Defensively clean up any stale fixtures from interrupted/prior runs of this module
+		cls._cleanup_module_fixtures()
+
 		cls.company = frappe.db.get_single_value("Global Defaults", "default_company") or "Industrial DP"
-		cls.sales_channel = f"TEST-LIVE-CH-{frappe.generate_hash(length=4).upper()}"
-		cls.channel_b = f"TEST-LIVE-CH-B-{frappe.generate_hash(length=4).upper()}"
+		cls.sales_channel = f"{cls.MODULE_CHANNEL_PREFIX}A-{frappe.generate_hash(length=4).upper()}"
+		cls.channel_b = f"{cls.MODULE_CHANNEL_PREFIX}B-{frappe.generate_hash(length=4).upper()}"
 
 		# Create Sales Channel A
 		if not frappe.db.exists("Sales Channel", cls.sales_channel):
@@ -159,14 +164,42 @@ class TestOrderFulfillmentWritebackLive(unittest.TestCase):
 		cls._restore_remote_orders()
 
 	@classmethod
+	def _cleanup_module_fixtures(cls, specific_channels=None):
+		"""Safely cleans up channels, connectors, and mappings belonging exclusively to this test module."""
+		if specific_channels:
+			channels_to_clean = [ch for ch in specific_channels if ch]
+		else:
+			# Find all module-scoped channels
+			rows = frappe.db.get_all(
+				"Sales Channel",
+				filters={"name": ["like", f"{cls.MODULE_CHANNEL_PREFIX}%"]},
+				pluck="name",
+			)
+			channels_to_clean = list(rows)
+
+		for ch in channels_to_clean:
+			# Delete dependent integration events first
+			frappe.db.delete("Integration Event", {"sales_channel": ch})
+			# Delete dependent mappings
+			frappe.db.delete("External ID Mapping", {"sales_channel": ch})
+			# Delete dependent connectors
+			frappe.db.delete("PrestaShop Connector", {"sales_channel": ch})
+			# Delete sales channel
+			frappe.db.delete("Sales Channel", {"name": ch})
+
+		# Also clean any orphaned connectors matching the module prefix pattern
+		frappe.db.delete("PrestaShop Connector", {"sales_channel": ["like", f"{cls.MODULE_CHANNEL_PREFIX}%"]})
+		frappe.db.delete("External ID Mapping", {"sales_channel": ["like", f"{cls.MODULE_CHANNEL_PREFIX}%"]})
+		frappe.db.delete("Integration Event", {"sales_channel": ["like", f"{cls.MODULE_CHANNEL_PREFIX}%"]})
+
+		frappe.db.commit()
+
+	@classmethod
 	def tearDownClass(cls):
 		cls._restore_remote_orders()
-		for ch in [cls.sales_channel, cls.channel_b]:
-			frappe.db.delete("Integration Event", {"sales_channel": ch})
-			frappe.db.delete("External ID Mapping", {"sales_channel": ch})
-			frappe.db.delete("PrestaShop Connector", {"sales_channel": ch})
-			frappe.db.delete("Sales Channel", {"name": ch})
-		frappe.db.commit()
+		cls._cleanup_module_fixtures(
+			specific_channels=[getattr(cls, "sales_channel", None), getattr(cls, "channel_b", None)]
+		)
 		super().tearDownClass()
 
 	@classmethod
@@ -648,3 +681,15 @@ class TestOrderFulfillmentWritebackLive(unittest.TestCase):
 			self.assertIsNotNone(order)
 			self.assertEqual(int(order.get("id")), oid)
 			self.assertEqual(int(order.get("current_state")), 2, f"Order {oid} must be restored to state 2")
+
+		# Verify no orphaned module fixtures outside the active test channels exist
+		active_channels = {self.sales_channel, self.channel_b}
+		existing_channels = set(
+			frappe.db.get_all(
+				"Sales Channel",
+				filters={"name": ["like", f"{self.MODULE_CHANNEL_PREFIX}%"]},
+				pluck="name",
+			)
+		)
+		orphaned = existing_channels - active_channels
+		self.assertEqual(len(orphaned), 0, f"Found leaked/orphaned module channels: {orphaned}")
