@@ -207,6 +207,18 @@ def get_database_now():
 	try:
 		tz = frappe.get_system_settings("time_zone") or "UTC"
 		db_res = frappe.db.sql("SELECT CONVERT_TZ(NOW(), @@session.time_zone, %s)", (tz,))[0][0]
+		if not db_res:
+			try:
+				import zoneinfo
+				from datetime import datetime
+				offset_str = datetime.now(zoneinfo.ZoneInfo(tz)).strftime("%z")
+				if offset_str and len(offset_str) == 5:
+					formatted_offset = f"{offset_str[:3]}:{offset_str[3:]}"
+					db_res = frappe.db.sql(
+						"SELECT CONVERT_TZ(NOW(), @@session.time_zone, %s)", (formatted_offset,)
+					)[0][0]
+			except Exception:
+				pass
 		if db_res:
 			return get_datetime(db_res)
 		return now_datetime()

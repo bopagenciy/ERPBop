@@ -1,8 +1,10 @@
 # Copyright (c) 2026, Bop Agency and Contributors
 # See license.txt
 
+import datetime
 import json
 import unittest
+import zoneinfo
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 import frappe
@@ -331,12 +333,40 @@ class TestPrestaShopPublicationSchedulerUnit(unittest.TestCase):
 	# ==================================================
 	def test_06_database_time_authority_helper(self):
 		"""
-		Verifies get_database_now returns valid datetime matching SELECT NOW().
+		Verifies get_database_now returns authoritative timestamp from MariaDB
+		in the site's local timezone.
+		Normalizes raw DB session NOW() and get_database_now() to canonical UTC
+		instants to verify equality within a tight tolerance without naive date comparison.
 		"""
 		db_now = get_database_now()
 		self.assertIsNotNone(db_now)
 		raw_now = frappe.db.sql("SELECT NOW()")[0][0]
-		self.assertEqual(get_datetime(raw_now).date(), db_now.date())
+
+		site_tz_str = frappe.get_system_settings("time_zone") or "UTC"
+		sess_tz_str = frappe.db.sql("SELECT @@session.time_zone")[0][0]
+		if sess_tz_str == "SYSTEM":
+			sess_tz_str = frappe.db.sql("SELECT @@system_time_zone")[0][0]
+
+		site_tz = zoneinfo.ZoneInfo(site_tz_str)
+		sess_tz = zoneinfo.ZoneInfo(sess_tz_str)
+
+		raw_now_utc = get_datetime(raw_now).replace(tzinfo=sess_tz).astimezone(zoneinfo.ZoneInfo("UTC"))
+		db_now_utc = db_now.replace(tzinfo=site_tz).astimezone(zoneinfo.ZoneInfo("UTC"))
+
+		diff_seconds = abs((raw_now_utc - db_now_utc).total_seconds())
+		self.assertLess(
+			diff_seconds,
+			2.0,
+			f"Canonical time authority delta too large: {diff_seconds}s (raw_now={raw_now}, db_now={db_now})",
+		)
+
+		# Also verify MariaDB CONVERT_TZ consistency when supported
+		db_converted = frappe.db.sql(
+			"SELECT CONVERT_TZ(NOW(), @@session.time_zone, %s)", (site_tz_str,)
+		)[0][0]
+		if db_converted:
+			diff_db_conv = abs((get_datetime(db_converted) - db_now).total_seconds())
+			self.assertLess(diff_db_conv, 2.0, "get_database_now diverges from MariaDB CONVERT_TZ")
 
 	# ==================================================
 	# 7. SCHEDULER BOUNDED WORK PROCESSING
@@ -546,3 +576,73 @@ class TestPrestaShopPublicationSchedulerUnit(unittest.TestCase):
 				max_events=15,
 				now=frappe.flags.in_test or False,
 			)
+
+	# ==================================================
+	# 14. MIDNIGHT BOUNDARY DATABASE TIME REGRESSION
+	# ==================================================
+	def test_14_database_time_authority_midnight_boundary(self):
+		"""
+		Regression for midnight boundary condition:
+		UTC date = next day (e.g. 2026-09-10 01:30:00)
+		Site local date = previous day (e.g. 2026-09-09 20:30:00 in America/Bogota UTC-5).
+		Proves:
+		1. Dates intentionally differ (.date() comparison would falsely fail).
+		2. Canonical instants are identical when normalized to UTC (diff = 0s).
+		3. get_database_now() returns site-local timestamp matching persistence semantics.
+		4. verify_processing_authority uses authoritative DB time without false expiration.
+		"""
+		site_tz_name = frappe.get_system_settings("time_zone") or "America/Bogota"
+		site_tz = zoneinfo.ZoneInfo(site_tz_name)
+		utc_tz = zoneinfo.ZoneInfo("UTC")
+
+		# Synthetic boundary instants across midnight
+		utc_time = datetime.datetime(2026, 9, 10, 1, 30, 0)
+		local_time = datetime.datetime(2026, 9, 9, 20, 30, 0)
+
+		# Invariant 1: Dates differ across the midnight boundary
+		self.assertNotEqual(
+			utc_time.date(),
+			local_time.date(),
+			"Calendar dates must differ across midnight boundary",
+		)
+
+		# Invariant 2: Instant normalization proves identical physical time
+		utc_instant = utc_time.replace(tzinfo=utc_tz)
+		local_instant = local_time.replace(tzinfo=site_tz).astimezone(utc_tz)
+		self.assertEqual(
+			abs((utc_instant - local_instant).total_seconds()),
+			0.0,
+			"Normalized canonical instants must be identical",
+		)
+
+		# Invariant 3: get_database_now helper returns site-local time
+		with patch("bop_erp.reliability.frappe.db.sql") as mock_sql:
+			mock_sql.return_value = ((local_time,),)
+			mock_site_now = get_database_now()
+			self.assertEqual(mock_site_now, local_time)
+
+		# Invariant 4: Lease authority verification at midnight boundary
+		event = self._create_test_event(item_code=self.item_code)
+		token = "midnight-token-123"
+
+		# A lease expiring 5 minutes into the future of local_time (20:35:00) is valid
+		frappe.db.set_value("Integration Event", event.name, {
+			"status": IntegrationStatus.PROCESSING,
+			"worker_id": "worker-midnight",
+			"processing_token": token,
+			"lease_expires_at": local_time + timedelta(minutes=5),
+		})
+		is_auth, reason = verify_processing_authority(event.name, token, db_time=local_time)
+		self.assertTrue(
+			is_auth,
+			f"Valid lease erroneously rejected across midnight boundary: {reason}",
+		)
+
+		# An expired lease (20:25:00 vs local_time 20:30:00) is rejected
+		frappe.db.set_value("Integration Event", event.name, {
+			"lease_expires_at": local_time - timedelta(minutes=5),
+		})
+		is_auth_expired, reason_expired = verify_processing_authority(event.name, token, db_time=local_time)
+		self.assertFalse(is_auth_expired)
+		self.assertIn("expired", reason_expired.lower())
+
