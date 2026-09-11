@@ -47,6 +47,16 @@ def protect_imported_order_price_master() -> Generator[None, None, None]:
 	ss_copy.update_existing_price_list_rate = 0
 	frappe.local.cache[cached_key] = ss_copy
 
+	# Fail-fast compatibility assertion: verify Frappe caching contract holds
+	verified_ss = frappe.get_cached_doc("Stock Settings")
+	if verified_ss.auto_insert_price_list_rate_if_missing != 0:
+		raise RuntimeError(
+			"Pricing protection cache contract assertion failed: "
+			"frappe.get_cached_doc('Stock Settings') did not reflect the thread-local "
+			"auto_insert_price_list_rate_if_missing = 0 override. Frappe caching contract "
+			"may have changed in this environment."
+		)
+
 	try:
 		yield
 	finally:

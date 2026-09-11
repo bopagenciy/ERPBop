@@ -817,60 +817,61 @@ def ingest_order_pipeline(
 	sp_order = f"sp_ord_ingest_{frappe.generate_hash(length=8)}"
 	frappe.db.savepoint(sp_order)
 
+	# Create Sales Order in DRAFT (docstatus = 0)
+	so = frappe.get_doc({
+		"doctype": "Sales Order",
+		"customer": customer_name,
+		"company": company,
+		"transaction_date": _parse_date(external_order.date_add) or nowdate(),
+		"delivery_date": _parse_date(external_order.date_add) or nowdate(),
+		"currency": currency,
+		"sales_channel": sales_channel,
+		"transaction_origin": TransactionOrigin.WEB,
+		"external_order_id": str(order_id).strip(),
+		"integration_status": IntegrationReadinessStatus.INGESTION_PENDING,
+		"integration_provider": str(provider).strip().upper(),
+		"customer_address": invoice_addr,
+		"shipping_address_name": delivery_addr,
+		"items": so_items,
+	})
+	so.flags.ignore_permissions = True
 	with protect_imported_order_price_master():
-		# Create Sales Order in DRAFT (docstatus = 0)
-		so = frappe.get_doc({
-			"doctype": "Sales Order",
-			"customer": customer_name,
-			"company": company,
-			"transaction_date": _parse_date(external_order.date_add) or nowdate(),
-			"delivery_date": _parse_date(external_order.date_add) or nowdate(),
-			"currency": currency,
-			"sales_channel": sales_channel,
-			"transaction_origin": TransactionOrigin.WEB,
-			"external_order_id": str(order_id).strip(),
-			"integration_status": IntegrationReadinessStatus.INGESTION_PENDING,
-			"integration_provider": str(provider).strip().upper(),
-			"customer_address": invoice_addr,
-			"shipping_address_name": delivery_addr,
-			"items": so_items,
-		})
-		so.flags.ignore_permissions = True
 		so.insert(ignore_permissions=True)
 
-		# Pre-claim External ID Mapping BEFORE submitting or reserving!
-		mapping = frappe.get_doc({
-			"doctype": "External ID Mapping",
-			"sales_channel": sales_channel,
-			"provider": str(provider).strip().upper(),
-			"external_entity_type": ExternalEntityType.ORDER,
-			"external_id": str(order_id).strip(),
-			"erp_doctype": "Sales Order",
-			"erp_document": so.name,
-			"active": 1,
-		})
+	# Pre-claim External ID Mapping BEFORE submitting or reserving!
+	mapping = frappe.get_doc({
+		"doctype": "External ID Mapping",
+		"sales_channel": sales_channel,
+		"provider": str(provider).strip().upper(),
+		"external_entity_type": ExternalEntityType.ORDER,
+		"external_id": str(order_id).strip(),
+		"erp_doctype": "Sales Order",
+		"erp_document": so.name,
+		"active": 1,
+	})
+	try:
+		mapping.insert(ignore_permissions=True)
+	except frappe.QueryDeadlockError:
+		raise
+	except (frappe.DuplicateEntryError, frappe.ValidationError):
+		# Race condition: another worker claimed this external order first!
+		# Roll back our draft order cleanly so NO transient submitted order exists!
 		try:
-			mapping.insert(ignore_permissions=True)
-		except frappe.QueryDeadlockError:
-			raise
-		except (frappe.DuplicateEntryError, frappe.ValidationError):
-			# Race condition: another worker claimed this external order first!
-			# Roll back our draft order cleanly so NO transient submitted order exists!
-			try:
-				frappe.db.rollback(save_point=sp_order)
-			except Exception:
-				pass
-			winner = find_existing_order_mapping(sales_channel, provider, order_id)
-			if winner:
-				return {
-					"success": True,
-					"sales_order": winner,
-					"is_replay": True,
-					"reason": "CONCURRENT_WINNER_MAPPED",
-				}
-			raise
+			frappe.db.rollback(save_point=sp_order)
+		except Exception:
+			pass
+		winner = find_existing_order_mapping(sales_channel, provider, order_id)
+		if winner:
+			return {
+				"success": True,
+				"sales_order": winner,
+				"is_replay": True,
+				"reason": "CONCURRENT_WINNER_MAPPED",
+			}
+		raise
 
-		# Confirmed sole owner: proceed with submission
+	# Confirmed sole owner: proceed with submission
+	with protect_imported_order_price_master():
 		so.submit()
 	so.db_set("integration_status", IntegrationReadinessStatus.RESERVATION_PENDING)
 	frappe.db.set_value(
