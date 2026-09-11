@@ -174,6 +174,9 @@ class TestPostcommitAndOperationalGuardLive(unittest.TestCase):
 		cls.write_client.update_stock_available_quantity(cls.stock_available_id_a, cls.baseline_qty_a, cls.product_id_a, None)
 		cls.write_client.update_stock_available_quantity(cls.stock_available_id_pliers, cls.baseline_qty_pliers, cls.product_id_pliers, None)
 
+		# Clean any pre-existing test item prices
+		frappe.db.delete("Item Price", {"item_code": ["in", [cls.item_a, cls.item_pliers]]})
+
 		frappe.db.commit()
 
 	@classmethod
@@ -197,6 +200,7 @@ class TestPostcommitAndOperationalGuardLive(unittest.TestCase):
 
 		for ic in [cls.item_a, cls.item_pliers]:
 			frappe.db.delete("Bin", {"item_code": ic})
+			frappe.db.delete("Item Price", {"item_code": ic})
 
 		# Ensure persistent TID mapping for product 21 is restored
 		if not frappe.db.exists("External ID Mapping", {"sales_channel": cls.channel_tid, "erp_document": cls.item_pliers, "active": 1}):
@@ -274,6 +278,9 @@ class TestPostcommitAndOperationalGuardLive(unittest.TestCase):
 		for a in frappe.get_all("Address", filters={"name": ["in", ["Alex Mercer-Shipping"]]}, pluck="name") + frappe.get_all("Address", filters={"address_title": ["like", "%Live Guard%"]}, pluck="name"):
 			frappe.db.delete("External ID Mapping", {"erp_document": a})
 			frappe.delete_doc("Address", a, force=True, ignore_permissions=True)
+
+		# Clean test item prices
+		frappe.db.delete("Item Price", {"item_code": ["in", [cls.item_a, cls.item_pliers]]})
 
 		frappe.db.commit()
 
