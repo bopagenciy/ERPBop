@@ -19,9 +19,11 @@ from bop_erp.constants import (
 )
 from bop_erp.accounts.exceptions import (
 	CompanyMismatchError,
+	CustomerMismatchError,
 	DuplicatePaymentError,
 	OverpaymentBlockedError,
 	PaymentAccountMismatchError,
+	PaymentAuthorityLostError,
 	PaymentEligibilityError,
 	PaymentMappingDriftError,
 	PaymentReconciliationError,
@@ -29,17 +31,27 @@ from bop_erp.accounts.exceptions import (
 
 logger = frappe.logger("bop_erp")
 
-# Structured Observability Counters (Section 42 & 44)
+# Structured Observability Counters (Section 45)
 PAYMENT_COUNTERS: Dict[str, int] = {
-	"reconciliation_requests": 0,
-	"payments_created": 0,
+	"external_payment_discovered": 0,
+	"payment_reconciliation_started": 0,
+	"payment_entry_created": 0,
+	"payment_entry_submitted": 0,
+	"payment_reconciliation_noop": 0,
+	"payment_reconciliation_blocked": 0,
+	"payment_overpayment_review": 0,
+	"payment_mapping_drift": 0,
+	"payment_authority_lost": 0,
 	"payments_reused": 0,
-	"payments_submitted": 0,
 	"payments_cancelled": 0,
+	"failed": 0,
+	# Compatibility aliases
+	"reconciliation_requests": 0,
 	"payments_blocked": 0,
 	"overpayment_blocked": 0,
 	"concurrent_replay": 0,
-	"failed": 0,
+	"payments_created": 0,
+	"payments_submitted": 0,
 }
 
 
@@ -106,6 +118,34 @@ def compute_external_payment_idempotency_key(
 	]
 	canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 	return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def resolve_external_payment_identity(
+	provider: str,
+	sales_channel: str,
+	external_payment_id: str,
+) -> Optional[Dict[str, Any]]:
+	"""
+	Resolves canonical External ID Mapping for a payment transaction.
+	Returns mapping row as dict if found, else None.
+	"""
+	from bop_erp.bop_erp.doctype.external_id_mapping.external_id_mapping import (
+		compute_active_external_key,
+	)
+	clean_prov = str(provider).strip().upper()
+	ext_pay_id = str(external_payment_id).strip()
+	active_ext_key = compute_active_external_key(
+		sales_channel,
+		ExternalEntityType.PAYMENT,
+		ext_pay_id,
+		provider=clean_prov,
+	)
+	return frappe.db.get_value(
+		"External ID Mapping",
+		{"active_external_key": active_ext_key, "active": 1},
+		["name", "erp_doctype", "erp_document", "provider", "sales_channel"],
+		as_dict=True,
+	)
 
 
 def resolve_clearing_account_for_payment(
@@ -248,6 +288,15 @@ def assert_payment_reconciliation_eligibility(
 	   - Must exist, be submitted (docstatus = 1), not cancelled.
 	   - outstanding_amount must be strictly > 0.
 	"""
+	# 0. Payment Record validation (order state alone is not sufficient)
+	if not payment_record or not getattr(payment_record, "external_payment_id", None):
+		PAYMENT_COUNTERS["payments_blocked"] += 1
+		PAYMENT_COUNTERS["payment_reconciliation_blocked"] += 1
+		raise PaymentEligibilityError(
+			_("Order state alone is insufficient proof of payment. A valid normalized "
+			  "ExternalPaymentRecord with durable transaction identity is required.")
+		)
+
 	# 1. Amount validation
 	amt = flt(payment_record.amount)
 	if amt <= 0.00001:
@@ -258,8 +307,21 @@ def assert_payment_reconciliation_eligibility(
 
 	# 2. Status validation
 	status = str(payment_record.payment_status).strip().upper()
+	if status in ExternalPaymentStatus.INELIGIBLE_PENDING:
+		PAYMENT_COUNTERS["payments_blocked"] += 1
+		PAYMENT_COUNTERS["payment_reconciliation_blocked"] += 1
+		raise PaymentEligibilityError(
+			_("Pending/authorized external payment status '{0}' is not eligible for financial posting.").format(status)
+		)
+	if status in ExternalPaymentStatus.REVIEW_REQUIRED:
+		PAYMENT_COUNTERS["payments_blocked"] += 1
+		PAYMENT_COUNTERS["payment_reconciliation_blocked"] += 1
+		raise PaymentEligibilityError(
+			_("External payment status '{0}' requires review and cannot be reconciled automatically.").format(status)
+		)
 	if status not in ExternalPaymentStatus.ELIGIBLE_FOR_RECONCILIATION:
 		PAYMENT_COUNTERS["payments_blocked"] += 1
+		PAYMENT_COUNTERS["payment_reconciliation_blocked"] += 1
 		raise PaymentEligibilityError(
 			_("External payment status '{0}' is not eligible for reconciliation. "
 			  "Must be one of: {1}.").format(
@@ -385,7 +447,59 @@ def assert_payment_reconciliation_eligibility(
 				)
 			)
 
+	# 7. Customer isolation across eligible invoices
+	if eligible_invoices:
+		first_customer = eligible_invoices[0].customer
+		for si in eligible_invoices:
+			if si.customer != first_customer:
+				PAYMENT_COUNTERS["payments_blocked"] += 1
+				PAYMENT_COUNTERS["payment_reconciliation_blocked"] += 1
+				raise CustomerMismatchError(
+					_("Customer Mismatch: Invoices in allocation plan belong to different customers ('{0}' vs '{1}').").format(
+						first_customer, si.customer
+					)
+				)
+
 	return eligible_invoices, so_doc
+
+
+def get_payment_reconciliation_eligibility(
+	payment_record: ExternalPaymentRecord,
+	sales_invoices: Optional[List[Any]] = None,
+	sales_order: Optional[Any] = None,
+) -> Tuple[List[Any], Any]:
+	"""Alias wrapper for assert_payment_reconciliation_eligibility."""
+	return assert_payment_reconciliation_eligibility(
+		payment_record, sales_invoices=sales_invoices, sales_order=sales_order
+	)
+
+
+def get_payment_allocation_plan(
+	payment_amount: float,
+	eligible_invoices: List[Any],
+) -> List[Dict[str, Any]]:
+	"""Alias wrapper for plan_invoice_allocations."""
+	return plan_invoice_allocations(payment_amount, eligible_invoices)
+
+
+def create_payment_entry(
+	payment_record: ExternalPaymentRecord,
+	sales_invoices: Optional[List[Any]] = None,
+	sales_order: Optional[Any] = None,
+	posting_date: Optional[str] = None,
+	event_name: Optional[str] = None,
+	processing_token: Optional[str] = None,
+) -> Any:
+	"""Creates draft Payment Entry without submitting it."""
+	return reconcile_external_payment(
+		payment_record,
+		sales_invoices=sales_invoices,
+		sales_order=sales_order,
+		posting_date=posting_date,
+		submit=False,
+		event_name=event_name,
+		processing_token=processing_token,
+	)
 
 
 def plan_invoice_allocations(
@@ -451,6 +565,8 @@ def reconcile_external_payment(
 	sales_order: Optional[Any] = None,
 	posting_date: Optional[str] = None,
 	submit: bool = True,
+	event_name: Optional[str] = None,
+	processing_token: Optional[str] = None,
 ) -> Any:
 	"""
 	Provider-neutral External Payment Reconciliation service.
@@ -465,8 +581,24 @@ def reconcile_external_payment(
 	  External ID Mapping (entity_type = 'PAYMENT').
 	- Concurrency safe: serialized via MariaDB row-level locks on target Sales Invoices.
 	- Strictly blocks overpayment beyond total outstanding amount.
+	- Fenced: requires valid unexpired processing token when event pipeline is used.
+	- Replay protection: transactions cancelled in ERP route safely to review without duplicate creation.
 	"""
+	PAYMENT_COUNTERS["external_payment_discovered"] += 1
+	PAYMENT_COUNTERS["payment_reconciliation_started"] += 1
 	PAYMENT_COUNTERS["reconciliation_requests"] += 1
+
+	if event_name and processing_token:
+		from bop_erp.reliability import verify_processing_authority
+		is_valid, reason = verify_processing_authority(event_name, processing_token)
+		if not is_valid:
+			PAYMENT_COUNTERS["payment_authority_lost"] += 1
+			PAYMENT_COUNTERS["payment_reconciliation_blocked"] += 1
+			raise PaymentAuthorityLostError(
+				_("Processing authority verification failed for event '{0}': {1}").format(
+					event_name, reason
+				)
+			)
 
 	channel = payment_record.sales_channel
 	clean_prov = str(payment_record.provider).strip().upper()
@@ -495,10 +627,19 @@ def reconcile_external_payment(
 		pe_name = existing_map.erp_document
 		if frappe.db.exists("Payment Entry", pe_name):
 			pe_doc = frappe.get_doc("Payment Entry", pe_name)
+			if pe_doc.docstatus == 2:
+				PAYMENT_COUNTERS["payment_reconciliation_blocked"] += 1
+				raise PaymentEligibilityError(
+					_("Payment Entry '{0}' for external payment '{1}' was manually cancelled in ERP. "
+					  "Automatic replay is blocked and routes to REVIEW_REQUIRED.").format(
+						pe_name, ext_pay_id
+					)
+				)
 			if pe_doc.docstatus == 0 and submit:
 				# Converge and submit existing draft
 				return submit_payment_entry(pe_doc)
 
+			PAYMENT_COUNTERS["payment_reconciliation_noop"] += 1
 			PAYMENT_COUNTERS["payments_reused"] += 1
 			PAYMENT_COUNTERS["concurrent_replay"] += 1
 			logger.info(
@@ -607,11 +748,21 @@ def reconcile_external_payment(
 		)
 		pe.transaction_origin = trans_orig
 
-		pe.flags.ignore_validate = False
-		pe.flags.ignore_mandatory = False
-		pe.flags.ignore_permissions = True
+		# Fencing re-check immediately prior to financial insertion
+		if event_name and processing_token:
+			from bop_erp.reliability import verify_processing_authority
+			is_valid, reason = verify_processing_authority(event_name, processing_token)
+			if not is_valid:
+				PAYMENT_COUNTERS["payment_authority_lost"] += 1
+				PAYMENT_COUNTERS["payment_reconciliation_blocked"] += 1
+				raise PaymentAuthorityLostError(
+					_("Processing authority lost immediately before financial mutation for event '{0}': {1}").format(
+						event_name, reason
+					)
+				)
 
 		pe.insert()
+		PAYMENT_COUNTERS["payment_entry_created"] += 1
 		PAYMENT_COUNTERS["payments_created"] += 1
 		logger.info(
 			"Created draft Payment Entry '%s' for external payment '%s'.",
@@ -682,6 +833,7 @@ def submit_payment_entry(payment_entry: Union[str, Any]) -> Any:
 
 	try:
 		pe_doc.submit()
+		PAYMENT_COUNTERS["payment_entry_submitted"] += 1
 		PAYMENT_COUNTERS["payments_submitted"] += 1
 		logger.info(
 			"Submitted Payment Entry '%s' (allocated: %s).",
@@ -735,12 +887,8 @@ def cancel_payment_entry(payment_entry: Union[str, Any]) -> Any:
 		pe_doc.flags.ignore_permissions = True
 		pe_doc.cancel()
 
-		frappe.db.set_value(
-			"External ID Mapping",
-			{"erp_doctype": "Payment Entry", "erp_document": pe_name},
-			"active",
-			0,
-		)
+		# Section 34 & 35: Preserve terminal payment identity in External ID Mapping.
+		# Do not deactivate mapping so that DB-level unique constraint persists and replay routes to review.
 
 		PAYMENT_COUNTERS["payments_cancelled"] += 1
 		logger.info("Cancelled Payment Entry '%s'.", pe_name)

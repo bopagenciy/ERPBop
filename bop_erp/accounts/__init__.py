@@ -3,6 +3,7 @@
 
 from bop_erp.accounts.exceptions import (
 	CompanyMismatchError,
+	CustomerMismatchError,
 	DeliveryNoteNotReadyForInvoicingError,
 	DuplicatePaymentError,
 	DuplicateSalesInvoiceError,
@@ -12,6 +13,7 @@ from bop_erp.accounts.exceptions import (
 	OverbillingBlockedError,
 	OverpaymentBlockedError,
 	PaymentAccountMismatchError,
+	PaymentAuthorityLostError,
 	PaymentEligibilityError,
 	PaymentMappingDriftError,
 	PaymentReconciliationError,
@@ -34,16 +36,21 @@ from bop_erp.accounts.payments import (
 	assert_payment_reconciliation_eligibility,
 	cancel_payment_entry,
 	compute_external_payment_idempotency_key,
+	create_payment_entry,
+	get_payment_allocation_plan,
 	get_payment_counters,
+	get_payment_reconciliation_eligibility,
 	plan_invoice_allocations,
 	reconcile_external_payment,
 	reset_payment_counters,
 	resolve_clearing_account_for_payment,
+	resolve_external_payment_identity,
 	submit_payment_entry,
 )
 
 __all__ = [
 	"CompanyMismatchError",
+	"CustomerMismatchError",
 	"DeliveryNoteNotReadyForInvoicingError",
 	"DuplicatePaymentError",
 	"DuplicateSalesInvoiceError",
@@ -53,6 +60,7 @@ __all__ = [
 	"OverbillingBlockedError",
 	"OverpaymentBlockedError",
 	"PaymentAccountMismatchError",
+	"PaymentAuthorityLostError",
 	"PaymentEligibilityError",
 	"PaymentMappingDriftError",
 	"PaymentReconciliationError",
@@ -71,11 +79,15 @@ __all__ = [
 	"assert_payment_reconciliation_eligibility",
 	"cancel_payment_entry",
 	"compute_external_payment_idempotency_key",
+	"create_payment_entry",
+	"get_payment_allocation_plan",
 	"get_payment_counters",
+	"get_payment_reconciliation_eligibility",
 	"plan_invoice_allocations",
 	"reconcile_external_payment",
 	"reset_payment_counters",
 	"resolve_clearing_account_for_payment",
+	"resolve_external_payment_identity",
 	"submit_payment_entry",
 ]
 

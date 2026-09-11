@@ -73,3 +73,13 @@ class PaymentMappingDriftError(PaymentReconciliationError):
 	"""Raised when canonical External ID Mapping drifts or conflicts during payment processing."""
 	pass
 
+
+class CustomerMismatchError(PaymentReconciliationError):
+	"""Raised when customer bounds or parties do not match target invoices."""
+	pass
+
+
+class PaymentAuthorityLostError(PaymentReconciliationError):
+	"""Raised when worker lease expires or processing token is stale before financial mutation."""
+	pass
+

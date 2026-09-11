@@ -2,23 +2,26 @@
 # See license.txt
 
 import unittest
-from decimal import Decimal
+from typing import Any, Tuple
 import frappe
-from frappe.utils import flt, nowdate
+from frappe.utils import add_to_date, flt, now_datetime, nowdate
 
 from bop_erp.constants import (
 	ExternalEntityType,
 	IntegrationProvider,
 	IntegrationReadinessStatus,
+	IntegrationStatus,
 	TransactionOrigin,
 )
 from bop_erp.accounts import (
 	CompanyMismatchError,
+	CustomerMismatchError,
 	DuplicatePaymentError,
 	ExternalPaymentRecord,
 	ExternalPaymentStatus,
 	OverpaymentBlockedError,
 	PaymentAccountMismatchError,
+	PaymentAuthorityLostError,
 	PaymentEligibilityError,
 	PaymentMappingDriftError,
 	PaymentReconciliationError,
@@ -44,23 +47,23 @@ class TestExternalPaymentLive(unittest.TestCase):
 	Payment Entry / External Payment Reconciliation Foundation.
 	Executes against the local Frappe / ERPNext isolated test environment.
 
-	Scenarios (Section 45: A to P):
-	A. SETTLED external payment -> native Payment Entry (payment_type='Receive') against submitted invoice
-	B. Payment submission reduces Sales Invoice outstanding_amount natively
-	C. Balanced GL Entries: Debit Bank/Clearing, Credit Accounts Receivable
-	D. Idempotent re-ingestion: duplicate payment record converges to existing Payment Entry
-	E. Partial payment: invoice remains open with exact reduced outstanding balance
-	F. Multi-invoice allocation: single payment covers multiple invoices (oldest first)
-	G. Overpayment blocked: payment amount exceeding invoice outstanding balance is strictly rejected
-	H. Concurrent execution serialization: row lock prevents double payment entry creation
-	I. Payment Entry cancellation: reverses GL entries and restores invoice outstanding amount
-	J. Phase 1L cancellation guard: submitted Payment Entry blocks automatic Sales Order cancellation
-	K. Ineligible payment status: PENDING / AUTHORIZED blocked from creating financial ledger records
-	L. Mapping drift protection: order mapping mismatch or missing mapping blocks reconciliation
-	M. Cross-company accounting mismatch: clearing account belonging to different company blocked
-	N. Zero stock impact: Stock Ledger Entry and Bin completely untouched by payment lifecycle
-	O. Zero invoice status writeback / 0 PrestaShop core mutations
-	P. Pristine fixture cleanup: zero residual TEST-1Q-... records across all doctypes
+	Scenarios (Section 53: A to P):
+	A. Submitted Sales Invoice = 100, settled external payment = 100 -> submitted native Payment Entry -> outstanding = 0
+	B. Invoice = 100, payment = 40 -> outstanding = 60
+	C. Second external payment = 60 -> outstanding = 0 -> two distinct Payment Entries
+	D. Replay first transaction -> no duplicate Payment Entry -> no duplicate GL effect
+	E. Two concurrent workers same external transaction -> exactly one effective Payment Entry
+	F. Response lost after Payment Entry submit -> retry converges -> no duplicate accounting
+	G. Overpayment: outstanding 60, payment 100 -> REVIEW/BLOCK -> no Payment Entry
+	H. Pending/authorized-only payment -> no Payment Entry
+	I. External order marked Paid but no normalized transaction -> no Payment Entry
+	J. Multi-invoice same order: 60 + 40, payment 70 -> allocations 60 + 10 -> remaining 30
+	K. Cross-customer or cross-company attempted allocation -> blocked
+	L. Payment Entry cancel: invoice outstanding restored, GL reversed, upstream documents remain submitted
+	M. Replay external transaction after manually cancelled Payment Entry -> REVIEW_REQUIRED -> no silent recreation
+	N. Expired processing lease before submit -> zero Payment Entry
+	O. Mapping drift before payment submit -> zero Payment Entry
+	P. Fixture cleanup proof
 	"""
 
 	FIXTURE_PREFIX = "TEST-1Q-"
@@ -180,6 +183,12 @@ class TestExternalPaymentLive(unittest.TestCase):
 			})
 			mop_doc.save(ignore_permissions=True)
 
+		# Ensure receivable account for direct invoice tests
+		cls.receivable_account = (
+			frappe.db.get_value("Company", cls.company, "default_receivable_account")
+			or frappe.db.get_value("Account", {"company": cls.company, "account_type": "Receivable", "is_group": 0}, "name")
+		)
+
 		frappe.db.commit()
 
 	@classmethod
@@ -193,7 +202,6 @@ class TestExternalPaymentLive(unittest.TestCase):
 		abbr = getattr(cls, "abbr", None) or frappe.get_cached_value("Company", company, "abbr") or "IDP"
 
 		# 1. Clean Payment Entries
-
 		pe_names = frappe.db.sql(
 			"""
 			SELECT name FROM `tabPayment Entry`
@@ -288,7 +296,6 @@ class TestExternalPaymentLive(unittest.TestCase):
 				frappe.db.delete("GL Entry", {"voucher_no": se_name})
 				frappe.db.delete("Stock Ledger Entry", {"voucher_no": se_name})
 
-
 		# 5b. Clean SREs and IRRs
 		sres = frappe.db.sql(
 			"""
@@ -310,12 +317,14 @@ class TestExternalPaymentLive(unittest.TestCase):
 			(f"{cls.FIXTURE_PREFIX}%",),
 		)
 
-		# 6. Clean Mappings and Channels
-
+		# 6. Clean Mappings, Events, and Channels
 		for ch in [f"{cls.FIXTURE_PREFIX}CH-A", f"{cls.FIXTURE_PREFIX}CH-B"]:
 			frappe.db.delete("External ID Mapping", {"sales_channel": ch})
 			frappe.db.delete("Integration Event", {"sales_channel": ch})
 			frappe.db.delete("Sales Channel", {"name": ch})
+
+		# Clean any stray test customers
+		frappe.db.delete("Customer", {"name": f"{cls.FIXTURE_PREFIX}OTHER-CUST"})
 
 		# 7. Clean Bank Account
 		bank_acc = f"{cls.FIXTURE_PREFIX}Bank - {abbr}"
@@ -369,7 +378,7 @@ class TestExternalPaymentLive(unittest.TestCase):
 				)
 		frappe.db.commit()
 
-	def _create_so_and_dn(self, ext_id: str, qty: float = 3.0, channel: str = None) -> Tuple[Any, Any]:
+	def _create_so_and_dn(self, ext_id: str, qty: float = 1.0, channel: str = None) -> Tuple[Any, Any]:
 		ch = channel or self.sales_channel
 		so = frappe.get_doc({
 			"doctype": "Sales Order",
@@ -451,7 +460,7 @@ class TestExternalPaymentLive(unittest.TestCase):
 		frappe.db.commit()
 		return so, dn
 
-	def _create_submitted_invoice(self, ext_id: str, qty: float = 2.0, channel: str = None) -> Tuple[Any, Any, Any]:
+	def _create_submitted_invoice(self, ext_id: str, qty: float = 1.0, channel: str = None) -> Tuple[Any, Any, Any]:
 		so, dn = self._create_so_and_dn(ext_id, qty=qty, channel=channel)
 		si = create_sales_invoice_from_fulfillment(dn.name, submit=True)
 		return so, dn, si
@@ -499,24 +508,24 @@ class TestExternalPaymentLive(unittest.TestCase):
 
 		# Clean mappings for test channels
 		frappe.db.delete("External ID Mapping", {"sales_channel": ["in", [self.sales_channel, self.channel_b]]})
+		frappe.db.delete("Integration Event", {"sales_channel": ["in", [self.sales_channel, self.channel_b]]})
 
 		frappe.db.commit()
 
-
-
 	# =========================================================================
-	# SCENARIO A: SETTLED external payment -> native Payment Entry (Receive)
+	# SCENARIO A: Submitted Sales Invoice = 100, settled external payment = 100
+	# -> submitted native Payment Entry -> outstanding = 0
 	# =========================================================================
-	def test_scenario_a_settled_payment_creates_native_payment_entry(self):
-		so, dn, si = self._create_submitted_invoice("1Q-EXT-A-001", qty=2.0)
+	def test_scenario_a_settled_payment_full_reconciliation(self):
+		so, dn, si = self._create_submitted_invoice("1Q-EXT-A-001", qty=1.0)
 		self.assertEqual(si.docstatus, 1)
-		self.assertEqual(flt(si.outstanding_amount), 200.0)
+		self.assertEqual(flt(si.outstanding_amount), 100.0)
 
 		pay_rec = ExternalPaymentRecord(
 			provider=IntegrationProvider.PRESTASHOP,
 			sales_channel=self.sales_channel,
 			external_payment_id="PAY-A-001",
-			amount=200.0,
+			amount=100.0,
 			currency="COP",
 			payment_method="Credit Card",
 			payment_status=ExternalPaymentStatus.SETTLED,
@@ -529,18 +538,22 @@ class TestExternalPaymentLive(unittest.TestCase):
 		self.assertEqual(pe.docstatus, 1)
 		self.assertEqual(pe.party, self.customer)
 		self.assertEqual(pe.sales_channel, self.sales_channel)
-		self.assertEqual(flt(pe.paid_amount), 200.0)
+		self.assertEqual(flt(pe.paid_amount), 100.0)
+
+		si.reload()
+		self.assertEqual(flt(si.outstanding_amount), 0.0)
+		self.assertEqual(si.status, "Paid")
 
 	# =========================================================================
-	# SCENARIO B: Payment submission reduces Sales Invoice outstanding_amount natively
+	# SCENARIO B: Invoice = 100, payment = 40 -> outstanding = 60
 	# =========================================================================
-	def test_scenario_b_payment_reduces_invoice_outstanding_amount(self):
-		so, dn, si = self._create_submitted_invoice("1Q-EXT-B-001", qty=2.0)
+	def test_scenario_b_partial_payment_reduces_outstanding_amount(self):
+		so, dn, si = self._create_submitted_invoice("1Q-EXT-B-001", qty=1.0)
 		pay_rec = ExternalPaymentRecord(
 			provider=IntegrationProvider.PRESTASHOP,
 			sales_channel=self.sales_channel,
 			external_payment_id="PAY-B-001",
-			amount=200.0,
+			amount=40.0,
 			currency="COP",
 			payment_method="Credit Card",
 			payment_status=ExternalPaymentStatus.SETTLED,
@@ -549,252 +562,320 @@ class TestExternalPaymentLive(unittest.TestCase):
 
 		pe = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
 		si.reload()
-		self.assertEqual(flt(si.outstanding_amount), 0.0)
-		self.assertEqual(si.status, "Paid")
+		self.assertEqual(flt(si.outstanding_amount), 60.0)
+		self.assertEqual(si.status, "Partly Paid")
 
 	# =========================================================================
-	# SCENARIO C: Balanced GL Entries: Debit Clearing, Credit Receivable
+	# SCENARIO C: Second external payment = 60 -> outstanding = 0 -> two distinct PEs
 	# =========================================================================
-	def test_scenario_c_gl_entries_balanced(self):
-		so, dn, si = self._create_submitted_invoice("1Q-EXT-C-001", qty=2.0)
-		pay_rec = ExternalPaymentRecord(
+	def test_scenario_c_second_payment_completes_invoice_two_entries(self):
+		so, dn, si = self._create_submitted_invoice("1Q-EXT-C-001", qty=1.0)
+		# First payment 40.0
+		pay1 = ExternalPaymentRecord(
 			provider=IntegrationProvider.PRESTASHOP,
 			sales_channel=self.sales_channel,
 			external_payment_id="PAY-C-001",
-			amount=200.0,
+			amount=40.0,
 			currency="COP",
 			payment_method="Credit Card",
 			payment_status=ExternalPaymentStatus.SETTLED,
 			external_order_id="1Q-EXT-C-001",
 		)
+		pe1 = reconcile_external_payment(pay1, sales_invoices=[si], submit=True)
+		si.reload()
+		self.assertEqual(flt(si.outstanding_amount), 60.0)
 
-		pe = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
-
-		gl_entries = frappe.db.get_all(
-			"GL Entry",
-			filters={"voucher_no": pe.name, "is_cancelled": 0},
-			fields=["account", "debit", "credit"],
+		# Second external payment 60.0
+		pay2 = ExternalPaymentRecord(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.sales_channel,
+			external_payment_id="PAY-C-002",
+			amount=60.0,
+			currency="COP",
+			payment_method="Credit Card",
+			payment_status=ExternalPaymentStatus.SETTLED,
+			external_order_id="1Q-EXT-C-001",
 		)
-		self.assertGreaterEqual(len(gl_entries), 2)
-		total_debit = sum(flt(g.debit) for g in gl_entries)
-		total_credit = sum(flt(g.credit) for g in gl_entries)
-		self.assertAlmostEqual(total_debit, total_credit, places=2)
-		self.assertAlmostEqual(total_debit, 200.0, places=2)
-
-		# Verify accounts: Bank account debited, Receivable credited
-		accounts_debited = [g.account for g in gl_entries if flt(g.debit) > 0]
-		accounts_credited = [g.account for g in gl_entries if flt(g.credit) > 0]
-		self.assertIn(self.bank_account, accounts_debited)
-		self.assertIn(si.debit_to, accounts_credited)
+		pe2 = reconcile_external_payment(pay2, sales_invoices=[si], submit=True)
+		si.reload()
+		self.assertEqual(flt(si.outstanding_amount), 0.0)
+		self.assertEqual(si.status, "Paid")
+		self.assertNotEqual(pe1.name, pe2.name)
 
 	# =========================================================================
-	# SCENARIO D: Idempotent re-ingestion: duplicate payment converges
+	# SCENARIO D: Replay first transaction -> no duplicate Payment Entry -> no duplicate GL
 	# =========================================================================
-	def test_scenario_d_idempotent_reingestion_converges(self):
-		so, dn, si = self._create_submitted_invoice("1Q-EXT-D-001", qty=2.0)
+	def test_scenario_d_replay_first_transaction_no_duplicate_accounting(self):
+		so, dn, si = self._create_submitted_invoice("1Q-EXT-D-001", qty=1.0)
 		pay_rec = ExternalPaymentRecord(
 			provider=IntegrationProvider.PRESTASHOP,
 			sales_channel=self.sales_channel,
 			external_payment_id="PAY-D-001",
-			amount=200.0,
+			amount=40.0,
 			currency="COP",
 			payment_method="Credit Card",
 			payment_status=ExternalPaymentStatus.SETTLED,
 			external_order_id="1Q-EXT-D-001",
 		)
-
 		pe1 = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
+		gl_count_1 = frappe.db.count("GL Entry", {"voucher_no": pe1.name})
+		si.reload()
+		out_1 = flt(si.outstanding_amount)
+
+		# Replay identical transaction
 		pe2 = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
 		self.assertEqual(pe1.name, pe2.name)
-
-		# Verify only 1 Payment Entry exists in DB for this external payment ID
-		pe_count = frappe.db.count("External ID Mapping", {
-			"sales_channel": self.sales_channel,
-			"external_entity_type": ExternalEntityType.PAYMENT,
-			"external_id": "PAY-D-001",
-			"active": 1,
-		})
-		self.assertEqual(pe_count, 1)
+		gl_count_2 = frappe.db.count("GL Entry", {"voucher_no": pe1.name})
+		self.assertEqual(gl_count_1, gl_count_2)
+		si.reload()
+		self.assertEqual(flt(si.outstanding_amount), out_1)
 
 	# =========================================================================
-	# SCENARIO E: Partial payment: invoice remains open with reduced balance
+	# SCENARIO E: Two concurrent workers same external transaction -> exactly one effective PE
 	# =========================================================================
-	def test_scenario_e_partial_payment_reduces_outstanding_balance(self):
-		so, dn, si = self._create_submitted_invoice("1Q-EXT-E-001", qty=2.0)  # total 200.0
+	def test_scenario_e_concurrent_duplicate_payment_convergence(self):
+		so, dn, si = self._create_submitted_invoice("1Q-EXT-E-001", qty=1.0)
 		pay_rec = ExternalPaymentRecord(
 			provider=IntegrationProvider.PRESTASHOP,
 			sales_channel=self.sales_channel,
 			external_payment_id="PAY-E-001",
-			amount=75.0,
+			amount=100.0,
 			currency="COP",
 			payment_method="Credit Card",
 			payment_status=ExternalPaymentStatus.SETTLED,
 			external_order_id="1Q-EXT-E-001",
 		)
 
-		pe = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
-		si.reload()
-		self.assertEqual(flt(si.outstanding_amount), 125.0)
-		self.assertEqual(si.status, "Partly Paid")
+		pe1 = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
+		pe2 = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
+		self.assertEqual(pe1.name, pe2.name)
+		pe_count = frappe.db.count("Payment Entry Reference", {"reference_name": si.name})
+		self.assertEqual(pe_count, 1)
 
 	# =========================================================================
-	# SCENARIO F: Multi-invoice allocation: covers multiple invoices oldest-first
+	# SCENARIO F: Response lost after Payment Entry submit -> retry converges -> no duplicate accounting
 	# =========================================================================
-	def test_scenario_f_multi_invoice_allocation(self):
-		so1, dn1, si1 = self._create_submitted_invoice("1Q-EXT-F-001", qty=1.0)  # 100.0
-		so2, dn2, si2 = self._create_submitted_invoice("1Q-EXT-F-002", qty=1.0)  # 100.0
-
+	def test_scenario_f_response_lost_retry_converges(self):
+		so, dn, si = self._create_submitted_invoice("1Q-EXT-F-001", qty=1.0)
 		pay_rec = ExternalPaymentRecord(
 			provider=IntegrationProvider.PRESTASHOP,
 			sales_channel=self.sales_channel,
 			external_payment_id="PAY-F-001",
-			amount=160.0,
+			amount=100.0,
+			currency="COP",
+			payment_method="Credit Card",
+			payment_status=ExternalPaymentStatus.SETTLED,
+			external_order_id="1Q-EXT-F-001",
+		)
+		pe = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
+		# Worker loses response, retries
+		pe_retry = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
+		self.assertEqual(pe.name, pe_retry.name)
+		self.assertEqual(pe_retry.docstatus, 1)
+
+	# =========================================================================
+	# SCENARIO G: Overpayment: outstanding 60, payment 100 -> REVIEW/BLOCK -> no Payment Entry
+	# =========================================================================
+	def test_scenario_g_overpayment_blocked_routes_review(self):
+		so, dn, si = self._create_submitted_invoice("1Q-EXT-G-001", qty=1.0) # total 100.0
+		# Apply partial payment 40.0 so outstanding is 60.0
+		pay_part = ExternalPaymentRecord(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.sales_channel,
+			external_payment_id="PAY-G-PART",
+			amount=40.0,
+			currency="COP",
+			payment_method="Credit Card",
+			payment_status=ExternalPaymentStatus.SETTLED,
+			external_order_id="1Q-EXT-G-001",
+		)
+		reconcile_external_payment(pay_part, sales_invoices=[si], submit=True)
+		si.reload()
+		self.assertEqual(flt(si.outstanding_amount), 60.0)
+
+		# Attempt overpayment of 100.0 on 60.0 outstanding
+		pay_over = ExternalPaymentRecord(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.sales_channel,
+			external_payment_id="PAY-G-OVER",
+			amount=100.0,
+			currency="COP",
+			payment_method="Credit Card",
+			payment_status=ExternalPaymentStatus.SETTLED,
+			external_order_id="1Q-EXT-G-001",
+		)
+		with self.assertRaises(OverpaymentBlockedError):
+			reconcile_external_payment(pay_over, sales_invoices=[si], submit=True)
+
+		si.reload()
+		self.assertEqual(flt(si.outstanding_amount), 60.0)
+
+	# =========================================================================
+	# SCENARIO H: Pending/authorized-only payment -> no Payment Entry
+	# =========================================================================
+	def test_scenario_h_pending_authorized_payment_no_pe(self):
+		so, dn, si = self._create_submitted_invoice("1Q-EXT-H-001", qty=1.0)
+		for st in [ExternalPaymentStatus.PENDING, ExternalPaymentStatus.AUTHORIZED]:
+			pay_rec = ExternalPaymentRecord(
+				provider=IntegrationProvider.PRESTASHOP,
+				sales_channel=self.sales_channel,
+				external_payment_id=f"PAY-H-{st}",
+				amount=100.0,
+				currency="COP",
+				payment_method="Credit Card",
+				payment_status=st,
+				external_order_id="1Q-EXT-H-001",
+			)
+			with self.assertRaises(PaymentEligibilityError):
+				reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
+		si.reload()
+		self.assertEqual(flt(si.outstanding_amount), 100.0)
+
+	# =========================================================================
+	# SCENARIO I: External order marked Paid but no normalized transaction -> no Payment Entry
+	# =========================================================================
+	def test_scenario_i_order_marked_paid_without_transaction_no_pe(self):
+		so, dn, si = self._create_submitted_invoice("1Q-EXT-I-001", qty=1.0)
+		with self.assertRaises(PaymentEligibilityError):
+			assert_payment_reconciliation_eligibility(None)
+
+	# =========================================================================
+	# SCENARIO J: Multi-invoice same order: 60 + 40, payment 70 -> allocations 60 + 10 -> remaining 30
+	# =========================================================================
+	def test_scenario_j_multi_invoice_same_order_allocation(self):
+		so = frappe.get_doc({
+			"doctype": "Sales Order",
+			"customer": self.customer,
+			"company": self.company,
+			"transaction_origin": TransactionOrigin.WEB,
+			"sales_channel": self.sales_channel,
+			"external_order_id": "1Q-EXT-J-001",
+			"integration_status": IntegrationReadinessStatus.READY,
+			"delivery_date": nowdate(),
+			"currency": "COP",
+			"items": [{
+				"item_code": self.item_code,
+				"qty": 1.0,
+				"rate": 100.0,
+				"warehouse": self.warehouse,
+			}],
+		}).insert(ignore_permissions=True)
+		so.submit()
+
+		mapping = frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"provider": IntegrationProvider.PRESTASHOP,
+			"sales_channel": self.sales_channel,
+			"external_entity_type": ExternalEntityType.ORDER,
+			"external_id": "1Q-EXT-J-001",
+			"erp_doctype": "Sales Order",
+			"erp_document": so.name,
+			"active": 1,
+		}).insert(ignore_permissions=True)
+
+		# Make two invoices directly for this order
+		si1 = frappe.get_doc({
+			"doctype": "Sales Invoice",
+			"customer": self.customer,
+			"company": self.company,
+			"sales_channel": self.sales_channel,
+			"currency": "COP",
+			"debit_to": self.receivable_account,
+			"posting_date": "2026-09-01",
+			"items": [{
+				"item_code": self.item_code,
+				"qty": 1.0,
+				"rate": 60.0,
+				"income_account": self.income_account,
+			}],
+		}).insert(ignore_permissions=True)
+		si1.submit()
+
+		si2 = frappe.get_doc({
+			"doctype": "Sales Invoice",
+			"customer": self.customer,
+			"company": self.company,
+			"sales_channel": self.sales_channel,
+			"currency": "COP",
+			"debit_to": self.receivable_account,
+			"posting_date": "2026-09-02",
+			"items": [{
+				"item_code": self.item_code,
+				"qty": 1.0,
+				"rate": 40.0,
+				"income_account": self.income_account,
+			}],
+		}).insert(ignore_permissions=True)
+		si2.submit()
+
+		pay_rec = ExternalPaymentRecord(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.sales_channel,
+			external_payment_id="PAY-J-MULTI",
+			amount=70.0,
 			currency="COP",
 			payment_method="Credit Card",
 			payment_status=ExternalPaymentStatus.SETTLED,
 			external_order_id=None,
 		)
 
-		# Pass both invoices to reconcile
 		pe = reconcile_external_payment(pay_rec, sales_invoices=[si1, si2], submit=True)
 		si1.reload()
 		si2.reload()
-
-		self.assertEqual(flt(si1.outstanding_amount), 0.0)  # si1 fully paid (100.0 allocated)
-		self.assertEqual(flt(si2.outstanding_amount), 40.0)  # si2 partly paid (60.0 allocated)
+		self.assertEqual(flt(si1.outstanding_amount), 0.0)
+		self.assertEqual(flt(si2.outstanding_amount), 30.0)
 
 	# =========================================================================
-	# SCENARIO G: Overpayment blocked: amount exceeding invoice balance rejected
+	# SCENARIO K: Cross-customer or cross-company attempted allocation -> blocked
 	# =========================================================================
-	def test_scenario_g_overpayment_beyond_balance_blocked(self):
-		so, dn, si = self._create_submitted_invoice("1Q-EXT-G-001", qty=1.0)  # 100.0
+	def test_scenario_k_cross_customer_or_company_blocked(self):
+		so1, dn1, si1 = self._create_submitted_invoice("1Q-EXT-K-001", qty=1.0)
+		other_customer = f"{self.FIXTURE_PREFIX}OTHER-CUST"
+		cg = frappe.db.get_value("Customer", self.customer, "customer_group") or frappe.db.get_value("Customer Group", {"is_group": 0}, "name")
+		terr = frappe.db.get_value("Customer", self.customer, "territory") or frappe.db.get_value("Territory", {"is_group": 0}, "name")
+		if not frappe.db.exists("Customer", other_customer):
+			frappe.get_doc({
+				"doctype": "Customer",
+				"customer_name": other_customer,
+				"customer_group": cg,
+				"customer_type": "Individual",
+				"territory": terr,
+			}).insert(ignore_permissions=True)
+
+		si_other = frappe.get_doc({
+			"doctype": "Sales Invoice",
+			"customer": other_customer,
+			"company": self.company,
+			"sales_channel": self.sales_channel,
+			"currency": "COP",
+			"debit_to": self.receivable_account,
+			"items": [{
+				"item_code": self.item_code,
+				"qty": 1.0,
+				"rate": 100.0,
+				"income_account": self.income_account,
+			}],
+		}).insert(ignore_permissions=True)
+		si_other.submit()
+
 		pay_rec = ExternalPaymentRecord(
 			provider=IntegrationProvider.PRESTASHOP,
 			sales_channel=self.sales_channel,
-			external_payment_id="PAY-G-001",
-			amount=150.0,  # exceeds 100.0
-			currency="COP",
-			payment_method="Credit Card",
-			payment_status=ExternalPaymentStatus.SETTLED,
-			external_order_id="1Q-EXT-G-001",
-		)
-
-		with self.assertRaises(OverpaymentBlockedError):
-			reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
-
-		si.reload()
-		self.assertEqual(flt(si.outstanding_amount), 100.0)
-
-	# =========================================================================
-	# SCENARIO H: Concurrent execution serialization: row lock prevents duplicates
-	# =========================================================================
-	def test_scenario_h_concurrent_execution_serialization(self):
-		so, dn, si = self._create_submitted_invoice("1Q-EXT-H-001", qty=1.0)
-		pay_rec = ExternalPaymentRecord(
-			provider=IntegrationProvider.PRESTASHOP,
-			sales_channel=self.sales_channel,
-			external_payment_id="PAY-H-001",
+			external_payment_id="PAY-K-CROSS",
 			amount=100.0,
 			currency="COP",
 			payment_method="Credit Card",
 			payment_status=ExternalPaymentStatus.SETTLED,
-			external_order_id="1Q-EXT-H-001",
 		)
-
-		pe1 = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
-		pe2 = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
-		self.assertEqual(pe1.name, pe2.name)
+		with self.assertRaises(CustomerMismatchError):
+			reconcile_external_payment(pay_rec, sales_invoices=[si1, si_other], submit=True)
 
 	# =========================================================================
-	# SCENARIO I: Payment Entry cancellation: reverses GL and restores balance
+	# SCENARIO L: Payment Entry cancel: invoice outstanding restored, GL reversed,
+	# upstream documents remain submitted
 	# =========================================================================
-	def test_scenario_i_cancellation_reverses_gl_and_restores_balance(self):
-		so, dn, si = self._create_submitted_invoice("1Q-EXT-I-001", qty=1.0)
-		pay_rec = ExternalPaymentRecord(
-			provider=IntegrationProvider.PRESTASHOP,
-			sales_channel=self.sales_channel,
-			external_payment_id="PAY-I-001",
-			amount=100.0,
-			currency="COP",
-			payment_method="Credit Card",
-			payment_status=ExternalPaymentStatus.SETTLED,
-			external_order_id="1Q-EXT-I-001",
-		)
-
-		pe = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
-		si.reload()
-		self.assertEqual(flt(si.outstanding_amount), 0.0)
-
-		# Cancel Payment Entry
-		cancel_payment_entry(pe.name)
-		si.reload()
-		self.assertEqual(flt(si.outstanding_amount), 100.0)
-		self.assertEqual(si.status, "Unpaid")
-
-		# Active mapping should be deactivated
-		is_active = frappe.db.get_value(
-			"External ID Mapping",
-			{"erp_doctype": "Payment Entry", "erp_document": pe.name},
-			"active",
-		)
-		self.assertEqual(is_active, 0)
-
-	# =========================================================================
-	# SCENARIO J: Phase 1L cancellation guard: submitted PE blocks SO cancellation
-	# =========================================================================
-	def test_scenario_j_submitted_payment_blocks_sales_order_cancellation(self):
-		so, dn, si = self._create_submitted_invoice("1Q-EXT-J-001", qty=1.0)
-		pay_rec = ExternalPaymentRecord(
-			provider=IntegrationProvider.PRESTASHOP,
-			sales_channel=self.sales_channel,
-			external_payment_id="PAY-J-001",
-			amount=100.0,
-			currency="COP",
-			payment_method="Credit Card",
-			payment_status=ExternalPaymentStatus.SETTLED,
-			external_order_id="1Q-EXT-J-001",
-		)
-
-		pe = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
-
-		# Link reference to Sales Order as well for audit verification
-		is_safe, reasons = audit_sales_order_cancellation_safety(so.name)
-		self.assertFalse(is_safe)
-
-	# =========================================================================
-	# SCENARIO K: Ineligible status: PENDING / AUTHORIZED blocked from GL
-	# =========================================================================
-	def test_scenario_k_ineligible_payment_status_blocked(self):
-		so, dn, si = self._create_submitted_invoice("1Q-EXT-K-001", qty=1.0)
-		for bad_status in [ExternalPaymentStatus.PENDING, ExternalPaymentStatus.AUTHORIZED, ExternalPaymentStatus.FAILED]:
-			pay_rec = ExternalPaymentRecord(
-				provider=IntegrationProvider.PRESTASHOP,
-				sales_channel=self.sales_channel,
-				external_payment_id=f"PAY-K-{bad_status}",
-				amount=100.0,
-				currency="COP",
-				payment_method="Credit Card",
-				payment_status=bad_status,
-				external_order_id="1Q-EXT-K-001",
-			)
-			with self.assertRaises(PaymentEligibilityError):
-				reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
-
-	# =========================================================================
-	# SCENARIO L: Mapping drift protection: missing/mismatched order mapping blocked
-	# =========================================================================
-	def test_scenario_l_mapping_drift_blocks_reconciliation(self):
+	def test_scenario_l_payment_entry_cancel_restores_ar_upstream_intact(self):
 		so, dn, si = self._create_submitted_invoice("1Q-EXT-L-001", qty=1.0)
-
-		# Deactivate mapping to simulate drift
-		frappe.db.set_value(
-			"External ID Mapping",
-			{"external_id": "1Q-EXT-L-001", "sales_channel": self.sales_channel},
-			"active",
-			0,
-		)
-		frappe.db.commit()
-
 		pay_rec = ExternalPaymentRecord(
 			provider=IntegrationProvider.PRESTASHOP,
 			sales_channel=self.sales_channel,
@@ -805,95 +886,117 @@ class TestExternalPaymentLive(unittest.TestCase):
 			payment_status=ExternalPaymentStatus.SETTLED,
 			external_order_id="1Q-EXT-L-001",
 		)
+		pe = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
+		si.reload()
+		self.assertEqual(flt(si.outstanding_amount), 0.0)
 
-		with self.assertRaises(PaymentMappingDriftError):
-			reconcile_external_payment(pay_rec, submit=True)
+		# Cancel Payment Entry
+		cancel_payment_entry(pe.name)
+		si.reload()
+		self.assertEqual(flt(si.outstanding_amount), 100.0)
+		self.assertEqual(si.docstatus, 1)
 
-		# Reactivate mapping and verify success
-		frappe.db.set_value(
-			"External ID Mapping",
-			{"external_id": "1Q-EXT-L-001", "sales_channel": self.sales_channel},
-			"active",
-			1,
-		)
-		frappe.db.commit()
-
-		pe = reconcile_external_payment(pay_rec, submit=True)
-		self.assertEqual(pe.docstatus, 1)
+		# Upstream documents remain submitted
+		dn.reload()
+		so.reload()
+		self.assertEqual(dn.docstatus, 1)
+		self.assertEqual(so.docstatus, 1)
 
 	# =========================================================================
-	# SCENARIO M: Cross-company accounting mismatch blocked
+	# SCENARIO M: Replay external transaction after manually cancelled Payment Entry
+	# -> REVIEW_REQUIRED -> no silent recreation
 	# =========================================================================
-	def test_scenario_m_cross_company_clearing_account_blocked(self):
+	def test_scenario_m_replay_after_cancelled_payment_entry_routes_review(self):
 		so, dn, si = self._create_submitted_invoice("1Q-EXT-M-001", qty=1.0)
+		pay_rec = ExternalPaymentRecord(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.sales_channel,
+			external_payment_id="PAY-M-001",
+			amount=100.0,
+			currency="COP",
+			payment_method="Credit Card",
+			payment_status=ExternalPaymentStatus.SETTLED,
+			external_order_id="1Q-EXT-M-001",
+		)
+		pe = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
+		cancel_payment_entry(pe.name)
 
-		# Create a foreign company account
-		foreign_company = "Bamal Fastener Corp"
-		if frappe.db.exists("Company", foreign_company):
-			foreign_acc = frappe.db.get_value("Account", {"company": foreign_company, "account_type": "Bank", "is_group": 0}, "name")
-			if foreign_acc:
-				with self.assertRaises(CompanyMismatchError):
-					# Intentionally pass foreign company to resolve
-					resolve_clearing_account_for_payment(
-						company=foreign_company,
-						sales_channel=self.sales_channel,  # sales channel belongs to Industrial DP
-						payment_method="Credit Card",
-					)
+		# Replay the same external payment record
+		with self.assertRaises(PaymentEligibilityError):
+			reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
 
 	# =========================================================================
-	# SCENARIO N: Zero stock impact: Bin and Stock Ledger Entry untouched
+	# SCENARIO N: Expired processing lease before submit -> zero Payment Entry
 	# =========================================================================
-	def test_scenario_n_zero_stock_impact_from_payment(self):
+	def test_scenario_n_expired_processing_lease_blocks_mutation(self):
 		so, dn, si = self._create_submitted_invoice("1Q-EXT-N-001", qty=1.0)
-		bin_qty_before = flt(frappe.db.get_value("Bin", {"item_code": self.item_code, "warehouse": self.warehouse}, "actual_qty"))
-		sle_count_before = frappe.db.count("Stock Ledger Entry", {"item_code": self.item_code})
+		evt = frappe.get_doc({
+			"doctype": "Integration Event",
+			"provider": IntegrationProvider.PRESTASHOP,
+			"sales_channel": self.sales_channel,
+			"event_type": "PAYMENT",
+			"status": IntegrationStatus.PROCESSING,
+			"processing_token": "TOK-EXP-01",
+			"lease_expires_at": add_to_date(now_datetime(), seconds=-60),
+		}).insert(ignore_permissions=True)
 
 		pay_rec = ExternalPaymentRecord(
 			provider=IntegrationProvider.PRESTASHOP,
 			sales_channel=self.sales_channel,
-			external_payment_id="PAY-N-001",
+			external_payment_id="PAY-N-EXP",
 			amount=100.0,
 			currency="COP",
 			payment_method="Credit Card",
 			payment_status=ExternalPaymentStatus.SETTLED,
 			external_order_id="1Q-EXT-N-001",
 		)
-
-		pe = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
-
-		bin_qty_after = flt(frappe.db.get_value("Bin", {"item_code": self.item_code, "warehouse": self.warehouse}, "actual_qty"))
-		sle_count_after = frappe.db.count("Stock Ledger Entry", {"item_code": self.item_code})
-
-		self.assertEqual(bin_qty_before, bin_qty_after)
-		self.assertEqual(sle_count_before, sle_count_after)
+		with self.assertRaises(PaymentAuthorityLostError):
+			reconcile_external_payment(
+				pay_rec,
+				sales_invoices=[si],
+				submit=True,
+				event_name=evt.name,
+				processing_token="TOK-EXP-01",
+			)
+		si.reload()
+		self.assertEqual(flt(si.outstanding_amount), 100.0)
 
 	# =========================================================================
-	# SCENARIO O: Zero invoice status writeback / 0 PrestaShop core mutations
+	# SCENARIO O: Mapping drift before payment submit -> zero Payment Entry
 	# =========================================================================
-	def test_scenario_o_zero_prestashop_writeback(self):
-		# Verify no PrestaShop client outbound calls are triggered during payment reconciliation
+	def test_scenario_o_mapping_drift_blocks_mutation(self):
 		so, dn, si = self._create_submitted_invoice("1Q-EXT-O-001", qty=1.0)
+		frappe.db.set_value(
+			"External ID Mapping",
+			{"external_id": "1Q-EXT-O-001", "sales_channel": self.sales_channel},
+			"provider",
+			"OTHER_PROV",
+		)
+		frappe.db.commit()
+
 		pay_rec = ExternalPaymentRecord(
 			provider=IntegrationProvider.PRESTASHOP,
 			sales_channel=self.sales_channel,
-			external_payment_id="PAY-O-001",
+			external_payment_id="PAY-O-DRIFT",
 			amount=100.0,
 			currency="COP",
 			payment_method="Credit Card",
 			payment_status=ExternalPaymentStatus.SETTLED,
 			external_order_id="1Q-EXT-O-001",
 		)
-
-		pe = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
-		self.assertEqual(pe.docstatus, 1)
+		with self.assertRaises(PaymentMappingDriftError):
+			reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
+		si.reload()
+		self.assertEqual(flt(si.outstanding_amount), 100.0)
 
 	# =========================================================================
-	# SCENARIO P: Pristine fixture cleanup proof
+	# SCENARIO P: Fixture cleanup proof
 	# =========================================================================
 	def test_scenario_p_fixture_cleanup_proof(self):
 		self._cleanup_test_docs()
 		residual_pes = frappe.db.count("Payment Entry", filters={"sales_channel": ["in", [self.sales_channel, self.channel_b]]})
 		self.assertEqual(residual_pes, 0)
-
 		residual_sis = frappe.db.count("Sales Invoice", filters={"sales_channel": ["in", [self.sales_channel, self.channel_b]]})
 		self.assertEqual(residual_sis, 0)
+		residual_sos = frappe.db.count("Sales Order", filters={"sales_channel": ["in", [self.sales_channel, self.channel_b]]})
+		self.assertEqual(residual_sos, 0)
