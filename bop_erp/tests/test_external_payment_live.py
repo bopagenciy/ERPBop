@@ -919,11 +919,67 @@ class TestExternalPaymentLive(unittest.TestCase):
 			external_order_id="1Q-EXT-M-001",
 		)
 		pe = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
+		self.assertEqual(pe.docstatus, 1)
+
+		# Verify canonical PAYMENT identity persisted with active = 1
+		map_doc = frappe.db.get_value(
+			"External ID Mapping",
+			{
+				"sales_channel": self.sales_channel,
+				"external_entity_type": ExternalEntityType.PAYMENT,
+				"external_id": "PAY-M-001",
+			},
+			["name", "active", "active_external_key", "erp_document"],
+			as_dict=True,
+		)
+		self.assertIsNotNone(map_doc)
+		self.assertEqual(map_doc.active, 1)
+		self.assertIsNotNone(map_doc.active_external_key)
+		self.assertEqual(map_doc.erp_document, pe.name)
+
+		# Cancel PE-1 natively
 		cancel_payment_entry(pe.name)
+		pe.reload()
+		self.assertEqual(pe.docstatus, 2)
+
+		# Invoice outstanding restored correctly
+		si.reload()
+		self.assertEqual(flt(si.outstanding_amount), 100.0)
+
+		# Canonical PAYMENT identity remains active in database
+		map_doc_after = frappe.db.get_value(
+			"External ID Mapping",
+			map_doc.name,
+			["active", "active_external_key"],
+			as_dict=True,
+		)
+		self.assertEqual(map_doc_after.active, 1)
+		self.assertEqual(map_doc_after.active_external_key, map_doc.active_external_key)
+
+		# Record pre-replay baselines
+		gl_count_before = frappe.db.count("GL Entry", {"voucher_no": pe.name})
+		pe_count_before = frappe.db.count("Payment Entry Reference", {"reference_name": si.name})
 
 		# Replay the same external payment record
-		with self.assertRaises(PaymentEligibilityError):
+		with self.assertRaises(PaymentEligibilityError) as cm:
 			reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
+
+		# Assert error identifies original cancelled PE and REVIEW_REQUIRED
+		self.assertIn(pe.name, str(cm.exception))
+		self.assertIn("REVIEW_REQUIRED", str(cm.exception))
+
+		# Post-replay invariants:
+		# 0 new Payment Entries
+		pe_count_after = frappe.db.count("Payment Entry Reference", {"reference_name": si.name})
+		self.assertEqual(pe_count_after, pe_count_before)
+
+		# 0 new GL effect
+		gl_count_after = frappe.db.count("GL Entry", {"voucher_no": pe.name})
+		self.assertEqual(gl_count_after, gl_count_before)
+
+		# 0 duplicate allocation
+		si.reload()
+		self.assertEqual(flt(si.outstanding_amount), 100.0)
 
 	# =========================================================================
 	# SCENARIO N: Expired processing lease before submit -> zero Payment Entry
@@ -986,6 +1042,118 @@ class TestExternalPaymentLive(unittest.TestCase):
 		)
 		with self.assertRaises(PaymentMappingDriftError):
 			reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
+		si.reload()
+		self.assertEqual(flt(si.outstanding_amount), 100.0)
+
+	# =========================================================================
+	# SCENARIO Q: Database direct duplicate proof after PE cancellation
+	# =========================================================================
+	def test_scenario_q_cancelled_payment_database_direct_duplicate_proof(self):
+		so, dn, si = self._create_submitted_invoice("1Q-EXT-Q-001", qty=1.0)
+		pay_rec = ExternalPaymentRecord(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.sales_channel,
+			external_payment_id="PAY-Q-001",
+			amount=100.0,
+			currency="COP",
+			payment_method="Credit Card",
+			payment_status=ExternalPaymentStatus.SETTLED,
+			external_order_id="1Q-EXT-Q-001",
+		)
+		pe = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
+		cancel_payment_entry(pe.name)
+		pe.reload()
+		self.assertEqual(pe.docstatus, 2)
+
+		from bop_erp.bop_erp.doctype.external_id_mapping.external_id_mapping import (
+			compute_active_external_key,
+			compute_active_erp_key,
+		)
+		active_ext_key = compute_active_external_key(
+			self.sales_channel,
+			ExternalEntityType.PAYMENT,
+			"PAY-Q-001",
+			provider=IntegrationProvider.PRESTASHOP,
+		)
+
+		# Attempt direct database insertion of duplicate canonical payment identity bypassing Frappe validate()
+		m_dup = frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": self.sales_channel,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"external_entity_type": ExternalEntityType.PAYMENT,
+			"external_id": "PAY-Q-001",
+			"erp_doctype": "Payment Entry",
+			"erp_document": pe.name,
+			"active": 1,
+			"active_external_key": active_ext_key,
+			"active_erp_key": compute_active_erp_key(self.sales_channel, ExternalEntityType.PAYMENT, "Payment Entry", pe.name),
+		})
+		# Database unique constraint MUST reject duplicate canonical payment identity
+		with self.assertRaises(Exception):
+			m_dup.db_insert()
+
+	# =========================================================================
+	# SCENARIO R: Concurrent replay workers after cancellation converge to REVIEW_REQUIRED
+	# =========================================================================
+	def test_scenario_r_concurrent_replay_after_cancellation_routes_review(self):
+		so, dn, si = self._create_submitted_invoice("1Q-EXT-R-001", qty=1.0)
+		pay_rec = ExternalPaymentRecord(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.sales_channel,
+			external_payment_id="PAY-R-001",
+			amount=100.0,
+			currency="COP",
+			payment_method="Credit Card",
+			payment_status=ExternalPaymentStatus.SETTLED,
+			external_order_id="1Q-EXT-R-001",
+		)
+		pe = reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
+		cancel_payment_entry(pe.name)
+		pe.reload()
+		self.assertEqual(pe.docstatus, 2)
+
+		initial_map_count = frappe.db.count("External ID Mapping", {
+			"sales_channel": self.sales_channel,
+			"external_entity_type": ExternalEntityType.PAYMENT,
+			"external_id": "PAY-R-001",
+			"active": 1,
+		})
+		self.assertEqual(initial_map_count, 1)
+
+		# Simulate Worker 1 and Worker 2 concurrently replaying TX
+		worker1_blocked = False
+		worker2_blocked = False
+
+		try:
+			reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
+		except PaymentEligibilityError as e:
+			worker1_blocked = True
+			self.assertIn("REVIEW_REQUIRED", str(e))
+
+		try:
+			reconcile_external_payment(pay_rec, sales_invoices=[si], submit=True)
+		except PaymentEligibilityError as e:
+			worker2_blocked = True
+			self.assertIn("REVIEW_REQUIRED", str(e))
+
+		self.assertTrue(worker1_blocked)
+		self.assertTrue(worker2_blocked)
+
+		# 0 new Payment Entries
+		pe_refs = frappe.db.count("Payment Entry Reference", {"reference_name": si.name})
+		self.assertEqual(pe_refs, 1)
+
+		# 0 new active payment identities
+		final_map_count = frappe.db.count("External ID Mapping", {
+			"sales_channel": self.sales_channel,
+			"external_entity_type": ExternalEntityType.PAYMENT,
+			"external_id": "PAY-R-001",
+			"active": 1,
+		})
+		self.assertEqual(final_map_count, 1)
+
+		# Invoice outstanding remains restored
 		si.reload()
 		self.assertEqual(flt(si.outstanding_amount), 100.0)
 

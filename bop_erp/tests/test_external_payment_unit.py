@@ -541,15 +541,33 @@ class TestExternalPaymentUnit(FrappeTestCase):
 		cancelled_pe = MockDocument(name="PE-CANC", docstatus=2)
 		with patch.object(frappe.db, "get_value", return_value=frappe._dict({"name": "MAP-01", "erp_doctype": "Payment Entry", "erp_document": "PE-CANC"})):
 			with patch("frappe.get_doc", return_value=cancelled_pe):
-				with self.assertRaises(PaymentEligibilityError):
+				with self.assertRaises(PaymentEligibilityError) as cm:
 					reconcile_external_payment(rec, sales_invoices=[inv])
+				self.assertIn("PE-CANC", str(cm.exception))
+				self.assertIn("REVIEW_REQUIRED", str(cm.exception))
+				self.assertEqual(get_payment_counters()["payment_reconciliation_blocked"], 1)
 
 	# 43. terminal payment identity retained
 	def test_43_terminal_payment_identity_retained(self):
 		mock_pe = MockDocument(name="PE-SUB", docstatus=1, cancel=MagicMock())
-		with patch("frappe.get_doc", return_value=mock_pe):
-			cancel_payment_entry(mock_pe)
-			# Mapping was NOT deleted or set active=0
+		with patch.object(frappe.db, "set_value") as mock_set_val:
+			with patch.object(frappe, "delete_doc") as mock_del:
+				cancel_payment_entry(mock_pe)
+				mock_pe.cancel.assert_called_once()
+				# Assert mapping was NOT set active=0 or deleted
+				mock_set_val.assert_not_called()
+				mock_del.assert_not_called()
+
+	# 43b. missing canonical PE external replay routes review
+	def test_43b_missing_pe_external_replay_routes_review(self):
+		inv = self._make_mock_invoice()
+		rec = self._make_payment_record()
+		with patch.object(frappe.db, "get_value", return_value=frappe._dict({"name": "MAP-01", "erp_doctype": "Payment Entry", "erp_document": "PE-MISSING"})):
+			with patch.object(frappe.db, "exists", return_value=False):
+				with self.assertRaises(PaymentEligibilityError) as cm:
+					reconcile_external_payment(rec, sales_invoices=[inv])
+				self.assertIn("missing in ERP", str(cm.exception))
+				self.assertIn("REVIEW_REQUIRED", str(cm.exception))
 
 	# 44. response-lost convergence
 	def test_44_response_lost_convergence(self):

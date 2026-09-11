@@ -259,6 +259,38 @@ class TestExternalIDMapping(FrappeTestCase):
 		frappe.delete_doc("External ID Mapping", m2.name)
 		frappe.delete_doc("External ID Mapping", m3.name)
 
+	def test_payment_terminal_identity_db_uniqueness(self):
+		m1 = frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": "TID",
+			"provider": "PRESTASHOP",
+			"external_entity_type": ExternalEntityType.PAYMENT,
+			"erp_doctype": "Company",
+			"erp_document": self.company,
+			"external_id": "TX-TERM-001",
+			"active": 1,
+		}).insert()
+
+		self.assertTrue(m1.active_external_key)
+		self.assertEqual(len(m1.active_external_key), 64)
+
+		# Attempting direct database insert of duplicate canonical payment identity fails at DB layer
+		m2 = frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": "TID",
+			"provider": "PRESTASHOP",
+			"external_entity_type": ExternalEntityType.PAYMENT,
+			"erp_doctype": "Company",
+			"erp_document": self.company,
+			"external_id": "TX-TERM-001",
+			"active": 1,
+			"active_external_key": m1.active_external_key,
+			"active_erp_key": "1111111111222222222233333333334444444444555555555566666666667777",
+		})
+		self.assertRaises(Exception, m2.db_insert)
+
+		frappe.delete_doc("External ID Mapping", m1.name)
+
 	def test_product_duplicate_cannot_bypass_uniqueness_using_external_variant_id(self):
 		doc = frappe.get_doc({
 			"doctype": "External ID Mapping",

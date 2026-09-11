@@ -648,6 +648,14 @@ def reconcile_external_payment(
 				ext_pay_id,
 			)
 			return pe_doc
+		else:
+			PAYMENT_COUNTERS["payment_reconciliation_blocked"] += 1
+			raise PaymentEligibilityError(
+				_("Canonical Payment Entry '{0}' for external payment '{1}' is missing in ERP. "
+				  "Automatic replay is blocked and routes to REVIEW_REQUIRED.").format(
+					pe_name, ext_pay_id
+				)
+			)
 
 	# 2. Assert financial reconciliation eligibility
 	eligible_invoices, so_doc = assert_payment_reconciliation_eligibility(
@@ -854,7 +862,7 @@ def cancel_payment_entry(payment_entry: Union[str, Any]) -> Any:
 	Cancels a Payment Entry natively.
 	- Reverses GL Entries.
 	- Restores Sales Invoice outstanding_amount natively.
-	- Deactivates or removes canonical External ID Mapping.
+	- Preserves canonical External ID Mapping active (terminal payment identity).
 	- Does NOT cancel the Sales Invoice, Delivery Note, or Sales Order.
 	"""
 	if isinstance(payment_entry, str):
