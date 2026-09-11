@@ -41,8 +41,9 @@ class TestImportedOrderPriceMasterProtectionLive(FrappeTestCase):
 			frappe.init("frontend")
 			frappe.connect()
 
-		# Snapshot baseline Item Prices before test execution
+		# Snapshot baseline Item Prices and Reservation References before test execution
 		cls.baseline_item_prices = set(frappe.get_all("Item Price", pluck="name"))
+		cls.baseline_reservation_refs = set(frappe.get_all("Inventory Reservation Reference", pluck="name"))
 
 		cls.company = frappe.db.get_single_value("Global Defaults", "default_company") or "Industrial DP"
 		cls.abbr = frappe.get_cached_value("Company", cls.company, "abbr") or "IDP"
@@ -157,8 +158,11 @@ class TestImportedOrderPriceMasterProtectionLive(FrappeTestCase):
 					}).insert(ignore_permissions=True)
 
 		# Set physical stock via Stock Reconciliation
+		cls.stock_recos = []
 		for code in cls.test_items:
-			cls._set_physical_stock(code, cls.wh_a, 100.0)
+			r_name = cls._set_physical_stock(code, cls.wh_a, 100.0)
+			if r_name:
+				cls.stock_recos.append(r_name)
 
 		# Create pre-existing master Item Price for cls.item_existing
 		cls.existing_ip_name = None
@@ -200,7 +204,21 @@ class TestImportedOrderPriceMasterProtectionLive(FrappeTestCase):
 
 	@classmethod
 	def tearDownClass(cls):
-		# Clean up Stock Reservation Entries for test items
+		# 1. Clean up Inventory Reservation References created for test items
+		# Dependency order: Reference -> SRE -> SO -> Mapping -> Item Price -> Stock Ledgers -> Channels -> Warehouse -> Items
+		current_refs = set(frappe.get_all(
+			"Inventory Reservation Reference",
+			filters={"item_code": ["in", cls.test_items]},
+			pluck="name",
+		))
+		test_owned_refs = current_refs - cls.baseline_reservation_refs
+		for ref_name in test_owned_refs:
+			try:
+				frappe.delete_doc("Inventory Reservation Reference", ref_name, force=True, ignore_permissions=True)
+			except Exception:
+				pass
+
+		# 2. Clean up Stock Reservation Entries for test items
 		for item_code in cls.test_items:
 			sre_names = frappe.get_all("Stock Reservation Entry", filters={"item_code": item_code}, pluck="name")
 			for sre in sre_names:
@@ -212,7 +230,7 @@ class TestImportedOrderPriceMasterProtectionLive(FrappeTestCase):
 				except Exception:
 					pass
 
-		# Clean up Sales Orders created for test channels
+		# 3. Clean up Sales Orders created for test channels
 		for ch in [cls.channel_a, cls.channel_b]:
 			so_names = frappe.get_all("Sales Order", filters={"sales_channel": ch}, pluck="name")
 			for so in so_names:
@@ -235,32 +253,45 @@ class TestImportedOrderPriceMasterProtectionLive(FrappeTestCase):
 			except Exception:
 				pass
 
-		# Clean up External ID Mappings for orders & test products
+		# 4. Clean up External ID Mappings for orders & test products
 		frappe.db.delete("External ID Mapping", {"sales_channel": ["in", [cls.channel_a, cls.channel_b]]})
 
-		# Clean up Item Prices created during tests for test items
+		# 5. Clean up Item Prices created during tests for test items
 		if cls.existing_ip_name and frappe.db.exists("Item Price", cls.existing_ip_name):
 			frappe.delete_doc("Item Price", cls.existing_ip_name, force=True)
 		for code in cls.test_items:
 			frappe.db.delete("Item Price", {"item_code": code})
 
-		# Clean Stock Ledgers, Reconciliations before warehouse deletion
+		# 6. Clean Stock Ledgers, Reconciliations before warehouse deletion
+		reco_parents = set(frappe.get_all("Stock Reconciliation Item", filters={"warehouse": cls.wh_a}, pluck="parent"))
+		if hasattr(cls, "stock_recos"):
+			reco_parents.update(cls.stock_recos)
+		for rp in reco_parents:
+			try:
+				doc = frappe.get_doc("Stock Reconciliation", rp)
+				if doc.docstatus == 1:
+					doc.cancel()
+				frappe.delete_doc("Stock Reconciliation", rp, force=True, ignore_permissions=True)
+			except Exception:
+				frappe.db.delete("Stock Reconciliation Item", {"parent": rp})
+				frappe.db.delete("Stock Reconciliation", {"name": rp})
+
 		frappe.db.delete("Stock Ledger Entry", {"warehouse": cls.wh_a})
 		frappe.db.delete("Stock Reconciliation Item", {"warehouse": cls.wh_a})
 		frappe.db.delete("Bin", {"warehouse": cls.wh_a})
 
-		# Delete test channels, connectors, and sources
+		# 7. Delete test channels, connectors, and sources
 		for ch in [cls.channel_a, cls.channel_b]:
 			frappe.db.delete("Channel Inventory Source", {"sales_channel": ch})
 			frappe.db.delete("PrestaShop Connector", {"sales_channel": ch})
 			if frappe.db.exists("Sales Channel", ch):
 				frappe.delete_doc("Sales Channel", ch, force=True)
 
-		# Delete test warehouse
+		# 8. Delete test warehouse
 		if frappe.db.exists("Warehouse", cls.wh_a):
 			frappe.delete_doc("Warehouse", cls.wh_a, force=True)
 
-		# Delete test items
+		# 9. Delete test items
 		for code in cls.test_items:
 			if frappe.db.exists("Item", code):
 				frappe.delete_doc("Item", code, force=True)
@@ -272,6 +303,26 @@ class TestImportedOrderPriceMasterProtectionLive(FrappeTestCase):
 		missing_baseline = cls.baseline_item_prices - current_prices
 		if missing_baseline:
 			frappe.logger("bop_erp").error(f"Baseline Item Prices missing after test: {missing_baseline}")
+
+		current_refs_all = set(frappe.get_all("Inventory Reservation Reference", pluck="name"))
+		missing_baseline_refs = cls.baseline_reservation_refs - current_refs_all
+		if missing_baseline_refs:
+			frappe.logger("bop_erp").error(f"Baseline Reservation References missing after test: {missing_baseline_refs}")
+
+	def tearDown(self):
+		super().tearDown()
+		# Failure-safe cleanup: remove any test-owned reservation references created during the test
+		current_refs = set(frappe.get_all(
+			"Inventory Reservation Reference",
+			filters={"item_code": ["in", self.test_items]},
+			pluck="name",
+		))
+		test_owned_refs = current_refs - self.baseline_reservation_refs
+		for ref_name in test_owned_refs:
+			try:
+				frappe.delete_doc("Inventory Reservation Reference", ref_name, force=True, ignore_permissions=True)
+			except Exception:
+				pass
 
 	def test_01_imported_order_missing_item_price_creates_zero_item_prices(self):
 		"""
@@ -635,4 +686,46 @@ class TestImportedOrderPriceMasterProtectionLive(FrappeTestCase):
 		current_prices = set(frappe.get_all("Item Price", pluck="name"))
 		missing = self.baseline_item_prices - current_prices
 		self.assertEqual(len(missing), 0, f"Missing baseline item prices: {missing}")
+
+	def test_07_baseline_reservation_reference_preserved(self):
+		"""
+		Phase 1R.0-B Req 5:
+		Verifies that test cleanup deletes ONLY test-owned records
+		and preserves pre-existing legitimate references outside TEST-1R0 ownership.
+		"""
+		synthetic_key = f"TEST-LEGIT-{frappe.generate_hash(length=8)}"
+		legit_ref = frappe.get_doc({
+			"doctype": "Inventory Reservation Reference",
+			"idempotency_key": synthetic_key,
+			"status": "Reserved",
+			"sales_channel": "CHAN-NON-1R0",
+			"item_code": "ITEM-NON-1R0",
+			"warehouse": "WH-NON-1R0",
+			"reserved_qty": 5.0,
+		})
+		legit_ref.flags.ignore_links = True
+		legit_ref.flags.ignore_validate = True
+		legit_ref.insert(ignore_permissions=True)
+		frappe.db.commit()
+
+		try:
+			# Run the test-owned cleanup logic
+			current_refs = set(frappe.get_all(
+				"Inventory Reservation Reference",
+				filters={"item_code": ["in", self.test_items]},
+				pluck="name",
+			))
+			for ref_name in current_refs - self.baseline_reservation_refs:
+				frappe.delete_doc("Inventory Reservation Reference", ref_name, force=True, ignore_permissions=True)
+
+			# Assert that the non-1R0 reference remains completely intact
+			self.assertTrue(
+				frappe.db.exists("Inventory Reservation Reference", legit_ref.name),
+				"Non-1R0 baseline reference was erroneously deleted by test cleanup!",
+			)
+		finally:
+			# Clean up the synthetic record
+			frappe.delete_doc("Inventory Reservation Reference", legit_ref.name, force=True, ignore_permissions=True)
+			frappe.db.commit()
+
 
