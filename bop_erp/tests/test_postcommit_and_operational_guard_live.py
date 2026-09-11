@@ -81,6 +81,24 @@ class TestPostcommitAndOperationalGuardLive(unittest.TestCase):
 
 		cls.company = frappe.db.get_single_value("Global Defaults", "default_company") or "Industrial DP"
 		cls.abbr = frappe.get_cached_value("Company", cls.company, "abbr") or "IDP"
+		cls.company_currency = frappe.get_cached_value("Company", cls.company, "default_currency") or "COP"
+
+		# Phase 1Q.2: Test-owned Currency Exchange fixture for USD -> company_currency
+		cls.owned_currency_exchange = None
+		if not frappe.db.exists("Currency Exchange", {"from_currency": "USD", "to_currency": cls.company_currency, "for_selling": 1}):
+			ce = frappe.get_doc({
+				"doctype": "Currency Exchange",
+				"date": frappe.utils.nowdate(),
+				"from_currency": "USD",
+				"to_currency": cls.company_currency,
+				"exchange_rate": 3000.0,
+				"for_buying": 1,
+				"for_selling": 1,
+			})
+			ce.flags.ignore_permissions = True
+			ce.insert(ignore_permissions=True)
+			cls.owned_currency_exchange = ce.name
+			frappe.db.commit()
 
 		cls.diff_account = frappe.db.get_value(
 			"Account",
@@ -192,6 +210,11 @@ class TestPostcommitAndOperationalGuardLive(unittest.TestCase):
 				"erp_document": cls.item_pliers,
 				"active": 1,
 			}).insert(ignore_permissions=True)
+
+		# Clean test-owned Currency Exchange fixture
+		if getattr(cls, "owned_currency_exchange", None) and frappe.db.exists("Currency Exchange", cls.owned_currency_exchange):
+			frappe.delete_doc("Currency Exchange", cls.owned_currency_exchange, force=True, ignore_permissions=True)
+			cls.owned_currency_exchange = None
 
 		frappe.db.commit()
 		super().tearDownClass()
@@ -413,7 +436,7 @@ class TestPostcommitAndOperationalGuardLive(unittest.TestCase):
 			external_order_id="LIVE-ORD-01",
 			external_reference="REF-LIVE-01",
 			order_state_id="2",
-			currency="USD",
+			currency=self.company_currency,
 			customer=ExternalCustomer(
 				external_customer_id="CUST-LIVE-01",
 				first_name="Live Guard",
@@ -530,7 +553,7 @@ class TestPostcommitAndOperationalGuardLive(unittest.TestCase):
 			external_order_id="LIVE-CRASH-SUBMIT-01",
 			external_reference="REF-CRASH-SUBMIT-01",
 			order_state_id="2",
-			currency="USD",
+			currency=self.company_currency,
 			customer=ExternalCustomer(
 				external_customer_id="CUST-LIVE-02",
 				first_name="Live Guard",
