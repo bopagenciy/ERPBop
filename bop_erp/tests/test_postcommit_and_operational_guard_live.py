@@ -174,10 +174,31 @@ class TestPostcommitAndOperationalGuardLive(unittest.TestCase):
 		cls.write_client.update_stock_available_quantity(cls.stock_available_id_a, cls.baseline_qty_a, cls.product_id_a, None)
 		cls.write_client.update_stock_available_quantity(cls.stock_available_id_pliers, cls.baseline_qty_pliers, cls.product_id_pliers, None)
 
-		# Clean any pre-existing test item prices
-		frappe.db.delete("Item Price", {"item_code": ["in", [cls.item_a, cls.item_pliers]]})
+		# Phase 1Q.4: Snapshot pre-existing legitimate Item Price rows before module execution
+		cls.baseline_item_price_names = set(
+			frappe.get_all(
+				"Item Price",
+				filters={"item_code": ["in", [cls.item_a, cls.item_pliers]]},
+				pluck="name",
+			)
+		)
 
 		frappe.db.commit()
+
+	@classmethod
+	def _clean_owned_item_prices(cls):
+		"""Deletes ONLY new Item Price rows created during this module, preserving all baseline rows."""
+		baseline = getattr(cls, "baseline_item_price_names", set())
+		current_names = set(
+			frappe.get_all(
+				"Item Price",
+				filters={"item_code": ["in", [cls.item_a, cls.item_pliers]]},
+				pluck="name",
+			)
+		)
+		new_names = current_names - baseline
+		for name in new_names:
+			frappe.delete_doc("Item Price", name, force=True, ignore_permissions=True)
 
 	@classmethod
 	def tearDownClass(cls):
@@ -200,7 +221,7 @@ class TestPostcommitAndOperationalGuardLive(unittest.TestCase):
 
 		for ic in [cls.item_a, cls.item_pliers]:
 			frappe.db.delete("Bin", {"item_code": ic})
-			frappe.db.delete("Item Price", {"item_code": ic})
+		cls._clean_owned_item_prices()
 
 		# Ensure persistent TID mapping for product 21 is restored
 		if not frappe.db.exists("External ID Mapping", {"sales_channel": cls.channel_tid, "erp_document": cls.item_pliers, "active": 1}):
@@ -279,8 +300,8 @@ class TestPostcommitAndOperationalGuardLive(unittest.TestCase):
 			frappe.db.delete("External ID Mapping", {"erp_document": a})
 			frappe.delete_doc("Address", a, force=True, ignore_permissions=True)
 
-		# Clean test item prices
-		frappe.db.delete("Item Price", {"item_code": ["in", [cls.item_a, cls.item_pliers]]})
+		# Clean test-owned item prices while preserving baseline rows
+		cls._clean_owned_item_prices()
 
 		frappe.db.commit()
 
@@ -991,5 +1012,102 @@ class TestPostcommitAndOperationalGuardLive(unittest.TestCase):
 				frappe.db.delete("External ID Mapping", {"erp_document": so.shipping_address_name})
 				frappe.delete_doc("Address", so.shipping_address_name, force=True, ignore_permissions=True)
 			frappe.delete_doc("Customer", cust, force=True, ignore_permissions=True)
+			frappe.db.commit()
+
+	# ==================================================
+	# 6. PRE-EXISTING ITEM PRICE PRESERVATION PROOF
+	# ==================================================
+	def test_06_preexisting_item_price_survives_unchanged(self):
+		"""
+		Phase 1Q.4: Proves that a pre-existing legitimate Item Price row:
+		1. Is never overwritten by external order ingestion transaction prices.
+		2. Remains intact with exact price_list_rate, currency, and identity.
+		3. Is preserved across module cleanup, never deleted by teardown.
+		"""
+		test_rate = 123.45
+		existing_price = frappe.db.get_value(
+			"Item Price",
+			{"item_code": self.item_a, "price_list": "Standard Selling"},
+			["name", "price_list_rate"],
+			as_dict=True,
+		)
+		created_for_test = False
+		if not existing_price:
+			ip = frappe.get_doc({
+				"doctype": "Item Price",
+				"item_code": self.item_a,
+				"price_list": "Standard Selling",
+				"price_list_rate": test_rate,
+				"currency": self.company_currency,
+			})
+			ip.insert(ignore_permissions=True)
+			frappe.db.commit()
+			ip_name = ip.name
+			self.baseline_item_price_names.add(ip_name)
+			created_for_test = True
+		else:
+			ip_name = existing_price.name
+			test_rate = flt(existing_price.price_list_rate)
+
+		self._setup_channels()
+		ext_order = ExternalOrder(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.channel_a,
+			external_order_id="LIVE-PRICE-SAFETY-01",
+			external_reference="REF-PRICE-SAFETY-01",
+			order_state_id="2",
+			currency=self.company_currency,
+			customer=ExternalCustomer(
+				external_customer_id="CUST-LIVE-PS-01",
+				first_name="Price",
+				last_name="Safety",
+				email="pricesafety@example.com",
+			),
+			delivery_address=ExternalAddress(
+				external_address_id="ADDR-LIVE-PS-01",
+				address_type="Shipping",
+				first_name="Price",
+				last_name="Safety",
+				address1="123 Price Lane",
+				city="Miami",
+				postcode="33101",
+				country="United States",
+			),
+			lines=[
+				ExternalOrderLine(
+					external_line_id="1",
+					external_product_id=str(self.product_id_a),
+					sku=self.item_a,
+					quantity=1.0,
+					unit_price_ex_tax=10.0,
+				)
+			],
+			totals=ExternalTotals(total_products_ex_tax=10.0, total_paid=10.0),
+		)
+
+		res = ingest_order_pipeline(ext_order)
+		self.assertTrue(res["success"])
+		so_name = res["sales_order"]
+		frappe.db.commit()
+
+		# Verify transaction rate on Sales Order Item row is preserved at 10.0
+		so = frappe.get_doc("Sales Order", so_name)
+		self.assertEqual(flt(so.items[0].rate), 10.0)
+
+		# Verify pre-existing master Item Price in DB was NOT mutated to 10.0
+		current_rate = frappe.db.get_value("Item Price", ip_name, "price_list_rate")
+		self.assertEqual(flt(current_rate), test_rate)
+
+		# Trigger teardown cleanup
+		self._clean_owned_item_prices()
+
+		# Verify baseline Item Price still exists in DB after cleanup
+		self.assertTrue(frappe.db.exists("Item Price", ip_name))
+		final_rate = frappe.db.get_value("Item Price", ip_name, "price_list_rate")
+		self.assertEqual(flt(final_rate), test_rate)
+
+		if created_for_test:
+			self.baseline_item_price_names.discard(ip_name)
+			frappe.delete_doc("Item Price", ip_name, force=True, ignore_permissions=True)
 			frappe.db.commit()
 
