@@ -83,3 +83,44 @@ class PaymentAuthorityLostError(PaymentReconciliationError):
 	"""Raised when worker lease expires or processing token is stale before financial mutation."""
 	pass
 
+
+class RefundError(frappe.ValidationError):
+	"""Base exception for all Bop Sales Return, Credit Note, and External Refund operations."""
+	pass
+
+
+class RefundEligibilityError(RefundError):
+	"""Raised when a refund request or its target invoice/order/channel is ineligible for processing."""
+	pass
+
+
+class RefundStatusIneligibleError(RefundError):
+	"""Raised when an external refund status is not eligible for accounting mutation (PENDING, FAILED, etc.)."""
+	pass
+
+
+class DuplicateRefundError(RefundError):
+	"""Raised when duplicate refund processing is attempted without safe reuse."""
+	pass
+
+
+class OverRefundBlockedError(RefundError):
+	"""Raised when requested refund amount or line returned quantity exceeds remaining eligible bounds."""
+	pass
+
+
+class RefundDriftError(RefundError):
+	"""Raised when a replayed external refund identity has conflicting or drifted payload data."""
+	pass
+
+
+class RefundReplayCancelledError(RefundError):
+	"""Raised when an external refund identity whose Credit Note was cancelled is replayed."""
+	pass
+
+
+class CurrencyMismatchError(RefundError):
+	"""Raised when currency of the refund does not match the original invoice or company."""
+	pass
+
+

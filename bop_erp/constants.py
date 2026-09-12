@@ -47,6 +47,7 @@ class ExternalEntityType:
 	PRICE = "PRICE"
 	WAREHOUSE = "WAREHOUSE"
 	STOCK_LOCATION = "STOCK_LOCATION"
+	REFUND = "REFUND"
 
 	ALL = (
 		PRODUCT,
@@ -62,6 +63,7 @@ class ExternalEntityType:
 		PRICE,
 		WAREHOUSE,
 		STOCK_LOCATION,
+		REFUND,
 	)
 
 class IntegrationDirection:
