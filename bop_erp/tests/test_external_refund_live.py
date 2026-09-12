@@ -32,7 +32,6 @@ from bop_erp.accounts import (
 	reset_refund_counters,
 )
 from erpnext.selling.doctype.sales_order.sales_order import make_delivery_note
-from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
 
 
 class TestExternalRefundLive(unittest.TestCase):
@@ -207,6 +206,20 @@ class TestExternalRefundLive(unittest.TestCase):
 			})
 			mop_doc.save(ignore_permissions=True)
 
+		# Ensure difference account for Stock Reconciliation (must be Balance Sheet account for opening stock)
+		cls.opening_diff_account = (
+			frappe.db.get_value("Account", {"company": cls.company, "root_type": "Equity", "report_type": "Balance Sheet", "is_group": 0, "disabled": 0}, "name")
+			or frappe.db.get_value("Account", {"company": cls.company, "account_type": "Stock Adjustment", "report_type": "Balance Sheet", "is_group": 0, "disabled": 0}, "name")
+			or frappe.db.get_value("Account", {"company": cls.company, "account_type": "Stock Adjustment", "is_group": 0, "disabled": 0}, "name")
+		)
+
+		# Snapshot baselines for stock
+		cls.baseline_stock = {
+			cls.item_code: flt(frappe.db.get_value("Bin", {"item_code": cls.item_code, "warehouse": cls.warehouse}, "actual_qty") or 0.0),
+			cls.item_code_2: flt(frappe.db.get_value("Bin", {"item_code": cls.item_code_2, "warehouse": cls.warehouse}, "actual_qty") or 0.0),
+		}
+		cls.baseline_stock_reconciliations = set(frappe.get_all("Stock Reconciliation", pluck="name"))
+
 		frappe.db.commit()
 
 	@classmethod
@@ -338,6 +351,24 @@ class TestExternalRefundLive(unittest.TestCase):
 				frappe.db.delete("GL Entry", {"voucher_no": se_name})
 				frappe.db.delete("Stock Ledger Entry", {"voucher_no": se_name})
 
+		# 6b. Clean Stock Reconciliations
+		sr_names = frappe.db.sql(
+			"""
+			SELECT DISTINCT parent FROM `tabStock Reconciliation Item`
+			WHERE item_code LIKE %s
+			""",
+			(f"{cls.FIXTURE_PREFIX}%",),
+			pluck="name",
+		)
+		for sr_name in sr_names:
+			if frappe.db.exists("Stock Reconciliation", sr_name):
+				sr = frappe.get_doc("Stock Reconciliation", sr_name)
+				if sr.docstatus == 1:
+					sr.cancel()
+				frappe.delete_doc("Stock Reconciliation", sr_name, force=True, ignore_permissions=True)
+				frappe.db.delete("GL Entry", {"voucher_no": sr_name})
+				frappe.db.delete("Stock Ledger Entry", {"voucher_no": sr_name})
+
 		# 7. Clean SREs and IRRs
 		sres = frappe.db.sql(
 			"""
@@ -398,24 +429,20 @@ class TestExternalRefundLive(unittest.TestCase):
 		current = flt(frappe.db.get_value("Bin", {"item_code": item_code, "warehouse": self.warehouse}, "actual_qty") or 0.0)
 		diff = target_qty - current
 		if abs(diff) > 0.001:
-			if diff > 0:
-				make_stock_entry(
-					item_code=item_code,
-					target=self.warehouse,
-					qty=diff,
-					rate=50.0,
-					company=self.company,
-					purpose="Material Receipt",
-				)
-			else:
-				make_stock_entry(
-					item_code=item_code,
-					source=self.warehouse,
-					qty=abs(diff),
-					rate=50.0,
-					company=self.company,
-					purpose="Material Issue",
-				)
+			sr = frappe.get_doc({
+				"doctype": "Stock Reconciliation",
+				"company": self.company,
+				"purpose": "Opening Stock",
+				"expense_account": self.opening_diff_account,
+				"items": [{
+					"item_code": item_code,
+					"warehouse": self.warehouse,
+					"qty": target_qty,
+					"valuation_rate": 50.0,
+				}],
+			})
+			sr.insert(ignore_permissions=True)
+			sr.submit()
 		frappe.db.commit()
 
 	def _cleanup_test_docs(self):
@@ -539,6 +566,24 @@ class TestExternalRefundLive(unittest.TestCase):
 			(f"{self.FIXTURE_PREFIX}%",),
 		)
 
+		# Clean Stock Reconciliations
+		sr_names = frappe.db.sql(
+			"""
+			SELECT DISTINCT parent FROM `tabStock Reconciliation Item`
+			WHERE item_code LIKE %s
+			""",
+			(f"{self.FIXTURE_PREFIX}%",),
+			pluck="name",
+		)
+		for sr_name in sr_names:
+			if frappe.db.exists("Stock Reconciliation", sr_name):
+				sr = frappe.get_doc("Stock Reconciliation", sr_name)
+				if sr.docstatus == 1:
+					sr.cancel()
+				frappe.delete_doc("Stock Reconciliation", sr_name, force=True, ignore_permissions=True)
+				frappe.db.delete("GL Entry", {"voucher_no": sr_name})
+				frappe.db.delete("Stock Ledger Entry", {"voucher_no": sr_name})
+
 		# Clean refund mappings
 		for ch in [f"{self.FIXTURE_PREFIX}CH-A", f"{self.FIXTURE_PREFIX}CH-B"]:
 			frappe.db.delete("External ID Mapping", {
@@ -564,6 +609,11 @@ class TestExternalRefundLive(unittest.TestCase):
 		"""
 		ch = channel or self.sales_channel
 		it = item_code or self.item_code
+
+		# Defensive physical stock check: ensure sufficient stock exists before fulfillment
+		current_stock = flt(frappe.db.get_value("Bin", {"item_code": it, "warehouse": self.warehouse}, "actual_qty") or 0.0)
+		if current_stock < qty:
+			self._seed_stock(it, max(30.0, current_stock + qty + 10.0))
 
 		if direct_stock_invoice:
 			si = frappe.get_doc({
@@ -1315,3 +1365,22 @@ class TestExternalRefundLive(unittest.TestCase):
 		self.assertEqual(residual_so, 0, "Residual Sales Order records leaked!")
 		self.assertEqual(residual_pe, 0, "Residual Payment Entry records leaked!")
 		self.assertEqual(residual_maps, 0, "Residual External ID Mapping records leaked!")
+
+		residual_sre = frappe.db.count("Stock Reservation Entry", {"item_code": ["like", f"{self.FIXTURE_PREFIX}%"]})
+		residual_irr = frappe.db.count("Inventory Reservation Reference", {"item_code": ["like", f"{self.FIXTURE_PREFIX}%"]})
+		self.assertEqual(residual_sre, 0, "Residual Stock Reservation Entry records leaked!")
+		self.assertEqual(residual_irr, 0, "Residual Inventory Reservation Reference records leaked!")
+
+		residual_sr = frappe.db.sql(
+			"""
+			SELECT COUNT(DISTINCT parent) FROM `tabStock Reconciliation Item`
+			WHERE item_code LIKE %s
+			""",
+			(f"{self.FIXTURE_PREFIX}%",),
+		)[0][0]
+		self.assertEqual(residual_sr, 0, "Residual Stock Reconciliation records leaked!")
+
+		# Verify stock matches pre-test baseline
+		for itm, baseline_qty in self.baseline_stock.items():
+			current_qty = flt(frappe.db.get_value("Bin", {"item_code": itm, "warehouse": self.warehouse}, "actual_qty") or 0.0)
+			self.assertEqual(current_qty, baseline_qty, f"Stock for {itm} drifted from baseline {baseline_qty} to {current_qty}")
