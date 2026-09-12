@@ -69,6 +69,9 @@ class TestExternalRefundLive(unittest.TestCase):
 		cls.company = frappe.db.get_single_value("Global Defaults", "default_company") or "Industrial DP"
 		cls.abbr = frappe.get_cached_value("Company", cls.company, "abbr") or "IDP"
 
+		# Defensively clean prior fixtures before capturing baselines
+		cls._cleanup_module_fixtures()
+
 		# Snapshot baselines before module execution
 		cls.baseline_sales_invoices = set(frappe.get_all("Sales Invoice", pluck="name"))
 		cls.baseline_delivery_notes = set(frappe.get_all("Delivery Note", pluck="name"))
@@ -79,11 +82,9 @@ class TestExternalRefundLive(unittest.TestCase):
 		cls.baseline_items = set(frappe.get_all("Item", pluck="name"))
 		cls.baseline_warehouses = set(frappe.get_all("Warehouse", pluck="name"))
 
-		# Defensively clean prior fixtures
-		cls._cleanup_module_fixtures()
-
 		cls.sales_channel = f"{cls.FIXTURE_PREFIX}CH-A"
 		cls.channel_b = f"{cls.FIXTURE_PREFIX}CH-B"
+
 
 		# Ensure sales channels exist
 		for ch in [cls.sales_channel, cls.channel_b]:
@@ -988,10 +989,12 @@ class TestExternalRefundLive(unittest.TestCase):
 
 	def test_i_credit_note_cancel_terminal_identity(self):
 		"""
-		Scenario I:
+		Scenario I (Phase 1R.1 Goal A Hardening):
 		Credit Note cancel reverses GL natively.
-		External refund identity remains claimed.
+		External refund identity remains claimed permanently (active=1, keys populated).
+		Direct duplicate mapping insert fails at MariaDB unique constraint level.
 		Replaying the cancelled refund ID routes to review (RefundReplayCancelledError).
+		Concurrent replay attempts are both rejected with zero duplicate Credit Notes or mappings.
 		"""
 		ext_id = f"{self.FIXTURE_PREFIX}ORD-I"
 		so, dn, si = self._create_submitted_invoice(ext_id, qty=1.0, rate=100.0)
@@ -1007,15 +1010,104 @@ class TestExternalRefundLive(unittest.TestCase):
 		cn = process_external_refund(ref_rec)
 		self.assertEqual(cn.docstatus, 1)
 
-		# Cancel the Credit Note
+		# 1. Verify mapping before cancel
+		mapping_before = frappe.get_doc("External ID Mapping", {
+			"sales_channel": self.sales_channel,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"external_entity_type": ExternalEntityType.REFUND,
+			"external_id": f"{self.FIXTURE_PREFIX}REF-I",
+		})
+		self.assertEqual(mapping_before.active, 1)
+		self.assertTrue(mapping_before.active_external_key)
+		self.assertTrue(mapping_before.active_erp_key)
+		self.assertEqual(mapping_before.erp_document, cn.name)
+
+		# 2. Cancel the Credit Note
 		cn.cancel()
 		self.assertEqual(cn.docstatus, 2)
+		frappe.db.commit()
 
-		# Replaying the same external refund ID must be blocked and route to review
+		# 3. Verify mapping remains active=1 and keys remain populated permanently
+		mapping_after = frappe.get_doc("External ID Mapping", {
+			"sales_channel": self.sales_channel,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"external_entity_type": ExternalEntityType.REFUND,
+			"external_id": f"{self.FIXTURE_PREFIX}REF-I",
+		})
+		self.assertEqual(mapping_after.active, 1)
+		self.assertEqual(mapping_after.active_external_key, mapping_before.active_external_key)
+		self.assertEqual(mapping_after.active_erp_key, mapping_before.active_erp_key)
+		self.assertEqual(mapping_after.erp_document, cn.name)
+
+		# 4. Direct insert of second mapping with same active_external_key fails at MariaDB constraint level
+		m_dup = frappe.get_doc({
+			"doctype": "External ID Mapping",
+			"sales_channel": self.sales_channel,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"external_entity_type": ExternalEntityType.REFUND,
+			"external_id": f"{self.FIXTURE_PREFIX}REF-I",
+			"erp_doctype": "Sales Invoice",
+			"erp_document": cn.name,
+			"active": 1,
+			"active_external_key": mapping_after.active_external_key,
+			"active_erp_key": "dummy_erp_key_test_dup",
+		})
+		with self.assertRaises(Exception):
+			m_dup.db_insert()
+
+		# 5. Single-thread replay of cancelled refund must be blocked and route to review
 		with self.assertRaises(RefundReplayCancelledError):
 			process_external_refund(ref_rec)
 
+		frappe.db.commit()
+
+		# 6. Concurrent workers replaying cancelled refund must BOTH be rejected without creating duplicates
+
+		errors = []
+		results = []
+
+		def worker_cancelled():
+			try:
+				frappe.init(site="frontend")
+				frappe.connect()
+				process_external_refund(ref_rec)
+				results.append("UNEXPECTED_SUCCESS")
+			except Exception as ex:
+				errors.append(ex)
+			finally:
+				try:
+					frappe.destroy()
+				except Exception:
+					pass
+
+		t1 = threading.Thread(target=worker_cancelled)
+		t2 = threading.Thread(target=worker_cancelled)
+		t1.start()
+		t2.start()
+		t1.join(timeout=15)
+		t2.join(timeout=15)
+
+		frappe.init(site="frontend")
+		frappe.connect()
+
+		self.assertEqual(len(results), 0, "Replay of cancelled refund unexpectedly succeeded!")
+		self.assertEqual(len(errors), 2)
+		for err in errors:
+			self.assertIsInstance(err, RefundReplayCancelledError)
+
+		# Verify strictly 1 Credit Note exists for this refund, and 1 mapping exists
+		total_cns = frappe.db.count("Sales Invoice", {"return_against": si.name, "is_return": 1})
+		self.assertEqual(total_cns, 1)
+		total_maps = frappe.db.count("External ID Mapping", {
+			"sales_channel": self.sales_channel,
+			"provider": IntegrationProvider.PRESTASHOP,
+			"external_entity_type": ExternalEntityType.REFUND,
+			"external_id": f"{self.FIXTURE_PREFIX}REF-I",
+		})
+		self.assertEqual(total_maps, 1)
+
 	def test_j_response_lost_after_credit_note_submit(self):
+
 		"""
 		Scenario J:
 		Credit Note submitted, response lost / worker crashes before ack.
@@ -1086,7 +1178,122 @@ class TestExternalRefundLive(unittest.TestCase):
 		events_after = frappe.db.count("Integration Event", {"sales_channel": self.sales_channel})
 		self.assertGreaterEqual(events_after, events_before + 1)
 
+	def test_l2_physical_over_return_authority_lifecycle(self):
+
+		"""
+		Scenario L2 (Phase 1R.1 Goal C Hardening):
+		Lifecycle proof of physical return authority via Delivery Notes:
+		- Delivered 2 units via Delivery Note.
+		- Step 1: Financial-only credit of $20 -> verifies 0 Return Delivery Notes created, physical capacity remains 2.
+		- Step 2: Physical return A of 1 unit -> Return DN created and submitted (qty -1). Stock restored by 1. Remaining physical capacity: 1.
+		- Step 3: Physical return B attempt of 2 units -> BLOCKED with OverRefundBlockedError (req 2 > rem 1). Stock remains 1.
+		- Step 4: Valid physical return B of 1 unit -> Return DN created and submitted (qty -1). Physical capacity fully consumed (2/2). Stock restored by 2 total.
+		- Step 5: Physical return C attempt of 1 unit -> BLOCKED with OverRefundBlockedError (req 1 > rem 0).
+		"""
+		ext_id = f"{self.FIXTURE_PREFIX}ORD-L2"
+		so, dn, si = self._create_submitted_invoice(ext_id, qty=2.0, rate=100.0)
+
+		initial_actual_qty = frappe.db.get_value(
+			"Bin", {"item_code": self.item_code, "warehouse": self.warehouse}, "actual_qty"
+		) or 0.0
+
+		# Step 1: Financial-only refund of $20
+		ref_fin = ExternalRefundRecord(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.sales_channel,
+			external_refund_id=f"{self.FIXTURE_PREFIX}REF-L2-FIN",
+			sales_invoice=si.name,
+			amount=20.0,
+			return_stock=False,
+			currency="COP",
+		)
+		cn_fin = process_external_refund(ref_fin)
+		self.assertEqual(cn_fin.update_stock, 0)
+		self.assertIsNone(getattr(cn_fin, "_return_delivery_note", None))
+
+		# Stock must not have changed from financial credit
+		qty_after_fin = frappe.db.get_value(
+			"Bin", {"item_code": self.item_code, "warehouse": self.warehouse}, "actual_qty"
+		) or 0.0
+		self.assertEqual(qty_after_fin, initial_actual_qty)
+
+		# Step 2: Physical return of 1 unit
+		ref_phys_1 = ExternalRefundRecord(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.sales_channel,
+			external_refund_id=f"{self.FIXTURE_PREFIX}REF-L2-P1",
+			sales_invoice=si.name,
+			items=[ExternalRefundItem(item_code=self.item_code, qty=1.0)],
+			return_stock=True,
+			currency="COP",
+		)
+		cn_p1 = process_external_refund(ref_phys_1)
+		self.assertEqual(cn_p1.update_stock, 0)
+		self.assertTrue(getattr(cn_p1, "_return_delivery_note", None))
+		self.assertEqual(cn_p1._return_delivery_note.docstatus, 1)
+
+		# Stock restored by exactly 1 unit
+		qty_after_p1 = frappe.db.get_value(
+			"Bin", {"item_code": self.item_code, "warehouse": self.warehouse}, "actual_qty"
+		) or 0.0
+		self.assertEqual(flt(qty_after_p1 - initial_actual_qty), 1.0)
+
+		# Step 3: Attempt physical over-return of 2 units (remaining capacity is 1)
+		ref_over = ExternalRefundRecord(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.sales_channel,
+			external_refund_id=f"{self.FIXTURE_PREFIX}REF-L2-OVER",
+			sales_invoice=si.name,
+			items=[ExternalRefundItem(item_code=self.item_code, qty=2.0)],
+			return_stock=True,
+			currency="COP",
+		)
+		with self.assertRaises(OverRefundBlockedError) as ctx:
+			process_external_refund(ref_over)
+		self.assertIn("exceeds remaining physical return capacity", str(ctx.exception))
+
+		# Stock still restored by strictly 1 unit
+		qty_after_over = frappe.db.get_value(
+			"Bin", {"item_code": self.item_code, "warehouse": self.warehouse}, "actual_qty"
+		) or 0.0
+		self.assertEqual(flt(qty_after_over - initial_actual_qty), 1.0)
+
+		# Step 4: Valid physical return of the remaining 1 unit
+		ref_phys_2 = ExternalRefundRecord(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.sales_channel,
+			external_refund_id=f"{self.FIXTURE_PREFIX}REF-L2-P2",
+			sales_invoice=si.name,
+			items=[ExternalRefundItem(item_code=self.item_code, qty=1.0)],
+			return_stock=True,
+			currency="COP",
+		)
+		cn_p2 = process_external_refund(ref_phys_2)
+		self.assertEqual(cn_p2.update_stock, 0)
+		self.assertTrue(getattr(cn_p2, "_return_delivery_note", None))
+		self.assertEqual(cn_p2._return_delivery_note.docstatus, 1)
+
+		# Stock restored by exactly 2 units total
+		qty_after_p2 = frappe.db.get_value(
+			"Bin", {"item_code": self.item_code, "warehouse": self.warehouse}, "actual_qty"
+		) or 0.0
+		self.assertEqual(flt(qty_after_p2 - initial_actual_qty), 2.0)
+
+		# Step 5: Attempt third physical return of 1 unit (0 remaining capacity)
+		ref_exhausted = ExternalRefundRecord(
+			provider=IntegrationProvider.PRESTASHOP,
+			sales_channel=self.sales_channel,
+			external_refund_id=f"{self.FIXTURE_PREFIX}REF-L2-EXHAUSTED",
+			sales_invoice=si.name,
+			items=[ExternalRefundItem(item_code=self.item_code, qty=1.0)],
+			return_stock=True,
+			currency="COP",
+		)
+		with self.assertRaises(OverRefundBlockedError):
+			process_external_refund(ref_exhausted)
+
 	def test_m_fixture_cleanup_proof(self):
+
 		"""
 		Scenario M:
 		Verifies clean fixture teardown restoring baseline invariance.

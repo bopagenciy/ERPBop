@@ -99,6 +99,9 @@ class ExternalRefundItem:
 	sales_invoice_item: Optional[str] = None
 	warehouse: Optional[str] = None
 	physical_return_evidence: bool = False
+	refund_amount: Optional[float] = None
+	returned_qty: Optional[float] = None
+
 
 
 @dataclass
@@ -128,38 +131,255 @@ class ExternalRefundRecord:
 
 
 def compute_external_refund_idempotency_key(
-	sales_channel: str,
-	provider: str,
-	external_refund_id: str,
+	sales_channel: Optional[str] = None,
+	provider: Optional[str] = None,
+	external_refund_id: Optional[str] = None,
 	external_order_id: Optional[str] = None,
 	amount: Optional[float] = None,
 	currency: Optional[str] = None,
 	items: Optional[List[ExternalRefundItem]] = None,
+	refund_record: Optional[ExternalRefundRecord] = None,
+	external_payment_id: Optional[str] = None,
+	shipping_refund_amount: Optional[float] = None,
+	status: Optional[str] = None,
+	return_stock: Optional[bool] = None,
+	metadata: Optional[Dict[str, Any]] = None,
+	**kwargs,
 ) -> str:
 	"""
-	Computes a deterministic SHA-256 idempotency key for an external refund event.
+	Computes a canonical deterministic SHA-256 idempotency key for an external refund event.
+	Covers all material refund semantics:
+	- provider
+	- sales_channel
+	- external_refund_id
+	- external_order_id
+	- external_payment_id (if supplied)
+	- currency
+	- refund_amount
+	- shipping_refund_amount
+	- status
+	- return_stock
+	- sorted line items (external_order_line_id, item_code, refund_amount, returned_qty, physical_return_evidence, warehouse)
+	- metadata (deterministic sorting ensures key ordering variations do not drift)
 	"""
-	payload = {
-		"channel": str(sales_channel).strip(),
-		"provider": str(provider).strip().upper(),
+	if refund_record is not None:
+		provider = refund_record.provider
+		sales_channel = refund_record.sales_channel
+		external_refund_id = refund_record.external_refund_id
+		external_order_id = refund_record.external_order_id
+		external_payment_id = refund_record.external_payment_id
+		currency = refund_record.currency
+		amount = refund_record.amount
+		shipping_refund_amount = refund_record.shipping_refund_amount
+		status = refund_record.status
+		return_stock = refund_record.return_stock
+		items = refund_record.items
+		metadata = refund_record.metadata
+
+	prov = str(provider).strip().upper() if provider else ""
+	channel = str(sales_channel).strip() if sales_channel else ""
+	ref_id = str(external_refund_id).strip() if external_refund_id else ""
+	ord_id = str(external_order_id).strip() if external_order_id else None
+	pmt_id = (
+		str(external_payment_id).strip()
+		if external_payment_id
+		else (str(kwargs["external_payment_id"]).strip() if kwargs.get("external_payment_id") else None)
+	)
+	curr = str(currency).strip().upper() if currency else "USD"
+	st = (
+		str(status).strip().upper()
+		if status
+		else (str(kwargs["status"]).strip().upper() if kwargs.get("status") else ExternalRefundStatus.SETTLED)
+	)
+	ship_amt = (
+		shipping_refund_amount
+		if shipping_refund_amount is not None
+		else kwargs.get("shipping_refund_amount")
+	)
+	ret_stock = (
+		bool(return_stock)
+		if return_stock is not None
+		else bool(kwargs.get("return_stock", False))
+	)
+	meta = metadata if metadata is not None else kwargs.get("metadata")
+
+	payload: Dict[str, Any] = {
+		"provider": prov,
+		"sales_channel": channel,
 		"entity_type": ExternalEntityType.REFUND,
-		"refund_id": str(external_refund_id).strip(),
-		"order_id": str(external_order_id).strip() if external_order_id else None,
-		"amount": float(_round_curr(amount)) if amount is not None else None,
-		"currency": str(currency).strip().upper() if currency else "USD",
+		"external_refund_id": ref_id,
+		"external_order_id": ord_id,
+		"external_payment_id": pmt_id,
+		"currency": curr,
+		"refund_amount": float(_round_curr(amount)) if amount is not None else None,
+		"shipping_refund_amount": float(_round_curr(ship_amt)) if ship_amt is not None else None,
+		"status": st,
+		"return_stock": ret_stock,
 	}
+
+	normalized_items = []
 	if items:
-		payload["items"] = [
-			{
-				"item_code": it.item_code,
-				"qty": float(it.qty) if it.qty is not None else None,
-				"rate": float(it.rate) if it.rate is not None else None,
-				"sales_invoice_item": it.sales_invoice_item,
-			}
-			for it in items
-		]
+		for it in items:
+			item_code = str(it.item_code).strip() if getattr(it, "item_code", None) else None
+			ext_line_id = str(it.external_order_line_id).strip() if getattr(it, "external_order_line_id", None) else None
+			warehouse = str(it.warehouse).strip() if getattr(it, "warehouse", None) else None
+			phys_ev = bool(getattr(it, "physical_return_evidence", False))
+
+			ref_amt = getattr(it, "refund_amount", None)
+			if ref_amt is not None:
+				calc_ref_amt = float(_round_curr(ref_amt))
+			elif getattr(it, "rate", None) is not None and getattr(it, "qty", None) is not None:
+				calc_ref_amt = float(_round_curr(flt(it.rate) * flt(it.qty)))
+			else:
+				calc_ref_amt = None
+
+			ret_q = getattr(it, "returned_qty", None)
+			if ret_q is not None:
+				calc_ret_q = float(ret_q)
+			elif getattr(it, "qty", None) is not None:
+				calc_ret_q = float(it.qty)
+			else:
+				calc_ret_q = None
+
+			normalized_items.append({
+				"external_order_line_id": ext_line_id,
+				"item_code": item_code,
+				"refund_amount": calc_ref_amt,
+				"returned_qty": calc_ret_q,
+				"physical_return_evidence": phys_ev,
+				"warehouse": warehouse,
+			})
+
+		# Deterministic sorting
+		normalized_items.sort(key=lambda x: (
+			x["item_code"] or "",
+			x["external_order_line_id"] or "",
+			x["warehouse"] or "",
+			x["refund_amount"] or 0.0,
+			x["returned_qty"] or 0.0,
+		))
+
+	payload["items"] = normalized_items
+
+	if meta and isinstance(meta, dict):
+		payload["metadata"] = meta
+
 	canonical_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 	return hashlib.sha256(canonical_bytes).hexdigest()
+
+
+def get_delivery_notes_for_invoice(si_doc) -> List[str]:
+	"""
+	Returns all submitted original (non-return) Delivery Notes associated with a Sales Invoice.
+	Checks both direct item row delivery_note links and Sales Order fulfillment links.
+	"""
+	dn_names = set()
+	for row in si_doc.items:
+		if getattr(row, "delivery_note", None) and isinstance(row.delivery_note, str):
+			dn_names.add(row.delivery_note)
+
+	so_name = getattr(si_doc, "sales_order", None)
+	if not so_name or not isinstance(so_name, str):
+		so_name = None
+		for row in si_doc.items:
+			if getattr(row, "sales_order", None) and isinstance(row.sales_order, str):
+				so_name = row.sales_order
+				break
+
+	if so_name:
+		dns = frappe.db.sql(
+			"""
+			SELECT DISTINCT parent FROM `tabDelivery Note Item`
+			WHERE against_sales_order = %s AND docstatus = 1
+			""",
+			(so_name,),
+			pluck="parent",
+		)
+		for dn in dns:
+			dn_names.add(dn)
+
+	valid_dns = []
+	for dn in dn_names:
+		if frappe.db.exists("Delivery Note", dn):
+			dn_info = frappe.db.get_value(
+				"Delivery Note", dn, ["docstatus", "is_return"], as_dict=True
+			)
+			if dn_info and dn_info.docstatus == 1 and not dn_info.is_return:
+				valid_dns.append(dn)
+	return valid_dns
+
+
+
+def get_physical_return_scope(
+	si_doc, item_code: str, dn_names: Optional[List[str]] = None
+) -> Tuple[float, float, float]:
+	"""
+	Returns (delivered_qty, physically_returned_qty, remaining_physical_qty) for a given item_code.
+	Distinguishes between Path 1 (si_doc.update_stock == 1) and Path 2 (Delivery Note fulfillment).
+	"""
+	delivered_qty = 0.0
+	physically_returned_qty = 0.0
+
+	if cint(si_doc.update_stock) == 1:
+		# Path 1: Sales Invoice directly moved stock
+		for row in si_doc.items:
+			if row.item_code == item_code:
+				delivered_qty += abs(flt(row.qty))
+
+		# Query submitted Return Sales Invoices with update_stock = 1
+		ret_si_rows = frappe.db.sql(
+			"""
+			SELECT SUM(ABS(sii.qty))
+			FROM `tabSales Invoice Item` sii
+			INNER JOIN `tabSales Invoice` si ON si.name = sii.parent
+			WHERE si.return_against = %s
+			  AND si.docstatus = 1
+			  AND si.is_return = 1
+			  AND si.update_stock = 1
+			  AND sii.item_code = %s
+			""",
+			(si_doc.name, item_code),
+		)
+		if ret_si_rows and ret_si_rows[0][0]:
+			physically_returned_qty = flt(ret_si_rows[0][0])
+	else:
+		# Path 2: Delivery Note fulfillment
+		if dn_names is None:
+			dn_names = get_delivery_notes_for_invoice(si_doc)
+
+		if dn_names:
+			del_rows = frappe.db.sql(
+				"""
+				SELECT SUM(qty)
+				FROM `tabDelivery Note Item`
+				WHERE parent IN %(dns)s
+				  AND docstatus = 1
+				  AND item_code = %(item_code)s
+				""",
+				{"dns": tuple(dn_names), "item_code": item_code},
+			)
+
+			if del_rows and del_rows[0][0]:
+				delivered_qty = flt(del_rows[0][0])
+
+			ret_dn_rows = frappe.db.sql(
+				"""
+				SELECT SUM(ABS(dni.qty))
+				FROM `tabDelivery Note Item` dni
+				INNER JOIN `tabDelivery Note` dn ON dn.name = dni.parent
+				WHERE dn.return_against IN %(dns)s
+				  AND dn.docstatus = 1
+				  AND dn.is_return = 1
+				  AND dni.item_code = %(item_code)s
+				""",
+				{"dns": tuple(dn_names), "item_code": item_code},
+			)
+			if ret_dn_rows and ret_dn_rows[0][0]:
+				physically_returned_qty = flt(ret_dn_rows[0][0])
+
+	remaining_physical_qty = max(0.0, delivered_qty - physically_returned_qty)
+	return (delivered_qty, physically_returned_qty, remaining_physical_qty)
+
 
 
 def process_external_refund(
@@ -219,14 +439,9 @@ def process_external_refund(
 
 	# 3. Canonical Identity & Replay Check (Section 5 & 17)
 	ref_idempotency_key = compute_external_refund_idempotency_key(
-		sales_channel=channel,
-		provider=clean_prov,
-		external_refund_id=ref_id,
-		external_order_id=refund_record.external_order_id,
-		amount=refund_record.amount,
-		currency=refund_record.currency,
-		items=refund_record.items,
+		refund_record=refund_record
 	)
+
 
 	existing_map = frappe.db.get_value(
 		"External ID Mapping",
@@ -466,16 +681,46 @@ def process_external_refund(
 			if prior_q == 0.0 and target_row.item_code in prior_returned_qtys:
 				prior_q = prior_returned_qtys[target_row.item_code]
 
-			remaining_q = row_qty - prior_q
-			if req_qty > (remaining_q + 0.0001):
+			is_physical_return = bool(refund_record.return_stock) or any(
+				getattr(it, "physical_return_evidence", False) for it in (refund_record.items or [])
+			)
+			if not is_physical_return:
+				remaining_q = row_qty - prior_q
+				if req_qty > (remaining_q + 0.0001):
+					REFUND_COUNTERS["refund_blocked"] += 1
+					REFUND_COUNTERS["refund_failures"] += 1
+					raise OverRefundBlockedError(
+						_(
+							"Requested return quantity {0} for item '{1}' exceeds remaining eligible quantity {2} "
+							"(Invoiced: {3}, Prior returned: {4})."
+						).format(req_qty, target_row.item_code, remaining_q, row_qty, prior_q)
+					)
+
+	# 7.1 Physical Return Capacity Validation (Goal C & Phase 1R.1)
+	is_physical_return = bool(refund_record.return_stock) or any(
+		getattr(it, "physical_return_evidence", False) for it in (refund_record.items or [])
+	)
+	if is_physical_return:
+		items_to_validate = refund_record.items if refund_record.items else [
+			ExternalRefundItem(item_code=r.item_code, qty=abs(flt(r.qty))) for r in si_doc.items
+		]
+		inv_dns = get_delivery_notes_for_invoice(si_doc) if not cint(si_doc.update_stock) else None
+		for req_it in items_to_validate:
+			item_code = req_it.item_code
+			req_phys_qty = abs(flt(req_it.returned_qty if req_it.returned_qty is not None else req_it.qty))
+			deliv_qty, ret_phys_qty, rem_phys_qty = get_physical_return_scope(
+				si_doc, item_code, inv_dns
+			)
+			if req_phys_qty > (rem_phys_qty + 0.0001):
 				REFUND_COUNTERS["refund_blocked"] += 1
 				REFUND_COUNTERS["refund_failures"] += 1
 				raise OverRefundBlockedError(
 					_(
-						"Requested return quantity {0} for item '{1}' exceeds remaining eligible quantity {2} "
-						"(Invoiced: {3}, Prior returned: {4})."
-					).format(req_qty, target_row.item_code, remaining_q, row_qty, prior_q)
+						"Requested physical return quantity {0} for item '{1}' exceeds remaining physical return capacity {2} "
+						"(Delivered: {3}, Already physically returned: {4})."
+					).format(req_phys_qty, item_code, rem_phys_qty, deliv_qty, ret_phys_qty)
 				)
+
 
 	# 8. Savepoint-wrapped Execution
 	sp_refund = f"sp_ref_{frappe.generate_hash(length=8)}"
@@ -496,18 +741,19 @@ def process_external_refund(
 
 		dn_name = None
 		for row in si_doc.items:
-			if row.delivery_note:
+			if getattr(row, "delivery_note", None) and isinstance(row.delivery_note, str):
 				dn_name = row.delivery_note
 				break
 		if not dn_name:
 			# Fallback: check if Delivery Note exists against the Sales Order
 			so_name_val = getattr(si_doc, "sales_order", None)
-			if not so_name_val:
+			if not so_name_val or not isinstance(so_name_val, str):
+				so_name_val = None
 				for row in si_doc.items:
-					if getattr(row, "sales_order", None):
+					if getattr(row, "sales_order", None) and isinstance(row.sales_order, str):
 						so_name_val = row.sales_order
 						break
-			if so_name_val:
+			if so_name_val and isinstance(so_name_val, str):
 				dn_names = frappe.db.sql(
 					"""
 					SELECT DISTINCT parent FROM `tabDelivery Note Item`
@@ -520,8 +766,9 @@ def process_external_refund(
 				if dn_names:
 					dn_name = dn_names[0]
 
-		if dn_name and frappe.db.exists("Delivery Note", dn_name):
+		if dn_name and isinstance(dn_name, str) and frappe.db.exists("Delivery Note", dn_name):
 			dn_dt_val = frappe.db.get_value("Delivery Note", dn_name, ["posting_date", "posting_time"], as_dict=True)
+
 			if dn_dt_val:
 				dn_posting_dt = get_datetime(f"{dn_dt_val.posting_date} {dn_dt_val.posting_time or '00:00:00'}")
 				earliest_dt = max(earliest_dt, dn_posting_dt)
@@ -614,8 +861,13 @@ def process_external_refund(
 						rem_credit_needed = 0.0
 						break
 
+				if not refund_record.return_stock:
+					for row_it in new_items:
+						row_it.sales_invoice_item = None
+
 				cn.items = new_items
 				cn.set_missing_values()
+
 				cn.calculate_taxes_and_totals()
 
 		# Handle stock return semantics (Section 8 & 9)
@@ -635,8 +887,31 @@ def process_external_refund(
 			else:
 				# Original SI was delivered via Delivery Note: ERPNext requires Return Delivery Note
 				cn.update_stock = 0
-				if dn_name and frappe.db.exists("Delivery Note", dn_name):
-					ret_dn = make_return_doc("Delivery Note", dn_name)
+				inv_dns = get_delivery_notes_for_invoice(si_doc)
+				target_dn = None
+				if inv_dns:
+					for cand in inv_dns:
+						cand_suitable = True
+						items_to_check = refund_record.items if refund_record.items else [
+							ExternalRefundItem(item_code=r.item_code, qty=abs(flt(r.qty))) for r in si_doc.items
+						]
+						for it in items_to_check:
+							it_code = it.item_code
+							req_q = abs(flt(it.returned_qty if it.returned_qty is not None else it.qty))
+							c_del, c_ret, c_rem = get_physical_return_scope(si_doc, it_code, [cand])
+							if req_q > (c_rem + 0.0001):
+								cand_suitable = False
+								break
+						if cand_suitable:
+							target_dn = cand
+							break
+					if not target_dn:
+						target_dn = inv_dns[0]
+				elif dn_name:
+					target_dn = dn_name
+
+				if target_dn and frappe.db.exists("Delivery Note", target_dn):
+					ret_dn = make_return_doc("Delivery Note", target_dn)
 					ret_dn.posting_date = cn.posting_date
 					ret_dn.posting_time = cn.posting_time
 					ret_dn.set_posting_time = 1
@@ -645,12 +920,15 @@ def process_external_refund(
 						ret_dn.items = [r for r in ret_dn.items if r.item_code in req_codes]
 						for r in ret_dn.items:
 							for it in refund_record.items:
-								if it.item_code == r.item_code and it.qty:
-									r.qty = -1 * abs(flt(it.qty))
+								if it.item_code == r.item_code:
+									ret_qty = it.returned_qty if it.returned_qty is not None else it.qty
+									if ret_qty:
+										r.qty = -1 * abs(flt(ret_qty))
 					ret_dn.flags.ignore_permissions = True
 					ret_dn.insert()
 					ret_dn.submit()
 					return_dn_doc = ret_dn
+
 
 			# Transactional inventory publication intent (Section 22)
 			if schedule_channel_inventory_publication and returned_item_codes:

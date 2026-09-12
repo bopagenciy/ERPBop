@@ -161,11 +161,15 @@ def validate_operational_guard(doc, method=None) -> None:
 				assert_sales_order_ready_for_fulfillment(so_id)
 
 	elif dt == "Delivery Note":
+		if getattr(doc, "is_return", None):
+			return
+
 		items = doc.get("items") or []
 		for item in items:
 			so_id = getattr(item, "against_sales_order", None) if not isinstance(item, dict) else item.get("against_sales_order")
 			if so_id:
 				assert_sales_order_ready_for_fulfillment(so_id)
+
 
 	elif dt == "Shipment":
 		delivery_notes = doc.get("delivery_notes") or []

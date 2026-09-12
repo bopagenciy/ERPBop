@@ -80,10 +80,23 @@ class ExternalIDMapping(Document):
 		self.clean_fields()
 		self.validate_field_lengths()
 		self.validate_variant_semantics()
+		self.validate_terminal_entity_immutability()
 		self.set_uniqueness_keys()
 		self.validate_linked_document()
 		self.validate_external_uniqueness()
 		self.validate_erp_document_uniqueness()
+
+	def validate_terminal_entity_immutability(self):
+		if self.external_entity_type == ExternalEntityType.REFUND:
+			old_doc = self.get_doc_before_save()
+			if old_doc and getattr(old_doc, "active", 0) == 1 and not self.active:
+				frappe.throw(
+					_(
+						"External ID Mapping for terminal entity '{0}' cannot be deactivated."
+					).format(self.external_entity_type)
+				)
+
+
 
 	def clean_fields(self):
 		# External IDs are opaque: DO NOT strip, lowercase, uppercase, or collapse whitespace

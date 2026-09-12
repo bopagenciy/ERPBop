@@ -1089,3 +1089,312 @@ class TestExternalRefundUnit(FrappeTestCase):
 		reset_refund_counters()
 		c = get_refund_counters()
 		self.assertEqual(sum(c.values()), 0)
+
+	# --- 9. Phase 1R.1 Hardening Tests (Scenarios 37-46) ---
+
+	def test_37_terminal_refund_identity_cannot_be_deactivated(self):
+		"""Phase 1R.1 Goal A: Terminal REFUND identity cannot be deactivated."""
+		doc = frappe.new_doc("External ID Mapping")
+		doc.name = "MAP-REF-TERM"
+		doc.sales_channel = "CH-01"
+		doc.provider = "PRESTASHOP"
+		doc.external_entity_type = ExternalEntityType.REFUND
+		doc.external_id = "REF-TERM-001"
+		doc.active = 0
+		doc.flags.is_new = False
+		# Mock get_doc_before_save to return active=1
+		old_doc = MagicMock()
+		old_doc.active = 1
+		doc.get_doc_before_save = MagicMock(return_value=old_doc)
+		with self.assertRaises(frappe.ValidationError) as ctx:
+			doc.validate_terminal_entity_immutability()
+		self.assertIn("cannot be deactivated", str(ctx.exception).lower())
+
+	def test_38_canonical_hash_all_material_fields(self):
+		"""Phase 1R.1 Goal B: Hash covers all material refund semantics."""
+		rec1 = ExternalRefundRecord(
+			provider="PRESTASHOP",
+			sales_channel="CH-01",
+			external_refund_id="REF-MAT-1",
+			external_order_id="ORD-MAT-1",
+			external_payment_id="PMT-MAT-1",
+			currency="USD",
+			amount=100.0,
+			shipping_refund_amount=15.0,
+			status="SETTLED",
+			return_stock=True,
+			items=[
+				ExternalRefundItem(
+					external_order_line_id="LINE-1",
+					item_code="ITEM-A",
+					refund_amount=85.0,
+					returned_qty=1.0,
+					physical_return_evidence=True,
+					warehouse="Stores - CA",
+				)
+			],
+		)
+		key1 = compute_external_refund_idempotency_key(refund_record=rec1)
+		self.assertEqual(len(key1), 64)
+
+		# Recomputing with exact same fields yields identical key
+		key2 = compute_external_refund_idempotency_key(refund_record=rec1)
+		self.assertEqual(key1, key2)
+
+	def test_39_canonical_hash_metadata_ordering_invariance(self):
+		"""Phase 1R.1 Goal B: Metadata key ordering variations do not cause hash drift."""
+		rec_a = ExternalRefundRecord(
+			provider="PRESTASHOP",
+			sales_channel="CH-01",
+			external_refund_id="REF-META",
+			amount=50.0,
+			currency="USD",
+			metadata={"zebra": 1, "apple": 2, "mango": {"beta": 10, "alpha": 20}},
+		)
+		rec_b = ExternalRefundRecord(
+			provider="PRESTASHOP",
+			sales_channel="CH-01",
+			external_refund_id="REF-META",
+			amount=50.0,
+			currency="USD",
+			metadata={"apple": 2, "zebra": 1, "mango": {"alpha": 20, "beta": 10}},
+		)
+		key_a = compute_external_refund_idempotency_key(refund_record=rec_a)
+		key_b = compute_external_refund_idempotency_key(refund_record=rec_b)
+		self.assertEqual(key_a, key_b)
+
+	def test_40_payload_drift_return_type(self):
+		"""Phase 1R.1 Goal B: Changing return type (financial-only vs physical return) causes drift."""
+		rec_fin = ExternalRefundRecord(
+			provider="PRESTASHOP",
+			sales_channel="CH-01",
+			external_refund_id="REF-DRIFT-1",
+			amount=50.0,
+			return_stock=False,
+		)
+		rec_phys = ExternalRefundRecord(
+			provider="PRESTASHOP",
+			sales_channel="CH-01",
+			external_refund_id="REF-DRIFT-1",
+			amount=50.0,
+			return_stock=True,
+		)
+		key_fin = compute_external_refund_idempotency_key(refund_record=rec_fin)
+		key_phys = compute_external_refund_idempotency_key(refund_record=rec_phys)
+		self.assertNotEqual(key_fin, key_phys)
+
+	def test_41_payload_drift_returned_qty(self):
+		"""Phase 1R.1 Goal B: Changing returned quantity triggers drift."""
+		rec_q1 = ExternalRefundRecord(
+			provider="PRESTASHOP",
+			sales_channel="CH-01",
+			external_refund_id="REF-DRIFT-2",
+			items=[ExternalRefundItem(item_code="ITEM-A", returned_qty=1.0)],
+		)
+		rec_q2 = ExternalRefundRecord(
+			provider="PRESTASHOP",
+			sales_channel="CH-01",
+			external_refund_id="REF-DRIFT-2",
+			items=[ExternalRefundItem(item_code="ITEM-A", returned_qty=2.0)],
+		)
+		key_q1 = compute_external_refund_idempotency_key(refund_record=rec_q1)
+		key_q2 = compute_external_refund_idempotency_key(refund_record=rec_q2)
+		self.assertNotEqual(key_q1, key_q2)
+
+	def test_42_payload_drift_line_allocation(self):
+		"""Phase 1R.1 Goal B: Changing line allocation triggers drift."""
+		rec_item_a = ExternalRefundRecord(
+			provider="PRESTASHOP",
+			sales_channel="CH-01",
+			external_refund_id="REF-DRIFT-3",
+			items=[ExternalRefundItem(item_code="ITEM-A", qty=1.0)],
+		)
+		rec_item_b = ExternalRefundRecord(
+			provider="PRESTASHOP",
+			sales_channel="CH-01",
+			external_refund_id="REF-DRIFT-3",
+			items=[ExternalRefundItem(item_code="ITEM-B", qty=1.0)],
+		)
+		key_a = compute_external_refund_idempotency_key(refund_record=rec_item_a)
+		key_b = compute_external_refund_idempotency_key(refund_record=rec_item_b)
+		self.assertNotEqual(key_a, key_b)
+
+	def test_43_payload_drift_shipping_refund_amount(self):
+		"""Phase 1R.1 Goal B: Changing shipping refund amount triggers drift."""
+		rec_ship1 = ExternalRefundRecord(
+			provider="PRESTASHOP",
+			sales_channel="CH-01",
+			external_refund_id="REF-DRIFT-4",
+			amount=50.0,
+			shipping_refund_amount=10.0,
+		)
+		rec_ship2 = ExternalRefundRecord(
+			provider="PRESTASHOP",
+			sales_channel="CH-01",
+			external_refund_id="REF-DRIFT-4",
+			amount=50.0,
+			shipping_refund_amount=15.0,
+		)
+		key1 = compute_external_refund_idempotency_key(refund_record=rec_ship1)
+		key2 = compute_external_refund_idempotency_key(refund_record=rec_ship2)
+		self.assertNotEqual(key1, key2)
+
+	@patch("bop_erp.accounts.refunds.get_physical_return_scope")
+	@patch("bop_erp.accounts.refunds.make_return_doc")
+	@patch("frappe.get_doc")
+	@patch("frappe.db.exists")
+	def test_44_physical_over_return_path1_direct_delivery(
+		self, mock_exists, mock_get_doc, mock_make_return, mock_scope
+	):
+		"""Phase 1R.1 Goal C: Path 1 (si.update_stock=1) physical over-return is blocked."""
+		mock_exists.return_value = True
+		si_data = [{
+			"name": "ACC-SINV-P1",
+			"docstatus": 1,
+			"is_return": 0,
+			"company": "Company A",
+			"currency": "USD",
+			"grand_total": 200.0,
+			"outstanding_amount": 200.0,
+			"update_stock": 1,
+			"sales_channel": "CH-01",
+		}]
+		mock_si = MagicMock()
+		mock_si.name = "ACC-SINV-P1"
+		mock_si.grand_total = 200.0
+		mock_si.update_stock = 1
+		mock_si.items = [MagicMock(item_code="ITEM-P1", qty=2.0)]
+		mock_get_doc.return_value = mock_si
+
+		# Mock scope: Delivered 2, Already returned 1, Remaining 1
+		mock_scope.return_value = (2.0, 1.0, 1.0)
+
+		with patch("frappe.db.sql", side_effect=_make_mock_sql(si_data)):
+			with patch("frappe.get_all", side_effect=_make_mock_get_all()):
+				with patch("frappe.db.get_value", side_effect=_make_mock_get_value()):
+					rec = ExternalRefundRecord(
+						provider="PRESTASHOP",
+						sales_channel="CH-01",
+						external_refund_id="REF-OVER-P1",
+						sales_invoice="ACC-SINV-P1",
+						items=[ExternalRefundItem(item_code="ITEM-P1", qty=2.0)],
+						return_stock=True,
+					)
+					with self.assertRaises(OverRefundBlockedError) as ctx:
+						process_external_refund(rec)
+					self.assertIn("exceeds remaining physical return capacity", str(ctx.exception))
+					self.assertEqual(get_refund_counters()["refund_blocked"], 1)
+
+	@patch("bop_erp.accounts.refunds.get_physical_return_scope")
+	@patch("bop_erp.accounts.refunds.make_return_doc")
+	@patch("frappe.get_doc")
+	@patch("frappe.db.exists")
+	def test_45_physical_over_return_path2_delivery_notes(
+		self, mock_exists, mock_get_doc, mock_make_return, mock_scope
+	):
+		"""Phase 1R.1 Goal C: Path 2 (Delivery Note fulfillment) physical over-return is blocked."""
+		mock_exists.return_value = True
+		si_data = [{
+			"name": "ACC-SINV-P2",
+			"docstatus": 1,
+			"is_return": 0,
+			"company": "Company A",
+			"currency": "USD",
+			"grand_total": 200.0,
+			"outstanding_amount": 200.0,
+			"update_stock": 0,
+			"sales_channel": "CH-01",
+		}]
+		mock_si = MagicMock()
+		mock_si.name = "ACC-SINV-P2"
+		mock_si.grand_total = 200.0
+		mock_si.update_stock = 0
+		mock_si.items = [MagicMock(item_code="ITEM-P2", qty=2.0)]
+		mock_get_doc.return_value = mock_si
+
+		# Mock scope: Delivered 2, Already physically returned 1, Remaining 1
+		mock_scope.return_value = (2.0, 1.0, 1.0)
+
+		with patch("frappe.db.sql", side_effect=_make_mock_sql(si_data)):
+			with patch("frappe.get_all", side_effect=_make_mock_get_all()):
+				with patch("frappe.db.get_value", side_effect=_make_mock_get_value()):
+					with patch("bop_erp.accounts.refunds.get_delivery_notes_for_invoice", return_value=["DN-001"]):
+						rec = ExternalRefundRecord(
+							provider="PRESTASHOP",
+							sales_channel="CH-01",
+							external_refund_id="REF-OVER-P2",
+							sales_invoice="ACC-SINV-P2",
+							items=[ExternalRefundItem(item_code="ITEM-P2", qty=2.0)],
+							return_stock=True,
+						)
+						with self.assertRaises(OverRefundBlockedError) as ctx:
+							process_external_refund(rec)
+						self.assertIn("exceeds remaining physical return capacity", str(ctx.exception))
+						self.assertEqual(get_refund_counters()["refund_blocked"], 1)
+
+	@patch("bop_erp.accounts.refunds.get_physical_return_scope")
+	@patch("bop_erp.accounts.refunds.reconcile_dr_cr_note")
+	@patch("bop_erp.accounts.refunds.make_return_doc")
+	@patch("frappe.get_doc")
+	@patch("frappe.db.exists")
+	def test_46_financial_only_credit_does_not_consume_physical_capacity(
+		self, mock_exists, mock_get_doc, mock_make_return, mock_reconcile, mock_scope
+	):
+		"""Phase 1R.1 Goal C: Financial-only credit (return_stock=False) does not consume physical return capacity."""
+		mock_exists.return_value = True
+		si_data = [{
+			"name": "ACC-SINV-P3",
+			"docstatus": 1,
+			"is_return": 0,
+			"company": "Company A",
+			"currency": "USD",
+			"grand_total": 200.0,
+			"outstanding_amount": 200.0,
+			"update_stock": 0,
+			"sales_channel": "CH-01",
+			"posting_date": "2026-09-01",
+			"posting_time": "10:00:00",
+		}]
+		mock_si = MagicMock()
+		mock_si.name = "ACC-SINV-P3"
+		mock_si.grand_total = 200.0
+		mock_si.outstanding_amount = 200.0
+		mock_si.update_stock = 0
+		mock_si.posting_date = "2026-09-01"
+		mock_si.posting_time = "10:00:00"
+		mock_si.items = [MagicMock(name="ROW-1", item_code="ITEM-P3", qty=2.0, rate=100.0)]
+
+		mock_cn = MagicMock()
+		mock_cn.name = "ACC-SINV-RET-P3"
+		mock_cn.grand_total = -50.0
+		mock_cn.outstanding_amount = -50.0
+		mock_cn.debit_to = "1305 - Debtor"
+		mock_cn.customer = "Customer A"
+		mock_cn.conversion_rate = 1.0
+		mock_cn.currency = "USD"
+		mock_cn.company = "Company A"
+		mock_cn.posting_date = "2026-09-01"
+		mock_cn.items = []
+
+		mock_get_doc.side_effect = _make_mock_get_doc(mock_si)
+		mock_make_return.return_value = mock_cn
+
+		# Financial-only refund should NOT invoke get_physical_return_scope
+		with patch("frappe.db.sql", side_effect=_make_mock_sql(si_data)):
+			with patch("frappe.get_all", side_effect=_make_mock_get_all()):
+				with patch("frappe.db.get_value", side_effect=_make_mock_get_value()):
+					rec = ExternalRefundRecord(
+						provider="PRESTASHOP",
+						sales_channel="CH-01",
+						external_refund_id="REF-FIN-ONLY",
+						sales_invoice="ACC-SINV-P3",
+						amount=50.0,
+						return_stock=False,  # Financial-only
+					)
+					cn = process_external_refund(rec)
+					self.assertEqual(cn.update_stock, 0)
+					mock_scope.assert_not_called()
+					self.assertEqual(get_refund_counters()["stock_returns"], 0)
+					self.assertEqual(get_refund_counters()["financial_only_credits"], 1)
+
+
