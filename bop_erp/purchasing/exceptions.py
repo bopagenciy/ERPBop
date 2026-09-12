@@ -71,6 +71,18 @@ class DocumentCancelledError(PurchasingError):
 	pass
 
 
+class PurchaseReplayCancelledError(PurchasingError):
+	"""Raised when replaying an operation whose linked ERP document was cancelled."""
+	pass
+
+
+class DownstreamCancellationBlockedError(PurchasingError):
+	"""Raised when attempting to cancel a document that has submitted downstream dependencies."""
+	pass
+
+
 class CurrencyMismatchError(PurchasingError):
 	"""Raised when currencies mismatch without valid conversion."""
 	pass
+
+

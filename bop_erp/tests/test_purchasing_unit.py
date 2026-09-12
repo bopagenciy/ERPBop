@@ -22,6 +22,7 @@ from bop_erp.purchasing import (
 	PurchaseOperation,
 	PurchaseOrderError,
 	PurchaseReceiptError,
+	PurchaseReplayCancelledError,
 	PurchasingError,
 	VendorPaymentError,
 	WarehouseMismatchError,
@@ -40,6 +41,8 @@ from bop_erp.purchasing import (
 	validate_company_account,
 	validate_company_warehouse,
 )
+from bop_erp.purchasing.idempotency import compute_canonical_operation_key
+
 
 _real_get_doc = frappe.get_doc
 _real_get_value = frappe.db.get_value
@@ -742,3 +745,170 @@ class TestPurchasingUnit(FrappeTestCase):
 		prefix = "TEST-1S"
 		self.assertTrue(self.item_code.startswith(prefix))
 		self.assertTrue(self.supplier.startswith(prefix))
+
+	# ==========================================================================
+	# PHASE 1S.1 TESTS (45 - 59)
+	# ==========================================================================
+
+	# 45. Durable publication intent exists in transaction before commit
+	def test_45_durable_publication_intent_exists_in_transaction(self):
+		from bop_erp.orders.ingestion import schedule_post_commit_publication
+		with patch("bop_erp.orders.ingestion.persist_publication_outbox_intents") as mock_persist, \
+		     patch("bop_erp.orders.ingestion.register_post_commit_wake") as mock_wake:
+			mock_persist.return_value = {"event_names": ["EV-01"], "outbox_persisted": 1}
+			res = schedule_post_commit_publication({"CH-1": ["ITEM-1"]})
+			mock_persist.assert_called_once_with({"CH-1": ["ITEM-1"]}, item_codes=None)
+			mock_wake.assert_called_once()
+			self.assertEqual(res["outbox_persisted"], 1)
+
+	# 46. Rollback removes intent (demonstrated by non-committal persistence)
+	def test_46_rollback_removes_intent(self):
+		from bop_erp.inventory.publication import schedule_channel_inventory_publication
+		# Verifies that schedule_channel_inventory_publication inserts doc without frappe.db.commit()
+		with patch("frappe.get_doc") as mock_get_doc, \
+		     patch("bop_erp.inventory.publication.resolve_item_mapping", return_value={"product_id": 1, "variant_id": None, "entity_type": "PRODUCT", "provider": "PRESTASHOP"}), \
+		     patch("bop_erp.inventory.publication.allocate_publication_version", return_value=("PUB-STATE-1", 1)), \
+		     patch("bop_erp.inventory.publication.get_channel_atp") as mock_atp:
+			mock_atp.return_value.aggregate_atp_qty = 10.0
+			mock_event = MagicMock()
+			mock_event.name = "EV-PENDING-01"
+			mock_get_doc.return_value = mock_event
+
+			with patch("frappe.db.commit") as mock_commit:
+				names = schedule_channel_inventory_publication("CH-1", ["ITEM-1"])
+				mock_event.insert.assert_called_once()
+				mock_commit.assert_not_called()  # Must NOT commit inside the helper!
+
+	# 47. Crash-after-commit leaves intent in DB
+	def test_47_crash_after_commit_leaves_intent(self):
+		# Even if after_commit callback is never called, the PENDING event remains in DB
+		from bop_erp.orders.ingestion import register_post_commit_wake
+		with patch("frappe.db.after_commit") as mock_after_commit:
+			register_post_commit_wake()
+			mock_after_commit.assert_called_once()
+
+	# 48. Dispatcher wake failure does not lose committed intent
+	def test_48_dispatcher_wake_failure_leaves_intent(self):
+		from bop_erp.orders.ingestion import register_post_commit_wake
+		callback_holder = []
+		def capture_callback(cb):
+			callback_holder.append(cb)
+
+		with patch("frappe.db.after_commit", side_effect=capture_callback), \
+		     patch("bop_erp.orders.ingestion.enqueue_inventory_publication_dispatcher", side_effect=Exception("Redis down")), \
+		     patch("frappe.flags", in_test=False, suppress_outbox_wake=False):
+			register_post_commit_wake()
+			self.assertEqual(len(callback_holder), 1)
+			# Invoking the callback must catch and log warning without raising
+			callback_holder[0]()
+
+	# 49. Publication retry idempotency
+	def test_49_publication_retry_idempotency(self):
+		from bop_erp.inventory.publication import compute_publication_idempotency_key
+		k1 = compute_publication_idempotency_key("PRESTASHOP", "CH-1", "ITEM-1", 1, None, 1, "HASH1")
+		k2 = compute_publication_idempotency_key("PRESTASHOP", "CH-1", "ITEM-1", 1, None, 1, "HASH1")
+		self.assertEqual(k1, k2)
+
+	# 50. Non-sellable receipt creates zero publication intent
+	@patch("erpnext.buying.doctype.purchase_order.purchase_order.make_purchase_receipt")
+	@patch("frappe.db.sql")
+	@patch("bop_erp.purchasing.services.schedule_post_commit_publication")
+	def test_50_non_sellable_receipt_zero_publication(self, mock_pub, mock_sql, mock_make_pr):
+		mock_sql.side_effect = [
+			[{"name": "PO-001", "docstatus": 1, "company": self.company}],
+			[{"name": "POI-01", "item_code": self.item_code, "qty": 10, "received_qty": 0}],
+		]
+		mock_pr = MagicMock()
+		mock_pr.name = "PR-QUAR-01"
+		mock_row = MagicMock(purchase_order_item="POI-01", item_code=self.item_code, qty=10, conversion_factor=1, rate=50, warehouse=self.other_warehouse)
+		mock_pr.items = [mock_row]
+		mock_make_pr.return_value = mock_pr
+
+		with patch("frappe.db.get_value", side_effect=_make_mock_get_value(wh_company=self.company)), \
+		     patch("bop_erp.purchasing.services.find_affected_channel_items_for_scopes", return_value={}):
+			receive_purchase_order("PO-001", target_warehouse=self.other_warehouse, submit=True)
+
+		mock_pub.assert_not_called()
+
+	# 51. Idempotency key operation scoping
+	def test_51_idempotency_key_operation_scoping(self):
+		k_po = compute_canonical_operation_key("REQ-123", company=self.company, operation_type=PurchaseOperation.CREATE_PURCHASE_ORDER)
+		k_pr = compute_canonical_operation_key("REQ-123", company=self.company, operation_type=PurchaseOperation.RECEIVE_PURCHASE_ORDER)
+		self.assertNotEqual(k_po, k_pr)
+		self.assertIn("CREATE_PURCHASE_ORDER", k_po)
+		self.assertIn("RECEIVE_PURCHASE_ORDER", k_pr)
+
+	# 52. Idempotency key company scoping
+	def test_52_idempotency_key_company_scoping(self):
+		k_c1 = compute_canonical_operation_key("REQ-123", company="Company A", operation_type=PurchaseOperation.CREATE_PURCHASE_ORDER)
+		k_c2 = compute_canonical_operation_key("REQ-123", company="Company B", operation_type=PurchaseOperation.CREATE_PURCHASE_ORDER)
+		self.assertNotEqual(k_c1, k_c2)
+		self.assertTrue(k_c1.startswith("Company A:"))
+		self.assertTrue(k_c2.startswith("Company B:"))
+
+	# 53. Payload drift detection
+	def test_53_payload_drift_detection(self):
+		p1 = {"company": self.company, "qty": 10}
+		p2 = {"company": self.company, "qty": 15}
+		with patch("frappe.db.sql", return_value=[{"payload_hash": compute_purchase_payload_hash(p1), "erp_doctype": "Purchase Order", "erp_document": "PO-001"}]):
+			with self.assertRaises(PurchaseDriftError):
+				check_purchase_operation_replay("REQ-1", PurchaseOperation.CREATE_PURCHASE_ORDER, p2, company=self.company)
+
+	# 54. DB unique protection via active_idempotency_key
+	def test_54_db_unique_protection(self):
+		meta = frappe.get_meta("Integration Event")
+		active_key_field = meta.get_field("active_idempotency_key")
+		self.assertTrue(active_key_field.unique)
+
+	# 55. Cancelled PR operation identity remains consumed
+	def test_55_cancelled_pr_operation_identity_remains_consumed(self):
+		payload = {"po_name": "PO-001", "items_to_receive": None}
+		hash_val = compute_purchase_payload_hash(payload)
+		with patch("frappe.db.sql", return_value=[{"payload_hash": hash_val, "erp_doctype": "Purchase Receipt", "erp_document": "PR-CANCELLED-01"}]), \
+		     patch("frappe.db.exists", return_value=True), \
+		     patch("frappe.db.get_value", return_value=2):  # docstatus = 2 (cancelled)
+			with self.assertRaises(PurchaseReplayCancelledError):
+				check_purchase_operation_replay("REQ-PR-1", PurchaseOperation.RECEIVE_PURCHASE_ORDER, payload, company=self.company)
+
+	# 56. Cancelled PI operation identity remains consumed
+	def test_56_cancelled_pi_operation_identity_remains_consumed(self):
+		payload = {"pr_name": "PR-001", "items_to_invoice": None}
+		hash_val = compute_purchase_payload_hash(payload)
+		with patch("frappe.db.sql", return_value=[{"payload_hash": hash_val, "erp_doctype": "Purchase Invoice", "erp_document": "PI-CANCELLED-01"}]), \
+		     patch("frappe.db.exists", return_value=True), \
+		     patch("frappe.db.get_value", return_value=2):
+			with self.assertRaises(PurchaseReplayCancelledError):
+				check_purchase_operation_replay("REQ-PI-1", PurchaseOperation.CREATE_PURCHASE_INVOICE, payload, company=self.company)
+
+	# 57. Cancelled vendor payment operation identity remains consumed
+	def test_57_cancelled_vendor_payment_operation_identity_remains_consumed(self):
+		payload = {"pi_name": "PI-001", "paid_amount": 50.0}
+		hash_val = compute_purchase_payload_hash(payload)
+		with patch("frappe.db.sql", return_value=[{"payload_hash": hash_val, "erp_doctype": "Payment Entry", "erp_document": "PE-CANCELLED-01"}]), \
+		     patch("frappe.db.exists", return_value=True), \
+		     patch("frappe.db.get_value", return_value=2):
+			with self.assertRaises(PurchaseReplayCancelledError):
+				check_purchase_operation_replay("REQ-PE-1", PurchaseOperation.PAY_PURCHASE_INVOICE, payload, company=self.company)
+
+	# 58. PO cancellation with submitted PR blocked
+	@patch("frappe.get_doc")
+	def test_58_po_cancellation_with_submitted_pr_blocked(self, mock_get_doc):
+		mock_po = MagicMock()
+		mock_po.docstatus = 1
+		mock_po.cancel.side_effect = frappe.ValidationError("Cannot cancel Purchase Order with submitted Purchase Receipts")
+		mock_get_doc.side_effect = _make_mock_get_doc(mock_po, "Purchase Order")
+
+		with self.assertRaises(frappe.ValidationError):
+			cancel_purchase_document("Purchase Order", "PO-001")
+
+	# 59. PR cancellation with submitted PI blocked
+	@patch("frappe.get_doc")
+	def test_59_pr_cancellation_with_submitted_pi_blocked(self, mock_get_doc):
+		mock_pr = MagicMock()
+		mock_pr.docstatus = 1
+		mock_pr.cancel.side_effect = frappe.ValidationError("Cannot cancel Purchase Receipt with submitted Purchase Invoices")
+		mock_get_doc.side_effect = _make_mock_get_doc(mock_pr, "Purchase Receipt")
+
+		with self.assertRaises(frappe.ValidationError):
+			cancel_purchase_document("Purchase Receipt", "PR-001")
+

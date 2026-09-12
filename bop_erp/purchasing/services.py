@@ -22,12 +22,15 @@ from bop_erp.purchasing.exceptions import (
 	CompanyMismatchError,
 	ConcurrentReceiptConflictError,
 	DocumentCancelledError,
+	DownstreamCancellationBlockedError,
 	OverBillingBlockedError,
 	OverPaymentBlockedError,
 	OverReceiptBlockedError,
 	PurchaseInvoiceError,
 	PurchaseOrderError,
 	PurchaseReceiptError,
+	PurchaseReplayCancelledError,
+	PurchasingError,
 	VendorPaymentError,
 	WarehouseMismatchError,
 )
@@ -113,14 +116,6 @@ def create_purchase_order(
 	"""
 	PURCHASING_COUNTERS["purchase_order_requests"] += 1
 
-	if operation_key:
-		replay = check_purchase_operation_replay(
-			operation_key, PurchaseOperation.CREATE_PURCHASE_ORDER, data
-		)
-		if replay:
-			PURCHASING_COUNTERS["duplicate_operations_converged"] += 1
-			return frappe.get_doc(replay[0], replay[1])
-
 	company = data.get("company")
 	supplier = data.get("supplier")
 	if not company:
@@ -129,6 +124,14 @@ def create_purchase_order(
 	if not supplier:
 		PURCHASING_COUNTERS["purchase_operations_blocked"] += 1
 		raise PurchaseOrderError("Supplier is required for Purchase Order.")
+
+	if operation_key:
+		replay = check_purchase_operation_replay(
+			operation_key, PurchaseOperation.CREATE_PURCHASE_ORDER, data, company=company
+		)
+		if replay:
+			PURCHASING_COUNTERS["duplicate_operations_converged"] += 1
+			return frappe.get_doc(replay[0], replay[1])
 
 	# Validate default warehouse if present
 	default_wh = data.get("set_warehouse")
@@ -233,14 +236,6 @@ def receive_purchase_order(
 		"posting_date": posting_date,
 	}
 
-	if operation_key:
-		replay = check_purchase_operation_replay(
-			operation_key, PurchaseOperation.RECEIVE_PURCHASE_ORDER, payload
-		)
-		if replay:
-			PURCHASING_COUNTERS["duplicate_operations_converged"] += 1
-			return frappe.get_doc(replay[0], replay[1])
-
 	# Row-level lock on Purchase Order to serialize concurrent receipt attempts
 	po_locked = frappe.db.sql(
 		"SELECT name, docstatus, company FROM `tabPurchase Order` WHERE name = %s FOR UPDATE",
@@ -252,6 +247,16 @@ def receive_purchase_order(
 		raise PurchaseOrderError(f"Purchase Order '{po_name}' not found.")
 
 	po_row = po_locked[0]
+	company = _get_val(po_row, "company")
+
+	if operation_key:
+		replay = check_purchase_operation_replay(
+			operation_key, PurchaseOperation.RECEIVE_PURCHASE_ORDER, payload, company=company
+		)
+		if replay:
+			PURCHASING_COUNTERS["duplicate_operations_converged"] += 1
+			return frappe.get_doc(replay[0], replay[1])
+
 	po_docstatus = _get_val(po_row, "docstatus")
 	if po_docstatus == 0:
 		PURCHASING_COUNTERS["purchase_operations_blocked"] += 1
@@ -259,8 +264,6 @@ def receive_purchase_order(
 	if po_docstatus == 2:
 		PURCHASING_COUNTERS["purchase_operations_blocked"] += 1
 		raise DocumentCancelledError(f"Purchase Order '{po_name}' is cancelled.")
-
-	company = _get_val(po_row, "company")
 
 	if target_warehouse:
 		validate_company_warehouse(company, target_warehouse)
@@ -429,14 +432,6 @@ def create_purchase_invoice(
 		"posting_date": posting_date,
 	}
 
-	if operation_key:
-		replay = check_purchase_operation_replay(
-			operation_key, PurchaseOperation.CREATE_PURCHASE_INVOICE, payload
-		)
-		if replay:
-			PURCHASING_COUNTERS["duplicate_operations_converged"] += 1
-			return frappe.get_doc(replay[0], replay[1])
-
 	if not pr_name and not po_name:
 		PURCHASING_COUNTERS["purchase_operations_blocked"] += 1
 		raise PurchaseInvoiceError("Either Purchase Receipt or Purchase Order must be provided.")
@@ -451,11 +446,21 @@ def create_purchase_invoice(
 		if not pr_locked:
 			PURCHASING_COUNTERS["purchase_operations_blocked"] += 1
 			raise PurchaseReceiptError(f"Purchase Receipt '{pr_name}' not found.")
+
+		company = _get_val(pr_locked[0], "company")
+
+		if operation_key:
+			replay = check_purchase_operation_replay(
+				operation_key, PurchaseOperation.CREATE_PURCHASE_INVOICE, payload, company=company
+			)
+			if replay:
+				PURCHASING_COUNTERS["duplicate_operations_converged"] += 1
+				return frappe.get_doc(replay[0], replay[1])
+
 		if _get_val(pr_locked[0], "docstatus") != 1:
 			PURCHASING_COUNTERS["purchase_operations_blocked"] += 1
 			raise PurchaseInvoiceError(f"Purchase Receipt '{pr_name}' must be submitted before invoicing.")
 
-		company = _get_val(pr_locked[0], "company")
 		try:
 			pi_doc = pr_module.make_purchase_invoice(pr_name)
 		except frappe.ValidationError as e:
@@ -478,11 +483,21 @@ def create_purchase_invoice(
 		if not po_locked:
 			PURCHASING_COUNTERS["purchase_operations_blocked"] += 1
 			raise PurchaseOrderError(f"Purchase Order '{po_name}' not found.")
+
+		company = _get_val(po_locked[0], "company")
+
+		if operation_key:
+			replay = check_purchase_operation_replay(
+				operation_key, PurchaseOperation.CREATE_PURCHASE_INVOICE, payload, company=company
+			)
+			if replay:
+				PURCHASING_COUNTERS["duplicate_operations_converged"] += 1
+				return frappe.get_doc(replay[0], replay[1])
+
 		if _get_val(po_locked[0], "docstatus") != 1:
 			PURCHASING_COUNTERS["purchase_operations_blocked"] += 1
 			raise PurchaseInvoiceError(f"Purchase Order '{po_name}' must be submitted before invoicing.")
 
-		company = _get_val(po_locked[0], "company")
 		try:
 			pi_doc = po_module.make_purchase_invoice(po_name)
 		except frappe.ValidationError as e:
@@ -621,14 +636,6 @@ def pay_purchase_invoice(
 		"posting_date": posting_date,
 	}
 
-	if operation_key:
-		replay = check_purchase_operation_replay(
-			operation_key, PurchaseOperation.PAY_PURCHASE_INVOICE, payload
-		)
-		if replay:
-			PURCHASING_COUNTERS["duplicate_operations_converged"] += 1
-			return frappe.get_doc(replay[0], replay[1])
-
 	# Lock Purchase Invoice
 	pi_locked = frappe.db.sql(
 		"SELECT name, docstatus, company, outstanding_amount, supplier, credit_to FROM `tabPurchase Invoice` WHERE name = %s FOR UPDATE",
@@ -640,11 +647,19 @@ def pay_purchase_invoice(
 		raise PurchaseInvoiceError(f"Purchase Invoice '{pi_name}' not found.")
 
 	pi_row = pi_locked[0]
+	company = _get_val(pi_row, "company")
+
+	if operation_key:
+		replay = check_purchase_operation_replay(
+			operation_key, PurchaseOperation.PAY_PURCHASE_INVOICE, payload, company=company
+		)
+		if replay:
+			PURCHASING_COUNTERS["duplicate_operations_converged"] += 1
+			return frappe.get_doc(replay[0], replay[1])
+
 	if _get_val(pi_row, "docstatus") != 1:
 		PURCHASING_COUNTERS["purchase_operations_blocked"] += 1
 		raise PurchaseInvoiceError(f"Purchase Invoice '{pi_name}' must be submitted before payment.")
-
-	company = _get_val(pi_row, "company")
 	outstanding = flt(_get_val(pi_row, "outstanding_amount"))
 
 	if outstanding <= 0:
@@ -743,6 +758,10 @@ def cancel_vendor_payment(pe_name: str) -> Any:
 def cancel_purchase_document(doctype: str, docname: str) -> Any:
 	"""
 	Safely cancels a purchasing document respecting native link validation.
+	Enforces downstream dependency blocking:
+	- Purchase Order cannot be cancelled if submitted Purchase Receipt or Invoice exists.
+	- Purchase Receipt cannot be cancelled if submitted Purchase Invoice exists.
+	- Purchase Invoice cannot be cancelled if submitted Payment Entry exists.
 	Does NOT use ignore_links or broad bypasses.
 	"""
 	if doctype not in ("Purchase Order", "Purchase Receipt", "Purchase Invoice", "Payment Entry"):
@@ -751,6 +770,48 @@ def cancel_purchase_document(doctype: str, docname: str) -> Any:
 	doc = frappe.get_doc(doctype, docname)
 	if doc.docstatus != 1:
 		raise PurchasingError(f"Document '{doctype}' '{docname}' is not submitted; cannot cancel.")
+
+	if doctype == "Purchase Order":
+		prs = frappe.db.sql(
+			"SELECT DISTINCT parent FROM `tabPurchase Receipt Item` WHERE purchase_order = %s AND docstatus = 1",
+			(docname,),
+			pluck="parent",
+		)
+		if prs:
+			raise DownstreamCancellationBlockedError(
+				f"Cannot cancel Purchase Order '{docname}': submitted Purchase Receipt '{prs[0]}' exists."
+			)
+		pis = frappe.db.sql(
+			"SELECT DISTINCT parent FROM `tabPurchase Invoice Item` WHERE purchase_order = %s AND docstatus = 1",
+			(docname,),
+			pluck="parent",
+		)
+		if pis:
+			raise DownstreamCancellationBlockedError(
+				f"Cannot cancel Purchase Order '{docname}': submitted Purchase Invoice '{pis[0]}' exists."
+			)
+
+	elif doctype == "Purchase Receipt":
+		pis = frappe.db.sql(
+			"SELECT DISTINCT parent FROM `tabPurchase Invoice Item` WHERE purchase_receipt = %s AND docstatus = 1",
+			(docname,),
+			pluck="parent",
+		)
+		if pis:
+			raise DownstreamCancellationBlockedError(
+				f"Cannot cancel Purchase Receipt '{docname}': submitted Purchase Invoice '{pis[0]}' exists."
+			)
+
+	elif doctype == "Purchase Invoice":
+		pes = frappe.db.sql(
+			"SELECT DISTINCT parent FROM `tabPayment Entry Reference` WHERE reference_doctype = 'Purchase Invoice' AND reference_name = %s AND docstatus = 1",
+			(docname,),
+			pluck="parent",
+		)
+		if pes:
+			raise DownstreamCancellationBlockedError(
+				f"Cannot cancel Purchase Invoice '{docname}': submitted Payment Entry '{pes[0]}' exists."
+			)
 
 	doc.cancel()
 	return doc

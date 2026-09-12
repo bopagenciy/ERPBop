@@ -18,6 +18,7 @@ from bop_erp.purchasing import (
 	OverPaymentBlockedError,
 	OverReceiptBlockedError,
 	PurchaseDriftError,
+	PurchaseReplayCancelledError,
 	cancel_purchase_document,
 	cancel_vendor_payment,
 	create_purchase_invoice,
@@ -64,12 +65,15 @@ class TestPurchasingLive(unittest.TestCase):
 		# Defensively clean prior interrupted fixtures
 		cls._cleanup_module_fixtures()
 
-		# Ensure default bank account
-		cls.bank_account = (
-			frappe.db.get_value("Company", cls.company, "default_bank_account")
-			or frappe.db.get_value("Account", {"company": cls.company, "account_type": "Bank", "is_group": 0}, "name")
-			or "1110 - Bancos - IDP"
-		)
+		# Ensure default bank account (must be non-group)
+		default_bank = frappe.db.get_value("Company", cls.company, "default_bank_account")
+		if default_bank and frappe.db.get_value("Account", default_bank, "is_group") == 0:
+			cls.bank_account = default_bank
+		else:
+			cls.bank_account = (
+				frappe.db.get_value("Account", {"company": cls.company, "account_type": "Bank", "is_group": 0}, "name")
+				or "Banco Principal - IDP"
+			)
 
 		# Ensure payable account
 		cls.payable_account = (
@@ -304,8 +308,9 @@ class TestPurchasingLive(unittest.TestCase):
 			WHERE idempotency_key LIKE %s
 			   OR active_idempotency_key LIKE %s
 			   OR erp_document LIKE %s
+			   OR request_metadata LIKE %s
 			""",
-			(f"{prefix}%", f"%{prefix}%", f"%{prefix}%"),
+			(f"%{prefix}%", f"%{prefix}%", f"%{prefix}%", f"%{prefix}%"),
 		)
 
 		# 6. Channel Inventory Source
@@ -813,9 +818,151 @@ class TestPurchasingLive(unittest.TestCase):
 		self.assertEqual(sle_count, 0, "Service PI must have zero Stock Ledger Entries!")
 
 	# ==========================================================================
-	# SCENARIO J — Fixture Cleanup Proof
+	# SCENARIO K — Cancelled Purchasing Document Operation Identity Remains Consumed
 	# ==========================================================================
-	def test_scenario_j_fixture_cleanup(self):
+	def test_scenario_k_cancelled_operation_identity_remains_consumed(self):
+		"""
+		PR completed with operation key.
+		PR subsequently cancelled.
+		Replaying same operation key must raise PurchaseReplayCancelledError.
+		"""
+		op_key = f"{self.FIXTURE_PREFIX}OP-PR-K"
+		po = create_purchase_order(
+			data={
+				"company": self.company,
+				"supplier": self.supplier_name,
+				"set_warehouse": self.wh_sellable,
+				"items": [{"item_code": self.item_stock, "qty": 5, "rate": 50}],
+			},
+			submit=True,
+			operation_key=f"{self.FIXTURE_PREFIX}OP-PO-K",
+		)
+		pr = receive_purchase_order(
+			po_name=po.name,
+			submit=True,
+			operation_key=op_key,
+		)
+		frappe.db.commit()
+
+		# Cancel PR
+		cancel_purchase_document("Purchase Receipt", pr.name)
+		frappe.db.commit()
+
+		# Replaying same operation key must be rejected with PurchaseReplayCancelledError
+		with self.assertRaises(PurchaseReplayCancelledError):
+			receive_purchase_order(
+				po_name=po.name,
+				submit=True,
+				operation_key=op_key,
+			)
+
+	# ==========================================================================
+	# SCENARIO L — Downstream Dependency Blocking on PO Cancellation
+	# ==========================================================================
+	def test_scenario_l_po_cancellation_blocked_by_submitted_pr(self):
+		"""
+		PO with submitted PR cannot be cancelled; native dependency blocking preserved.
+		"""
+		po = create_purchase_order(
+			data={
+				"company": self.company,
+				"supplier": self.supplier_name,
+				"set_warehouse": self.wh_sellable,
+				"items": [{"item_code": self.item_stock, "qty": 3, "rate": 50}],
+			},
+			submit=True,
+			operation_key=f"{self.FIXTURE_PREFIX}OP-PO-L",
+		)
+		pr = receive_purchase_order(
+			po_name=po.name,
+			submit=True,
+			operation_key=f"{self.FIXTURE_PREFIX}OP-PR-L",
+		)
+		frappe.db.commit()
+
+		# Attempt to cancel PO directly must raise ValidationError / LinkValidationError
+		with self.assertRaises(Exception):
+			cancel_purchase_document("Purchase Order", po.name)
+
+	# ==========================================================================
+	# SCENARIO M — Downstream Dependency Blocking on PR Cancellation
+	# ==========================================================================
+	def test_scenario_m_pr_cancellation_blocked_by_submitted_pi(self):
+		"""
+		PR with submitted PI cannot be cancelled; native dependency blocking preserved.
+		"""
+		po = create_purchase_order(
+			data={
+				"company": self.company,
+				"supplier": self.supplier_name,
+				"set_warehouse": self.wh_sellable,
+				"items": [{"item_code": self.item_stock, "qty": 3, "rate": 50}],
+			},
+			submit=True,
+			operation_key=f"{self.FIXTURE_PREFIX}OP-PO-M",
+		)
+		pr = receive_purchase_order(
+			po_name=po.name,
+			submit=True,
+			operation_key=f"{self.FIXTURE_PREFIX}OP-PR-M",
+		)
+		pi = create_purchase_invoice(
+			pr_name=pr.name,
+			payable_account=self.payable_account,
+			submit=True,
+			operation_key=f"{self.FIXTURE_PREFIX}OP-PI-M",
+		)
+		frappe.db.commit()
+
+		# Attempt to cancel PR directly must raise ValidationError / LinkValidationError
+		with self.assertRaises(Exception):
+			cancel_purchase_document("Purchase Receipt", pr.name)
+
+	# ==========================================================================
+	# SCENARIO N — Downstream Dependency Blocking on PI Cancellation
+	# ==========================================================================
+	def test_scenario_n_pi_cancellation_blocked_by_submitted_payment(self):
+		"""
+		PI with submitted Payment Entry cannot be cancelled; native dependency blocking preserved.
+		"""
+		po = create_purchase_order(
+			data={
+				"company": self.company,
+				"supplier": self.supplier_name,
+				"set_warehouse": self.wh_sellable,
+				"items": [{"item_code": self.item_stock, "qty": 3, "rate": 50}],
+			},
+			submit=True,
+			operation_key=f"{self.FIXTURE_PREFIX}OP-PO-N",
+		)
+		pr = receive_purchase_order(
+			po_name=po.name,
+			submit=True,
+			operation_key=f"{self.FIXTURE_PREFIX}OP-PR-N",
+		)
+		pi = create_purchase_invoice(
+			pr_name=pr.name,
+			payable_account=self.payable_account,
+			submit=True,
+			operation_key=f"{self.FIXTURE_PREFIX}OP-PI-N",
+		)
+		pe = pay_purchase_invoice(
+			pi_name=pi.name,
+			paid_amount=50.0,
+			bank_account=self.bank_account,
+			submit=True,
+			operation_key=f"{self.FIXTURE_PREFIX}OP-PE-N",
+		)
+		frappe.db.commit()
+
+		# Attempt to cancel PI directly must raise ValidationError / LinkValidationError
+		with self.assertRaises(Exception):
+			cancel_purchase_document("Purchase Invoice", pi.name)
+
+	# ==========================================================================
+	# SCENARIO Z — Fixture Cleanup Proof (Runs Last)
+	# ==========================================================================
+	def test_scenario_z_fixture_cleanup(self):
 		"""
 		Prove all TEST-1S fixtures are deleted cleanly while baseline records are preserved.
 		"""
@@ -840,8 +987,8 @@ class TestPurchasingLive(unittest.TestCase):
 			(f"{prefix}%",),
 		)[0][0]
 		residual_events = frappe.db.sql(
-			"SELECT COUNT(*) FROM `tabIntegration Event` WHERE idempotency_key LIKE %s",
-			(f"{prefix}%",),
+			"SELECT COUNT(*) FROM `tabIntegration Event` WHERE idempotency_key LIKE %s OR request_metadata LIKE %s",
+			(f"%{prefix}%", f"%{prefix}%"),
 		)[0][0]
 
 		self.assertEqual(residual_po, 0, f"Residual Purchase Orders found: {residual_po}")
