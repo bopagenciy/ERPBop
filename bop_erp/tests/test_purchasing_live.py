@@ -61,6 +61,9 @@ class TestPurchasingLive(unittest.TestCase):
 
 		cls.company = frappe.db.get_single_value("Global Defaults", "default_company") or "Industrial DP"
 		cls.abbr = frappe.get_cached_value("Company", cls.company, "abbr") or "IDP"
+		# Snapshot baseline batches and serial numbers for baseline safety verification
+		cls.baseline_batches = set(frappe.get_all("Batch", pluck="name"))
+		cls.baseline_serials = set(frappe.get_all("Serial No", pluck="name"))
 
 		# Defensively clean prior interrupted fixtures
 		cls._cleanup_module_fixtures()
@@ -347,6 +350,16 @@ class TestPurchasingLive(unittest.TestCase):
 		# 10. Supplier
 		if frappe.db.exists("Supplier", f"{prefix}VENDOR-01"):
 			frappe.delete_doc("Supplier", f"{prefix}VENDOR-01", force=True, ignore_permissions=True)
+
+		# 11. Defensively clean any TEST-1S owned Batches or Serials
+		for b in frappe.get_all("Batch", filters=[["name", "like", f"{prefix}%"]], pluck="name"):
+			frappe.delete_doc("Batch", b, force=True, ignore_permissions=True)
+		for b in frappe.get_all("Batch", filters=[["item", "like", f"{prefix}%"]], pluck="name"):
+			frappe.delete_doc("Batch", b, force=True, ignore_permissions=True)
+		for s in frappe.get_all("Serial No", filters=[["name", "like", f"{prefix}%"]], pluck="name"):
+			frappe.delete_doc("Serial No", s, force=True, ignore_permissions=True)
+		for s in frappe.get_all("Serial No", filters=[["item_code", "like", f"{prefix}%"]], pluck="name"):
+			frappe.delete_doc("Serial No", s, force=True, ignore_permissions=True)
 
 		frappe.db.commit()
 
@@ -996,3 +1009,15 @@ class TestPurchasingLive(unittest.TestCase):
 		self.assertEqual(residual_pi, 0, f"Residual Purchase Invoices found: {residual_pi}")
 		self.assertEqual(residual_pe, 0, f"Residual Payment Entries found: {residual_pe}")
 		self.assertEqual(residual_events, 0, f"Residual Integration Events found: {residual_events}")
+
+		# Batch and Serial No residual counts and baseline safety check
+		residual_batches = len(frappe.get_all("Batch", filters=[["item", "like", f"{prefix}%"]], pluck="name"))
+		residual_serials = len(frappe.get_all("Serial No", filters=[["item_code", "like", f"{prefix}%"]], pluck="name"))
+		self.assertEqual(residual_batches, 0, f"Residual TEST-1S Batches found: {residual_batches}")
+		self.assertEqual(residual_serials, 0, f"Residual TEST-1S Serials found: {residual_serials}")
+
+		# Prove baseline Batch and Serial No sets are preserved
+		current_batches = set(frappe.get_all("Batch", pluck="name"))
+		current_serials = set(frappe.get_all("Serial No", pluck="name"))
+		self.assertTrue(self.baseline_batches.issubset(current_batches), "Baseline batches were corrupted by purchasing tests")
+		self.assertTrue(self.baseline_serials.issubset(current_serials), "Baseline serials were corrupted by purchasing tests")

@@ -94,6 +94,26 @@ class TestStockMigrationApplyHardeningLive(unittest.TestCase):
 				"create_new_batch": 1,
 			}).insert(ignore_permissions=True)
 
+		# Defensively purge any prior test batches/serials for test items
+		for b in frappe.get_all("Batch", filters={"item": cls.batch_item}, pluck="name"):
+			frappe.delete_doc("Batch", b, force=True, ignore_permissions=True)
+		for s in frappe.get_all("Serial No", filters={"item_code": cls.serial_item}, pluck="name"):
+			frappe.delete_doc("Serial No", s, force=True, ignore_permissions=True)
+		frappe.db.commit()
+
+	@classmethod
+	def tearDownClass(cls):
+		for item in [cls.standard_item, cls.serial_item, cls.batch_item]:
+			if frappe.db.exists("Item", item):
+				for b in frappe.get_all("Batch", filters={"item": item}, pluck="name"):
+					frappe.delete_doc("Batch", b, force=True, ignore_permissions=True)
+				for s in frappe.get_all("Serial No", filters={"item_code": item}, pluck="name"):
+					frappe.delete_doc("Serial No", s, force=True, ignore_permissions=True)
+				frappe.db.delete("Bin", {"item_code": item})
+				frappe.delete_doc("Item", item, force=True, ignore_permissions=True)
+		frappe.db.commit()
+		super().tearDownClass()
+
 	def setUp(self):
 		self.orig_serial_batch_setting = frappe.db.get_single_value("Stock Settings", "enable_serial_and_batch_no_for_item")
 		frappe.db.set_single_value("Stock Settings", "enable_serial_and_batch_no_for_item", 1)
@@ -111,6 +131,11 @@ class TestStockMigrationApplyHardeningLive(unittest.TestCase):
 		batch_id = "LIVE-APPLY-HARDEN-01"
 		test_serial = "SN-HARDEN-9001"
 		test_batch = "BAT-HARDEN-B01"
+
+		# Snapshot baseline sets for exact baseline preservation verification
+		baseline_batches = set(frappe.get_all("Batch", pluck="name"))
+		baseline_serials = set(frappe.get_all("Serial No", pluck="name"))
+		baseline_recos = set(frappe.get_all("Stock Reconciliation", pluck="name"))
 
 		records = [
 			{
@@ -202,11 +227,17 @@ class TestStockMigrationApplyHardeningLive(unittest.TestCase):
 		reco.cancel()
 		frappe.delete_doc("Stock Reconciliation", reco_name, force=True, ignore_permissions=True)
 
-		# Purge test serial no and batch
+		# Purge test serial no and all serial numbers created for test serial item
 		if frappe.db.exists("Serial No", test_serial):
 			frappe.delete_doc("Serial No", test_serial, force=True, ignore_permissions=True)
+		for s_name in frappe.get_all("Serial No", filters={"item_code": self.serial_item}, pluck="name"):
+			frappe.delete_doc("Serial No", s_name, force=True, ignore_permissions=True)
+
+		# Purge test batch and all batches created for test batch item
 		if frappe.db.exists("Batch", test_batch):
 			frappe.delete_doc("Batch", test_batch, force=True, ignore_permissions=True)
+		for b_name in frappe.get_all("Batch", filters={"item": self.batch_item}, pluck="name"):
+			frappe.delete_doc("Batch", b_name, force=True, ignore_permissions=True)
 
 		# Purge test ledger entries
 		frappe.db.delete("Stock Ledger Entry", {"voucher_no": reco_name})
@@ -218,10 +249,31 @@ class TestStockMigrationApplyHardeningLive(unittest.TestCase):
 		frappe.delete_doc("Inventory Migration Batch", batch_name, force=True, ignore_permissions=True)
 		frappe.db.commit()
 
-		# 8. Assert safety invariance restored
-		self.assertEqual(frappe.db.count("Stock Ledger Entry"), 0, "Stock Ledger Entries must be 0 after test cleanup")
-		self.assertEqual(frappe.db.count("Bin"), 0, "Bins must be 0 after test cleanup")
-		self.assertEqual(frappe.db.count("Item Price"), 0, "Item Prices must be 0")
-		self.assertEqual(frappe.db.count("Stock Reconciliation"), 0, "Stock Reconciliations must be 0")
-		self.assertEqual(frappe.db.count("Serial No"), 0, "Serial Nos must be 0")
-		self.assertEqual(frappe.db.count("Batch"), 0, "Batches must be 0")
+		# 8. Assert safety invariance restored (baseline-safe and ownership-aware)
+		self.assertEqual(
+			frappe.db.count("Stock Ledger Entry", {"voucher_no": reco_name}),
+			0,
+			"Test Stock Ledger Entries must be 0 after test cleanup",
+		)
+		self.assertEqual(
+			frappe.db.count("GL Entry", {"voucher_no": reco_name}),
+			0,
+			"Test GL Entries must be 0 after test cleanup",
+		)
+		self.assertEqual(
+			frappe.db.count("Bin", {"item_code": ["in", [self.standard_item, self.serial_item, self.batch_item]]}),
+			0,
+			"Test Bins must be 0 after test cleanup",
+		)
+
+		current_recos = set(frappe.get_all("Stock Reconciliation", pluck="name"))
+		self.assertNotIn(reco_name, current_recos, "Test Stock Reconciliation must be deleted")
+		self.assertEqual(current_recos, baseline_recos, "Baseline Stock Reconciliations must remain untouched")
+
+		current_serials = set(frappe.get_all("Serial No", pluck="name"))
+		self.assertNotIn(test_serial, current_serials, "Test Serial No fixture SN-HARDEN-9001 must be deleted")
+		self.assertEqual(current_serials, baseline_serials, "Baseline Serial Nos must remain untouched")
+
+		current_batches = set(frappe.get_all("Batch", pluck="name"))
+		self.assertNotIn(test_batch, current_batches, "Test Batch fixture BAT-HARDEN-B01 must be deleted")
+		self.assertEqual(current_batches, baseline_batches, "Baseline Batches must remain untouched")
