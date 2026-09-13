@@ -255,7 +255,6 @@ class TestExternalRefundLive(unittest.TestCase):
 				if jv.docstatus == 1:
 					jv.cancel()
 				frappe.delete_doc("Journal Entry", jv_name, force=True, ignore_permissions=True)
-				frappe.db.delete("GL Entry", {"voucher_no": jv_name})
 
 		# 2. Clean Payment Entries
 		pe_names = frappe.db.sql(
@@ -272,7 +271,6 @@ class TestExternalRefundLive(unittest.TestCase):
 				if pe.docstatus == 1:
 					pe.cancel()
 				frappe.delete_doc("Payment Entry", pe_name, force=True, ignore_permissions=True)
-				frappe.db.delete("GL Entry", {"voucher_no": pe_name})
 
 		# 3. Clean Sales Invoices (Credit Notes first, then Invoices)
 		si_names = frappe.db.sql(
@@ -295,8 +293,6 @@ class TestExternalRefundLive(unittest.TestCase):
 				if si.docstatus == 1:
 					si.cancel()
 				frappe.delete_doc("Sales Invoice", s_name, force=True, ignore_permissions=True)
-				frappe.db.delete("GL Entry", {"voucher_no": s_name})
-				frappe.db.delete("Stock Ledger Entry", {"voucher_no": s_name})
 
 		# 4. Clean Delivery Notes (returns first)
 		dn_names = frappe.db.sql(
@@ -319,8 +315,6 @@ class TestExternalRefundLive(unittest.TestCase):
 				if dn.docstatus == 1:
 					dn.cancel()
 				frappe.delete_doc("Delivery Note", d_name, force=True, ignore_permissions=True)
-				frappe.db.delete("GL Entry", {"voucher_no": d_name})
-				frappe.db.delete("Stock Ledger Entry", {"voucher_no": d_name})
 
 		# 5. Clean Sales Orders
 		so_names = frappe.db.sql(
@@ -338,6 +332,7 @@ class TestExternalRefundLive(unittest.TestCase):
 			if frappe.db.exists("Sales Order", so_name):
 				so = frappe.get_doc("Sales Order", so_name)
 				if so.docstatus == 1:
+					so.flags.ignore_permissions = True
 					so.cancel()
 				frappe.delete_doc("Sales Order", so_name, force=True, ignore_permissions=True)
 
@@ -356,8 +351,6 @@ class TestExternalRefundLive(unittest.TestCase):
 				if se.docstatus == 1:
 					se.cancel()
 				frappe.delete_doc("Stock Entry", se_name, force=True, ignore_permissions=True)
-				frappe.db.delete("GL Entry", {"voucher_no": se_name})
-				frappe.db.delete("Stock Ledger Entry", {"voucher_no": se_name})
 
 		# 6b. Clean Stock Reconciliations
 		sr_names = frappe.db.sql(
@@ -373,9 +366,10 @@ class TestExternalRefundLive(unittest.TestCase):
 				sr = frappe.get_doc("Stock Reconciliation", sr_name)
 				if sr.docstatus == 1:
 					sr.cancel()
-				frappe.delete_doc("Stock Reconciliation", sr_name, force=True, ignore_permissions=True)
-				frappe.db.delete("GL Entry", {"voucher_no": sr_name})
-				frappe.db.delete("Stock Ledger Entry", {"voucher_no": sr_name})
+				try:
+					frappe.delete_doc("Stock Reconciliation", sr_name, force=True, ignore_permissions=True)
+				except Exception:
+					pass
 
 		# 7. Clean SREs and IRRs
 		sres = frappe.db.sql(
@@ -388,13 +382,10 @@ class TestExternalRefundLive(unittest.TestCase):
 		)
 		for sre_name in sres:
 			if frappe.db.exists("Stock Reservation Entry", sre_name):
-				try:
-					sre_doc = frappe.get_doc("Stock Reservation Entry", sre_name)
-					if sre_doc.docstatus == 1:
-						sre_doc.flags.ignore_permissions = True
-						sre_doc.cancel()
-				except Exception:
-					frappe.db.set_value("Stock Reservation Entry", sre_name, "docstatus", 2)
+				sre_doc = frappe.get_doc("Stock Reservation Entry", sre_name)
+				if sre_doc.docstatus == 1:
+					sre_doc.flags.ignore_permissions = True
+					sre_doc.cancel()
 				frappe.delete_doc("Stock Reservation Entry", sre_name, force=True, ignore_permissions=True)
 
 		frappe.db.sql(
@@ -409,29 +400,6 @@ class TestExternalRefundLive(unittest.TestCase):
 		for ch in [f"{cls.FIXTURE_PREFIX}CH-A", f"{cls.FIXTURE_PREFIX}CH-B"]:
 			frappe.db.delete("External ID Mapping", {"sales_channel": ch})
 			frappe.db.delete("Integration Event", {"sales_channel": ch})
-			frappe.db.delete("Sales Channel", {"name": ch})
-
-		# 9. Clean Bank Account
-		bank_acc = f"{cls.FIXTURE_PREFIX}Bank - {abbr}"
-		if frappe.db.exists("Account", bank_acc):
-			frappe.db.delete("Mode of Payment Account", {"default_account": bank_acc})
-			frappe.delete_doc("Account", bank_acc, force=True, ignore_permissions=True)
-
-		# 10. Clean Bins, Items, Warehouses
-		wh = f"{cls.FIXTURE_PREFIX}WH-{abbr} - {abbr}"
-		test_items = [f"{cls.FIXTURE_PREFIX}ITEM-01", f"{cls.FIXTURE_PREFIX}ITEM-02"]
-
-		# Purge SLEs for synthetic module fixtures so warehouse and item can be deleted cleanly
-		frappe.db.delete("Stock Ledger Entry", {"warehouse": wh})
-		frappe.db.delete("Stock Ledger Entry", {"item_code": ["in", test_items]})
-
-		for ic in test_items:
-			frappe.db.delete("Bin", {"item_code": ic})
-			if frappe.db.exists("Item", ic):
-				frappe.delete_doc("Item", ic, force=True, ignore_permissions=True)
-
-		if frappe.db.exists("Warehouse", wh):
-			frappe.delete_doc("Warehouse", wh, force=True, ignore_permissions=True)
 
 		frappe.db.commit()
 
@@ -492,7 +460,6 @@ class TestExternalRefundLive(unittest.TestCase):
 				if jv.docstatus == 1:
 					jv.cancel()
 				frappe.delete_doc("Journal Entry", jv_name, force=True, ignore_permissions=True)
-				frappe.db.delete("GL Entry", {"voucher_no": jv_name})
 
 		# Clean Payment Entries
 		pe_names = frappe.db.sql(
@@ -509,7 +476,6 @@ class TestExternalRefundLive(unittest.TestCase):
 				if pe.docstatus == 1:
 					pe.cancel()
 				frappe.delete_doc("Payment Entry", pe_name, force=True, ignore_permissions=True)
-				frappe.db.delete("GL Entry", {"voucher_no": pe_name})
 
 		# Clean Sales Invoices (Credit Notes first, then Invoices)
 		si_names = frappe.db.sql(
@@ -531,7 +497,6 @@ class TestExternalRefundLive(unittest.TestCase):
 				if si.docstatus == 1:
 					si.cancel()
 				frappe.delete_doc("Sales Invoice", s_name, force=True, ignore_permissions=True)
-				frappe.db.delete("GL Entry", {"voucher_no": s_name})
 
 		# Clean Delivery Notes
 		dn_names = frappe.db.sql(
@@ -553,7 +518,6 @@ class TestExternalRefundLive(unittest.TestCase):
 				if dn.docstatus == 1:
 					dn.cancel()
 				frappe.delete_doc("Delivery Note", d_name, force=True, ignore_permissions=True)
-				frappe.db.delete("GL Entry", {"voucher_no": d_name})
 
 		# Clean SREs and IRRs natively before Sales Orders
 		sres = frappe.db.sql(
@@ -566,13 +530,10 @@ class TestExternalRefundLive(unittest.TestCase):
 		)
 		for sre_name in sres:
 			if frappe.db.exists("Stock Reservation Entry", sre_name):
-				try:
-					sre_doc = frappe.get_doc("Stock Reservation Entry", sre_name)
-					if sre_doc.docstatus == 1:
-						sre_doc.flags.ignore_permissions = True
-						sre_doc.cancel()
-				except Exception:
-					frappe.db.set_value("Stock Reservation Entry", sre_name, "docstatus", 2)
+				sre_doc = frappe.get_doc("Stock Reservation Entry", sre_name)
+				if sre_doc.docstatus == 1:
+					sre_doc.flags.ignore_permissions = True
+					sre_doc.cancel()
 				frappe.delete_doc("Stock Reservation Entry", sre_name, force=True, ignore_permissions=True)
 
 		frappe.db.sql(
@@ -617,15 +578,14 @@ class TestExternalRefundLive(unittest.TestCase):
 				sr = frappe.get_doc("Stock Reconciliation", sr_name)
 				if sr.docstatus == 1:
 					sr.cancel()
-				frappe.delete_doc("Stock Reconciliation", sr_name, force=True, ignore_permissions=True)
-				frappe.db.delete("GL Entry", {"voucher_no": sr_name})
+				try:
+					frappe.delete_doc("Stock Reconciliation", sr_name, force=True, ignore_permissions=True)
+				except Exception:
+					pass
 
 		# Clean refund mappings
 		for ch in [f"{self.FIXTURE_PREFIX}CH-A", f"{self.FIXTURE_PREFIX}CH-B"]:
-			frappe.db.delete("External ID Mapping", {
-				"sales_channel": ch,
-				"external_entity_type": ["in", [ExternalEntityType.REFUND, ExternalEntityType.ORDER]],
-			})
+			frappe.db.delete("External ID Mapping", {"sales_channel": ch})
 			frappe.db.delete("Integration Event", {"sales_channel": ch})
 
 		frappe.db.commit()
@@ -1393,7 +1353,6 @@ class TestExternalRefundLive(unittest.TestCase):
 		residual_pe = frappe.db.count("Payment Entry", {"sales_channel": ["like", f"{self.FIXTURE_PREFIX}%"]})
 		residual_maps = frappe.db.count("External ID Mapping", {
 			"sales_channel": ["like", f"{self.FIXTURE_PREFIX}%"],
-			"external_entity_type": ["in", [ExternalEntityType.REFUND, ExternalEntityType.ORDER]],
 		})
 
 		self.assertEqual(residual_si, 0, "Residual Sales Invoice records leaked!")
