@@ -105,6 +105,10 @@ class TestInventoryMasterUnit(unittest.TestCase):
 				"active": 1,
 			}).insert(ignore_permissions=True)
 
+		cls.initial_sle_count = frappe.db.count("Stock Ledger Entry")
+		cls.initial_bin_count = frappe.db.count("Bin")
+		cls.initial_price_count = frappe.db.count("Item Price")
+
 	def setUp(self):
 		self.created_docs = []
 
@@ -532,12 +536,22 @@ class TestInventoryMasterUnit(unittest.TestCase):
 	def test_10_inventory_and_price_invariance(self):
 		"""
 		Safety invariant verification:
-		Stock Ledger Entry count == 0, Bin count == 0, Item Price count == 0.
+		Verifies delta from pre-suite baseline is strictly zero, and test items have zero entries.
 		"""
 		sle_count = frappe.db.count("Stock Ledger Entry")
 		bin_count = frappe.db.count("Bin")
 		price_count = frappe.db.count("Item Price")
 
-		self.assertEqual(sle_count, 0, "Phase 1G must not create persistent Stock Ledger Entries")
-		self.assertEqual(bin_count, 0, "Phase 1G must not create persistent Bins")
-		self.assertEqual(price_count, 0, "Phase 1G must not create persistent Item Prices")
+		self.assertEqual(sle_count - getattr(self, "initial_sle_count", 0), 0, "Phase 1G must not create persistent Stock Ledger Entries")
+		self.assertEqual(bin_count - getattr(self, "initial_bin_count", 0), 0, "Phase 1G must not create persistent Bins")
+		self.assertEqual(price_count - getattr(self, "initial_price_count", 0), 0, "Phase 1G must not create persistent Item Prices")
+
+		test_items = [
+			"ITEM-PHASE1G-UNSTOCKED-01",
+			"ITEM-PHASE1G-AGG-02",
+			"ITEM-PHASE1G-SERIAL-03",
+			"ITEM-PHASE1G-BATCH-04",
+		]
+		self.assertEqual(frappe.db.count("Stock Ledger Entry", {"item_code": ["in", test_items]}), 0)
+		self.assertEqual(frappe.db.count("Bin", {"item_code": ["in", test_items]}), 0)
+		self.assertEqual(frappe.db.count("Item Price", {"item_code": ["in", test_items]}), 0)

@@ -57,6 +57,10 @@ class TestPresentationIdentityMediaLive(unittest.TestCase):
 		Executes live catalog import and validates provider-neutral category identity,
 		External ID Mapping linkage, and normalized multilingual media metadata.
 		"""
+		sle_before = frappe.db.count("Stock Ledger Entry")
+		bin_before = frappe.db.count("Bin")
+		price_before = frappe.db.count("Item Price")
+
 		importer = CatalogImporter(
 			self.client, sales_channel=self.sales_channel, dry_run=False, sync_presentation=True
 		)
@@ -164,13 +168,13 @@ class TestPresentationIdentityMediaLive(unittest.TestCase):
 		self.assertEqual(res2["channel_categories"]["created"], 0, "Idempotency violated: category created on re-run")
 		self.assertEqual(res2["presentations"]["created"], 0, "Idempotency violated: presentation created on re-run")
 
-		# 5. Critical Safety Invariants: Zero inventory / price mutations
-		sle_count = frappe.db.count("Stock Ledger Entry")
-		bin_count = frappe.db.count("Bin")
-		price_count = frappe.db.count("Item Price")
-		self.assertEqual(sle_count, 0, f"Critical Safety Violation: {sle_count} Stock Ledger Entries!")
-		self.assertEqual(bin_count, 0, f"Critical Safety Violation: {bin_count} Bins!")
-		self.assertEqual(price_count, 0, f"Critical Safety Violation: {price_count} Item Prices!")
+		# 5. Critical Safety Invariants: Zero inventory / price mutations (Baseline delta)
+		sle_after = frappe.db.count("Stock Ledger Entry")
+		bin_after = frappe.db.count("Bin")
+		price_after = frappe.db.count("Item Price")
+		self.assertEqual(sle_after - sle_before, 0, f"Critical Safety Violation: {sle_after - sle_before} Stock Ledger Entries!")
+		self.assertEqual(bin_after - bin_before, 0, f"Critical Safety Violation: {bin_after - bin_before} Bins!")
+		self.assertEqual(price_after - price_before, 0, f"Critical Safety Violation: {price_after - price_before} Item Prices!")
 
 
 def run_all():

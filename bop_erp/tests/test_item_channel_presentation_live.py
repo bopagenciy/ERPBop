@@ -36,6 +36,9 @@ class TestItemChannelPresentationLive(unittest.TestCase):
 		cls.client = PrestaShopClient(config=cls.config)
 
 	def test_01_live_presentation_and_media_sync(self):
+		sle_before = frappe.db.count("Stock Ledger Entry")
+		bin_before = frappe.db.count("Bin")
+
 		importer = CatalogImporter(self.client, sales_channel=self.sales_channel, dry_run=False, sync_presentation=True)
 
 		# Execute catalog and presentation import
@@ -88,8 +91,8 @@ class TestItemChannelPresentationLive(unittest.TestCase):
 		self.assertEqual(res2["channel_categories"]["created"], 0, "Idempotency violated: Channel Category created on re-run")
 		self.assertEqual(res2["presentations"]["created"], 0, "Idempotency violated: Presentation created on re-run")
 
-		# Critical Inventory Safety Check
-		sle_count = frappe.db.count("Stock Ledger Entry")
-		bin_count = frappe.db.count("Bin")
-		self.assertEqual(sle_count, 0, f"Critical Safety Violation: {sle_count} Stock Ledger Entries detected!")
-		self.assertEqual(bin_count, 0, f"Critical Safety Violation: {bin_count} Bins detected!")
+		# Critical Inventory Safety Check (Baseline delta)
+		sle_after = frappe.db.count("Stock Ledger Entry")
+		bin_after = frappe.db.count("Bin")
+		self.assertEqual(sle_after - sle_before, 0, f"Critical Safety Violation: {sle_after - sle_before} Stock Ledger Entries detected!")
+		self.assertEqual(bin_after - bin_before, 0, f"Critical Safety Violation: {bin_after - bin_before} Bins detected!")

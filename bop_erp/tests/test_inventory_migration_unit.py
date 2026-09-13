@@ -213,6 +213,10 @@ P21-002,{self.simple_item},{self.test_wh},50,12.50,Nos
 
 	def test_04_dry_run_validation_produces_zero_mutations(self):
 		"""Validates that dry run produces structured summary with ZERO SLE and ZERO Bin mutations."""
+		sle_before = frappe.db.count("Stock Ledger Entry")
+		bin_before = frappe.db.count("Bin")
+		price_before = frappe.db.count("Item Price")
+
 		records = [
 			{"source_record_id": "VAL-1", "item_code": self.simple_item, "warehouse": self.test_wh, "quantity": 100, "valuation_rate": 15.0},
 		]
@@ -225,9 +229,12 @@ P21-002,{self.simple_item},{self.test_wh},50,12.50,Nos
 		self.assertEqual(res["status"], "READY")
 
 		# Assert zero stock writes
-		self.assertEqual(frappe.db.count("Stock Ledger Entry"), 0)
-		self.assertEqual(frappe.db.count("Bin"), 0)
-		self.assertEqual(frappe.db.count("Item Price"), 0)
+		self.assertEqual(frappe.db.count("Stock Ledger Entry") - sle_before, 0)
+		self.assertEqual(frappe.db.count("Bin") - bin_before, 0)
+		self.assertEqual(frappe.db.count("Item Price") - price_before, 0)
+		self.assertEqual(frappe.db.count("Stock Ledger Entry", {"item_code": self.simple_item}), 0)
+		self.assertEqual(frappe.db.count("Bin", {"item_code": self.simple_item}), 0)
+		self.assertEqual(frappe.db.count("Item Price", {"item_code": self.simple_item}), 0)
 
 	def test_05_reconciliation_preview_calculation(self):
 		"""

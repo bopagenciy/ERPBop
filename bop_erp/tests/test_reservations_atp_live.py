@@ -241,6 +241,14 @@ class TestReservationsATPLive(unittest.TestCase):
 			})
 			pb.insert(ignore_permissions=True)
 
+		cls.initial_sle_count = frappe.db.count("Stock Ledger Entry")
+		cls.initial_bin_count = frappe.db.count("Bin")
+		cls.initial_sre_count = frappe.db.count("Stock Reservation Entry")
+		cls.initial_reco_count = frappe.db.count("Stock Reconciliation")
+		cls.initial_price_count = frappe.db.count("Item Price")
+		cls.initial_irr_count = frappe.db.count("Inventory Reservation Reference")
+		cls.initial_policy_count = frappe.db.count("Inventory Availability Policy")
+
 		frappe.db.commit()
 
 	@classmethod
@@ -2331,13 +2339,21 @@ class TestReservationsATPLive(unittest.TestCase):
 
 	def test_99_safety_invariance_restoration(self):
 		"""
-		Verifies that after all tests and cleanups, exact zero counts are restored across all
-		inventory ledger and transaction tables.
+		Verifies that after all tests and cleanups, exact baseline invariance is restored
+		and zero test-scoped artifacts exist.
 		"""
-		self.assertEqual(frappe.db.count("Stock Ledger Entry"), 0, "SLE count must be 0")
-		self.assertEqual(frappe.db.count("Bin"), 0, "Bin count must be 0")
-		self.assertEqual(frappe.db.count("Stock Reservation Entry"), 0, "SRE count must be 0")
-		self.assertEqual(frappe.db.count("Stock Reconciliation"), 0, "Stock Reconciliation count must be 0")
-		self.assertEqual(frappe.db.count("Item Price"), 0, "Item Price count must be 0")
-		self.assertEqual(frappe.db.count("Inventory Reservation Reference"), 0, "Reservation reference count must be 0")
-		self.assertEqual(frappe.db.count("Inventory Availability Policy"), 0, "Availability policy count must be 0")
+		self.assertEqual(frappe.db.count("Stock Ledger Entry") - getattr(self, "initial_sle_count", 0), 0, "Net SLE delta must be 0")
+		self.assertEqual(frappe.db.count("Bin") - getattr(self, "initial_bin_count", 0), 0, "Net Bin delta must be 0")
+		self.assertEqual(frappe.db.count("Stock Reservation Entry") - getattr(self, "initial_sre_count", 0), 0, "Net SRE delta must be 0")
+		self.assertEqual(frappe.db.count("Stock Reconciliation") - getattr(self, "initial_reco_count", 0), 0, "Net Stock Reconciliation delta must be 0")
+		self.assertEqual(frappe.db.count("Item Price") - getattr(self, "initial_price_count", 0), 0, "Net Item Price delta must be 0")
+		self.assertEqual(frappe.db.count("Inventory Reservation Reference") - getattr(self, "initial_irr_count", 0), 0, "Net IRR delta must be 0")
+		self.assertEqual(frappe.db.count("Inventory Availability Policy") - getattr(self, "initial_policy_count", 0), 0, "Net Policy delta must be 0")
+
+		test_items = [self.item_code, self.serial_item, self.batch_item, self.bundle_parent, self.bundle_comp1, self.bundle_comp2]
+		test_whs = [self.wh_miami, self.wh_orlando, self.wh_quarantine]
+		self.assertEqual(frappe.db.count("Stock Ledger Entry", {"item_code": ["in", test_items]}), 0)
+		self.assertEqual(frappe.db.count("Bin", {"item_code": ["in", test_items]}), 0)
+		self.assertEqual(frappe.db.count("Stock Reservation Entry", {"item_code": ["in", test_items]}), 0)
+		self.assertEqual(frappe.db.count("Inventory Reservation Reference", {"item_code": ["in", test_items]}), 0)
+		self.assertEqual(frappe.db.count("Inventory Availability Policy", {"warehouse": ["in", test_whs]}), 0)

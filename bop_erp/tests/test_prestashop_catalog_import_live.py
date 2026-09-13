@@ -35,6 +35,9 @@ class TestPrestaShopCatalogImportLive(unittest.TestCase):
 		4. Re-runs import and verifies 100% idempotency (created=0 across all tiers).
 		5. Verifies inventory is untouched (0 Stock Ledger Entries, 0 Bins).
 		"""
+		sle_before = frappe.db.count("Stock Ledger Entry")
+		bin_before = frappe.db.count("Bin")
+
 		importer = CatalogImporter(self.client, sales_channel=self.sales_channel, dry_run=False)
 
 		# Run catalog import
@@ -81,8 +84,8 @@ class TestPrestaShopCatalogImportLive(unittest.TestCase):
 		self.assertEqual(run2["variants"]["created"], 0, "Idempotency violated: variants created on re-run")
 		self.assertEqual(run2["mappings"]["created"], 0, "Idempotency violated: mappings created on re-run")
 
-		# Inventory Safety: Ensure ZERO Stock Ledger Entries and ZERO Bins
-		sle_count = frappe.db.count("Stock Ledger Entry")
-		bin_count = frappe.db.count("Bin")
-		self.assertEqual(sle_count, 0, f"Critical Safety Violation: {sle_count} Stock Ledger Entries created during catalog import!")
-		self.assertEqual(bin_count, 0, f"Critical Safety Violation: {bin_count} Bins created during catalog import!")
+		# Inventory Safety: Ensure ZERO Stock Ledger Entries and ZERO Bins created (Baseline delta)
+		sle_after = frappe.db.count("Stock Ledger Entry")
+		bin_after = frappe.db.count("Bin")
+		self.assertEqual(sle_after - sle_before, 0, f"Critical Safety Violation: {sle_after - sle_before} Stock Ledger Entries created during catalog import!")
+		self.assertEqual(bin_after - bin_before, 0, f"Critical Safety Violation: {bin_after - bin_before} Bins created during catalog import!")

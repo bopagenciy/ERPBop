@@ -80,6 +80,13 @@ class TestShippingTicketLive(unittest.TestCase):
 		cls.wh_unrelated = f"WH-SHIP-UN-{cls.abbr} - {cls.abbr}"
 		cls.wh_parent = frappe.db.get_value("Warehouse", {"is_group": 1, "company": cls.company}, "name")
 
+		# Synthetic test items
+		cls.item_code = "SKU-SHIP-TEST-ITEM"
+		cls.item_code_2 = "SKU-SHIP-TEST-ITEM2"
+
+		# Clean any stale leftover fixtures from prior interrupted runs
+		cls._cleanup_all_test_fixtures()
+
 		# Create synthetic test warehouses
 		for wh_name, short_name in [
 			(cls.wh_shared, f"WH-SHIP-SH-{cls.abbr}"),
@@ -96,10 +103,6 @@ class TestShippingTicketLive(unittest.TestCase):
 				})
 				w.flags.ignore_permissions = True
 				w.insert(ignore_permissions=True)
-
-		# Synthetic test items
-		cls.item_code = "SKU-SHIP-TEST-ITEM"
-		cls.item_code_2 = "SKU-SHIP-TEST-ITEM2"
 
 		for item_id in [cls.item_code, cls.item_code_2]:
 			if not frappe.db.exists("Item", item_id):
@@ -267,6 +270,16 @@ class TestShippingTicketLive(unittest.TestCase):
 		super().setUp()
 		reset_shipping_counters()
 
+		# Reset any leftover reservations in Bin to guarantee clean state
+		for wh in [self.wh_shared, self.wh_secondary, self.wh_unrelated]:
+			for item in [self.item_code, self.item_code_2]:
+				if frappe.db.exists("Bin", {"item_code": item, "warehouse": wh}):
+					frappe.db.set_value(
+						"Bin",
+						{"item_code": item, "warehouse": wh},
+						{"reserved_stock": 0.0, "reserved_qty": 0.0},
+					)
+
 		# Setup Sales Channel A
 		if not frappe.db.exists("Sales Channel", self.channel_a):
 			frappe.get_doc({
@@ -383,8 +396,23 @@ class TestShippingTicketLive(unittest.TestCase):
 			fields=["name", "docstatus"],
 		):
 			if sre.docstatus == 1:
-				frappe.db.set_value("Stock Reservation Entry", sre.name, "docstatus", 2)
+				try:
+					doc = frappe.get_doc("Stock Reservation Entry", sre.name)
+					doc.flags.ignore_permissions = True
+					doc.cancel()
+				except Exception:
+					frappe.db.set_value("Stock Reservation Entry", sre.name, "docstatus", 2)
 			frappe.delete_doc("Stock Reservation Entry", sre.name, force=True, ignore_permissions=True)
+
+		# Reset Bin reservations
+		for wh in [self.wh_shared, self.wh_secondary, self.wh_unrelated]:
+			for item in [self.item_code, self.item_code_2]:
+				if frappe.db.exists("Bin", {"item_code": item, "warehouse": wh}):
+					frappe.db.set_value(
+						"Bin",
+						{"item_code": item, "warehouse": wh},
+						{"reserved_stock": 0.0, "reserved_qty": 0.0},
+					)
 
 		frappe.db.delete("Inventory Reservation Reference", {"item_code": ["in", [self.item_code, self.item_code_2]]})
 
@@ -427,6 +455,8 @@ class TestShippingTicketLive(unittest.TestCase):
 					rate=10.0,
 					company=self.company,
 					purpose="Material Receipt",
+					posting_date=frappe.utils.nowdate(),
+					posting_time="00:00:01",
 				)
 			else:
 				se = make_stock_entry(
@@ -436,6 +466,8 @@ class TestShippingTicketLive(unittest.TestCase):
 					rate=10.0,
 					company=self.company,
 					purpose="Material Issue",
+					posting_date=frappe.utils.nowdate(),
+					posting_time="00:00:01",
 				)
 
 	def _create_ready_order_with_reservation(

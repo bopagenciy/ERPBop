@@ -85,6 +85,10 @@ class TestPresentationLanguageTaxonomyLive(unittest.TestCase):
 		"""
 		Tests live import of industrial catalog with category scope closure and bilingual verification.
 		"""
+		sle_before = frappe.db.count("Stock Ledger Entry")
+		bin_before = frappe.db.count("Bin")
+		price_before = frappe.db.count("Item Price")
+
 		importer = CatalogImporter(
 			self.client, sales_channel=self.sales_channel, dry_run=False, sync_presentation=True
 		)
@@ -195,13 +199,13 @@ class TestPresentationLanguageTaxonomyLive(unittest.TestCase):
 		langs = [r.language for r in reloaded_pres20.localized_content]
 		self.assertEqual(len(langs), len(set(langs)), f"Duplicate language rows found on presentation 20: {langs}")
 
-		# Critical Safety Check: Zero inventory / price mutations
-		sle_count = frappe.db.count("Stock Ledger Entry")
-		bin_count = frappe.db.count("Bin")
-		price_count = frappe.db.count("Item Price")
-		self.assertEqual(sle_count, 0, f"Critical Safety Violation: {sle_count} Stock Ledger Entries detected!")
-		self.assertEqual(bin_count, 0, f"Critical Safety Violation: {bin_count} Bins detected!")
-		self.assertEqual(price_count, 0, f"Critical Safety Violation: {price_count} Item Prices detected!")
+		# Critical Safety Check: Zero inventory / price mutations (Baseline delta)
+		sle_after = frappe.db.count("Stock Ledger Entry")
+		bin_after = frappe.db.count("Bin")
+		price_after = frappe.db.count("Item Price")
+		self.assertEqual(sle_after - sle_before, 0, f"Critical Safety Violation: {sle_after - sle_before} Stock Ledger Entries detected!")
+		self.assertEqual(bin_after - bin_before, 0, f"Critical Safety Violation: {bin_after - bin_before} Bins detected!")
+		self.assertEqual(price_after - price_before, 0, f"Critical Safety Violation: {price_after - price_before} Item Prices detected!")
 
 
 def run_all():

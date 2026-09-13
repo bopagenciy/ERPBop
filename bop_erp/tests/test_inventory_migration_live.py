@@ -79,6 +79,11 @@ class TestInventoryMigrationLive(unittest.TestCase):
 			}
 		]
 
+		# Record pre-test baseline counts
+		sle_baseline = frappe.db.count("Stock Ledger Entry")
+		bin_baseline = frappe.db.count("Bin")
+		price_baseline = frappe.db.count("Item Price")
+
 		# 1. Stage
 		batch_name = MigrationImporter.stage_batch(
 			batch_id=batch_id,
@@ -96,8 +101,10 @@ class TestInventoryMigrationLive(unittest.TestCase):
 		self.assertEqual(val_res["error_rows"], 0)
 
 		# Confirm NO stock writes during dry run
-		self.assertEqual(frappe.db.count("Stock Ledger Entry"), 0)
-		self.assertEqual(frappe.db.count("Bin"), 0)
+		self.assertEqual(frappe.db.count("Stock Ledger Entry") - sle_baseline, 0)
+		self.assertEqual(frappe.db.count("Bin") - bin_baseline, 0)
+		self.assertEqual(frappe.db.count("Stock Ledger Entry", {"item_code": self.item_code}), 0)
+		self.assertEqual(frappe.db.count("Bin", {"item_code": self.item_code}), 0)
 
 		# 3. Preview
 		preview = MigrationPreview.get_reconciliation_preview(batch_name)
@@ -115,8 +122,10 @@ class TestInventoryMigrationLive(unittest.TestCase):
 		# 5. Verify live stock snapshot via InventoryService
 		snap = InventoryService.get_warehouse_inventory(self.item_code, self.warehouse)
 		self.assertEqual(snap.actual_qty, 150.0)
-		self.assertEqual(frappe.db.count("Stock Ledger Entry"), 1)
-		self.assertEqual(frappe.db.count("Bin"), 1)
+		self.assertEqual(frappe.db.count("Stock Ledger Entry") - sle_baseline, 1)
+		self.assertEqual(frappe.db.count("Bin") - bin_baseline, 1)
+		self.assertEqual(frappe.db.count("Stock Ledger Entry", {"item_code": self.item_code}), 1)
+		self.assertEqual(frappe.db.count("Bin", {"item_code": self.item_code}), 1)
 
 		# 6. Verify duplicate apply blocked
 		with self.assertRaises(frappe.ValidationError):
@@ -138,6 +147,9 @@ class TestInventoryMigrationLive(unittest.TestCase):
 		frappe.db.commit()
 
 		# 8. Assert safety invariance restored
-		self.assertEqual(frappe.db.count("Stock Ledger Entry"), 0, "Stock Ledger Entries must be 0 after test cleanup")
-		self.assertEqual(frappe.db.count("Bin"), 0, "Bins must be 0 after test cleanup")
-		self.assertEqual(frappe.db.count("Item Price"), 0, "Item Prices must be 0")
+		self.assertEqual(frappe.db.count("Stock Ledger Entry") - sle_baseline, 0, "Stock Ledger Entries must restore to baseline")
+		self.assertEqual(frappe.db.count("Bin") - bin_baseline, 0, "Bins must restore to baseline")
+		self.assertEqual(frappe.db.count("Item Price") - price_baseline, 0, "Item Prices must restore to baseline")
+		self.assertEqual(frappe.db.count("Stock Ledger Entry", {"item_code": self.item_code}), 0)
+		self.assertEqual(frappe.db.count("Bin", {"item_code": self.item_code}), 0)
+		self.assertEqual(frappe.db.count("Item Price", {"item_code": self.item_code}), 0)

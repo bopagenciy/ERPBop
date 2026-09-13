@@ -162,6 +162,11 @@ class TestInventoryMasterLive(unittest.TestCase):
 		- Proves no Stock Ledger Entry or Bin is mutated.
 		"""
 		item_code = "SKU-HAMMER-01"
+		# Pre-operation baseline
+		sle_before = frappe.db.count("Stock Ledger Entry")
+		bin_before = frappe.db.count("Bin")
+		price_before = frappe.db.count("Item Price")
+
 		# Ensure test item exists
 		if not frappe.db.exists("Item", item_code):
 			item = frappe.get_doc({
@@ -206,7 +211,10 @@ class TestInventoryMasterLive(unittest.TestCase):
 		self.assertEqual(comp.erp_aggregate_actual_qty, 0.0)
 		self.assertEqual(comp.delta_actual, 50.0)
 
-		# 5. Assert safety invariance
-		self.assertEqual(frappe.db.count("Stock Ledger Entry"), 0)
-		self.assertEqual(frappe.db.count("Bin"), 0)
-		self.assertEqual(frappe.db.count("Item Price"), 0)
+		# 5. Assert safety invariance (baseline delta + fixture scope)
+		self.assertEqual(frappe.db.count("Stock Ledger Entry") - sle_before, 0, "Operation must not create Stock Ledger Entries")
+		self.assertEqual(frappe.db.count("Bin") - bin_before, 0, "Operation must not create Bins")
+		self.assertEqual(frappe.db.count("Item Price") - price_before, 0, "Operation must not create Item Prices")
+		self.assertEqual(frappe.db.count("Stock Ledger Entry", {"item_code": item_code}), 0)
+		self.assertEqual(frappe.db.count("Bin", {"item_code": item_code}), 0)
+		self.assertEqual(frappe.db.count("Item Price", {"item_code": item_code}), 0)

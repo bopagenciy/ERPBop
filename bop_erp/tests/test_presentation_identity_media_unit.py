@@ -60,6 +60,10 @@ class TestPresentationIdentityMediaUnit(unittest.TestCase):
 			ch.language = "en"
 			ch.save(ignore_permissions=True)
 
+		cls.initial_sle_count = frappe.db.count("Stock Ledger Entry")
+		cls.initial_bin_count = frappe.db.count("Bin")
+		cls.initial_price_count = frappe.db.count("Item Price")
+
 	def setUp(self):
 		self.created_docs = []
 
@@ -554,9 +558,9 @@ class TestPresentationIdentityMediaUnit(unittest.TestCase):
 		sle_count = frappe.db.count("Stock Ledger Entry")
 		bin_count = frappe.db.count("Bin")
 		price_count = frappe.db.count("Item Price")
-		self.assertEqual(sle_count, 0, f"Critical Safety Violation: {sle_count} Stock Ledger Entries!")
-		self.assertEqual(bin_count, 0, f"Critical Safety Violation: {bin_count} Bins!")
-		self.assertEqual(price_count, 0, f"Critical Safety Violation: {price_count} Item Prices!")
+		self.assertEqual(sle_count - getattr(self, "initial_sle_count", 0), 0, f"Critical Safety Violation: {sle_count} Stock Ledger Entries!")
+		self.assertEqual(bin_count - getattr(self, "initial_bin_count", 0), 0, f"Critical Safety Violation: {bin_count} Bins!")
+		self.assertEqual(price_count - getattr(self, "initial_price_count", 0), 0, f"Critical Safety Violation: {price_count} Item Prices!")
 
 
 def run_all():
