@@ -52,6 +52,15 @@ from bop_erp.migration.prophet21_readiness import (
 	audit_sql_account_privileges,
 	classify_data_volume,
 )
+from bop_erp.migration.p21_schema_intake import (
+	SchemaIntakeValidationError,
+	analyze_entity_candidates,
+	assess_p21_schema_snapshot,
+	detect_customizations,
+	parse_schema_metadata_csv,
+	parse_schema_metadata_json,
+	validate_schema_metadata,
+)
 from bop_erp.migration.import_boundary import import_validated_entity
 from bop_erp.migration.normalization import (
 	normalize_customer,
@@ -151,4 +160,11 @@ __all__ = [
 	"coerce_source_record",
 	"DEFAULT_PAGE_SIZE",
 	"MAX_PAGE_SIZE",
+	"parse_schema_metadata_json",
+	"parse_schema_metadata_csv",
+	"validate_schema_metadata",
+	"analyze_entity_candidates",
+	"detect_customizations",
+	"assess_p21_schema_snapshot",
+	"SchemaIntakeValidationError",
 ]

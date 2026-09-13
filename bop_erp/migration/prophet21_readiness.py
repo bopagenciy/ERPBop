@@ -363,6 +363,45 @@ class SchemaSnapshot:
 			notes=data.get("notes"),
 		)
 
+	def to_dict(self) -> Dict[str, Any]:
+		"""Returns a serializable dictionary representation of SchemaSnapshot."""
+		tables_dict = {}
+		for t_name, t_snap in self.tables.items():
+			cols_dict = {}
+			for c_name, c_snap in t_snap.columns.items():
+				cols_dict[c_name] = {
+					"name": c_snap.name,
+					"data_type": c_snap.data_type,
+					"is_nullable": c_snap.is_nullable,
+					"is_primary_key": c_snap.is_primary_key,
+					"character_maximum_length": c_snap.character_maximum_length,
+					"numeric_precision": c_snap.numeric_precision,
+					"numeric_scale": c_snap.numeric_scale,
+					"collation_name": c_snap.collation_name,
+				}
+			tables_dict[t_name] = {
+				"name": t_snap.name,
+				"schema_name": t_snap.schema_name,
+				"columns": cols_dict,
+				"primary_keys": t_snap.primary_keys,
+				"indexes": t_snap.indexes,
+				"approximate_row_count": t_snap.approximate_row_count,
+				"has_timestamp_col": t_snap.has_timestamp_col,
+				"has_rowversion_col": t_snap.has_rowversion_col,
+			}
+		return {
+			"source_system": self.source_system,
+			"source_instance": self.source_instance,
+			"captured_at": self.captured_at,
+			"database_version": self.database_version,
+			"database_name": self.database_name,
+			"p21_version": self.p21_version,
+			"database_timezone": self.database_timezone,
+			"database_collation": self.database_collation,
+			"tables": tables_dict,
+			"notes": self.notes,
+		}
+
 
 # -------------------------------------------------------------------------
 # G — Logical Entity Requirement Definitions

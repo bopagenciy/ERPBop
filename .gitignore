@@ -58,6 +58,7 @@ sites/*/public/files/
 # Database dumps and local database files
 *.sql
 *.sql.gz
+!docs/migration/sql/*.sql
 *.tar
 *.tar.gz
 *.sqlite
