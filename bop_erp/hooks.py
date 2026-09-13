@@ -44,11 +44,22 @@ doc_events = {
 	},
 	"Sales Invoice": {
 		"before_insert": "bop_erp.attribution.propagate_attribution_to_sales_invoice",
-		"validate": "bop_erp.attribution.validate_transaction_attribution",
+		"validate": [
+			"bop_erp.attribution.validate_transaction_attribution",
+			"bop_erp.accounts.isolation.validate_company_accounting_isolation",
+		],
 	},
 	"Payment Entry": {
 		"before_insert": "bop_erp.attribution.propagate_attribution_to_payment_entry",
-		"validate": "bop_erp.attribution.validate_transaction_attribution",
+		"validate": [
+			"bop_erp.attribution.validate_transaction_attribution",
+			"bop_erp.accounts.isolation.validate_company_accounting_isolation",
+		],
+	},
+	"Purchase Invoice": {
+		"validate": [
+			"bop_erp.accounts.isolation.validate_company_accounting_isolation",
+		],
 	},
 }
 

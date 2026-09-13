@@ -124,3 +124,34 @@ class CurrencyMismatchError(RefundError):
 	pass
 
 
+class MaterialTaxMismatchError(frappe.ValidationError):
+	"""Raised when external imported tax totals materially deviate from native ERPNext calculations beyond currency tolerance."""
+	pass
+
+
+class CreditLimitExceededError(frappe.ValidationError):
+	"""Raised when a customer's outstanding balance plus transaction amount exceeds their credit limit."""
+	pass
+
+
+class FinancialTraceabilityError(frappe.ValidationError):
+	"""Raised when financial traceability resolution cannot locate or link accounting records."""
+	pass
+
+
+class FinancialInvariantViolationError(frappe.ValidationError):
+	"""Raised when an accounting invariant check detects inconsistent GL, balance, or document states."""
+	pass
+
+
+class AccountingPeriodClosedError(frappe.ValidationError):
+	"""Raised when an external or integrated transaction attempts to post into a closed Accounting Period."""
+	pass
+
+
+class PostingDateFrozenError(frappe.ValidationError):
+	"""Raised when a transaction posting date falls on or before the company accounts frozen date."""
+	pass
+
+
+
