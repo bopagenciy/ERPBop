@@ -119,6 +119,15 @@ class TestShippingTicketLive(unittest.TestCase):
 		frappe.db.set_single_value("Stock Settings", "enable_stock_reservation", 1)
 		frappe.db.commit()
 
+		# Record pre-suite baseline reservations and counts
+		cls.baseline_reservations = {}
+		for wh in [cls.wh_shared, cls.wh_secondary, cls.wh_unrelated]:
+			for item in [cls.item_code, cls.item_code_2]:
+				cls.baseline_reservations[(item, wh)] = {
+					"reserved_stock": flt(frappe.db.get_value("Bin", {"item_code": item, "warehouse": wh}, "reserved_stock") or 0.0),
+					"reserved_qty": flt(frappe.db.get_value("Bin", {"item_code": item, "warehouse": wh}, "reserved_qty") or 0.0),
+				}
+
 		# Record pre-suite baseline counts for fixture hygiene proof (Scenario L)
 		cls.initial_fixture_bins = cls._count_test_bins()
 		cls.initial_fixture_sres = cls._count_test_sres()
@@ -196,22 +205,32 @@ class TestShippingTicketLive(unittest.TestCase):
 				frappe.db.set_value("Pick List", pl.name, "docstatus", 2)
 			frappe.delete_doc("Pick List", pl.name, force=True, ignore_permissions=True)
 
-		# 3. Clean SREs and references
+		# 3. Clean SREs and references natively
 		for sre in frappe.db.get_all(
 			"Stock Reservation Entry", filters={"item_code": ["in", test_items]}, fields=["name", "docstatus"]
 		):
 			if sre.docstatus == 1:
-				frappe.db.set_value("Stock Reservation Entry", sre.name, "docstatus", 2)
+				try:
+					doc = frappe.get_doc("Stock Reservation Entry", sre.name)
+					doc.flags.ignore_permissions = True
+					doc.cancel()
+				except Exception:
+					frappe.db.set_value("Stock Reservation Entry", sre.name, "docstatus", 2)
 			frappe.delete_doc("Stock Reservation Entry", sre.name, force=True, ignore_permissions=True)
 
 		frappe.db.delete("Inventory Reservation Reference", {"item_code": ["in", test_items]})
 
-		# 4. Clean Sales Orders
+		# 4. Clean Sales Orders natively
 		for so in frappe.db.get_all(
 			"Sales Order", filters={"sales_channel": ["in", test_channels]}, fields=["name", "docstatus"]
 		):
 			if so.docstatus == 1:
-				frappe.db.set_value("Sales Order", so.name, "docstatus", 2)
+				try:
+					doc = frappe.get_doc("Sales Order", so.name)
+					doc.flags.ignore_permissions = True
+					doc.cancel()
+				except Exception:
+					frappe.db.set_value("Sales Order", so.name, "docstatus", 2)
 			frappe.delete_doc("Sales Order", so.name, force=True, ignore_permissions=True)
 
 		# Also clean any manual SOs created with test items
@@ -222,7 +241,12 @@ class TestShippingTicketLive(unittest.TestCase):
 			if frappe.db.exists("Sales Order", so_name):
 				ds = frappe.db.get_value("Sales Order", so_name, "docstatus")
 				if ds == 1:
-					frappe.db.set_value("Sales Order", so_name, "docstatus", 2)
+					try:
+						doc = frappe.get_doc("Sales Order", so_name)
+						doc.flags.ignore_permissions = True
+						doc.cancel()
+					except Exception:
+						frappe.db.set_value("Sales Order", so_name, "docstatus", 2)
 				frappe.delete_doc("Sales Order", so_name, force=True, ignore_permissions=True)
 
 		# 5. Cancel and delete Stock Entries used for test stock seeding
@@ -270,15 +294,30 @@ class TestShippingTicketLive(unittest.TestCase):
 		super().setUp()
 		reset_shipping_counters()
 
-		# Reset any leftover reservations in Bin to guarantee clean state
-		for wh in [self.wh_shared, self.wh_secondary, self.wh_unrelated]:
-			for item in [self.item_code, self.item_code_2]:
-				if frappe.db.exists("Bin", {"item_code": item, "warehouse": wh}):
-					frappe.db.set_value(
-						"Bin",
-						{"item_code": item, "warehouse": wh},
-						{"reserved_stock": 0.0, "reserved_qty": 0.0},
-					)
+		# Ensure native cancellation of any stale test SREs or SOs without direct Bin mutation
+		for sre in frappe.db.get_all(
+			"Stock Reservation Entry",
+			filters={"item_code": ["in", [self.item_code, self.item_code_2]], "docstatus": 1},
+			fields=["name"],
+		):
+			try:
+				doc = frappe.get_doc("Stock Reservation Entry", sre.name)
+				doc.flags.ignore_permissions = True
+				doc.cancel()
+			except Exception:
+				pass
+
+		for so in frappe.db.get_all(
+			"Sales Order",
+			filters={"sales_channel": ["in", [self.channel_a, self.channel_b, self.channel_c]], "docstatus": 1},
+			fields=["name"],
+		):
+			try:
+				doc = frappe.get_doc("Sales Order", so.name)
+				doc.flags.ignore_permissions = True
+				doc.cancel()
+			except Exception:
+				pass
 
 		# Setup Sales Channel A
 		if not frappe.db.exists("Sales Channel", self.channel_a):
@@ -404,26 +443,21 @@ class TestShippingTicketLive(unittest.TestCase):
 					frappe.db.set_value("Stock Reservation Entry", sre.name, "docstatus", 2)
 			frappe.delete_doc("Stock Reservation Entry", sre.name, force=True, ignore_permissions=True)
 
-		# Reset Bin reservations
-		for wh in [self.wh_shared, self.wh_secondary, self.wh_unrelated]:
-			for item in [self.item_code, self.item_code_2]:
-				if frappe.db.exists("Bin", {"item_code": item, "warehouse": wh}):
-					frappe.db.set_value(
-						"Bin",
-						{"item_code": item, "warehouse": wh},
-						{"reserved_stock": 0.0, "reserved_qty": 0.0},
-					)
-
 		frappe.db.delete("Inventory Reservation Reference", {"item_code": ["in", [self.item_code, self.item_code_2]]})
 
 		for so in frappe.db.get_all(
 			"Sales Order", filters={"sales_channel": ["in", [self.channel_a, self.channel_b, self.channel_c]]}, fields=["name", "docstatus"]
 		):
 			if so.docstatus == 1:
-				frappe.db.set_value("Sales Order", so.name, "docstatus", 2)
+				try:
+					doc = frappe.get_doc("Sales Order", so.name)
+					doc.flags.ignore_permissions = True
+					doc.cancel()
+				except Exception:
+					frappe.db.set_value("Sales Order", so.name, "docstatus", 2)
 			frappe.delete_doc("Sales Order", so.name, force=True, ignore_permissions=True)
 
-		# Clean any manual SOs created with test items
+		# Clean any manual SOs created with test items natively
 		for so_item in frappe.db.get_all(
 			"Sales Order Item", filters={"item_code": ["in", [self.item_code, self.item_code_2]]}, fields=["parent"]
 		):
@@ -431,7 +465,12 @@ class TestShippingTicketLive(unittest.TestCase):
 			if frappe.db.exists("Sales Order", so_name):
 				ds = frappe.db.get_value("Sales Order", so_name, "docstatus")
 				if ds == 1:
-					frappe.db.set_value("Sales Order", so_name, "docstatus", 2)
+					try:
+						doc = frappe.get_doc("Sales Order", so_name)
+						doc.flags.ignore_permissions = True
+						doc.cancel()
+					except Exception:
+						frappe.db.set_value("Sales Order", so_name, "docstatus", 2)
 				frappe.delete_doc("Sales Order", so_name, force=True, ignore_permissions=True)
 
 		# Clean outbox events for test channels
@@ -555,13 +594,6 @@ class TestShippingTicketLive(unittest.TestCase):
 		sre.flags.ignore_permissions = True
 		sre.insert(ignore_permissions=True)
 		sre.submit()
-
-		# Update Bin reserved_qty so native ERPNext ATP and reservation match
-		frappe.db.set_value(
-			"Bin",
-			{"item_code": item_code, "warehouse": warehouse},
-			{"reserved_stock": qty, "reserved_qty": qty},
-		)
 
 		ref = frappe.get_doc({
 			"doctype": "Inventory Reservation Reference",
@@ -968,3 +1000,67 @@ class TestShippingTicketLive(unittest.TestCase):
 		self.assertEqual(current_pls, self.initial_fixture_pls)
 		self.assertEqual(current_dns, self.initial_fixture_dns)
 		self.assertEqual(current_sos, self.initial_fixture_sos)
+
+		# Bin reservations must strictly match pre-suite baseline without direct mutation
+		for wh in [self.wh_shared, self.wh_secondary, self.wh_unrelated]:
+			for item in [self.item_code, self.item_code_2]:
+				cur_res_stock = flt(frappe.db.get_value("Bin", {"item_code": item, "warehouse": wh}, "reserved_stock") or 0.0)
+				cur_res_qty = flt(frappe.db.get_value("Bin", {"item_code": item, "warehouse": wh}, "reserved_qty") or 0.0)
+				expected = self.baseline_reservations.get((item, wh), {"reserved_stock": 0.0, "reserved_qty": 0.0})
+				self.assertEqual(cur_res_stock, expected["reserved_stock"])
+				self.assertEqual(cur_res_qty, expected["reserved_qty"])
+
+	# =========================================================================
+	# Scenario M: Native reservation lifecycle & baseline restoration proof (Phase 1T.3A)
+	# =========================================================================
+	def test_m_native_reservation_lifecycle_and_baseline_restoration_proof(self):
+		"""
+		Proves deterministic native ERPNext reservation lifecycle without direct Bin writes:
+		1. Capture Bin baseline reservation state.
+		2. Create TEST shipping Sales Order + native SRE.
+		3. Prove Bin reservations increase purely through native ERPNext lifecycle.
+		4. Cancel SRE natively via doc.cancel() and prove Bin.reserved_stock returns to baseline.
+		5. Cancel SO natively via doc.cancel() and prove Bin.reserved_qty returns to baseline.
+		6. Execute next independent shipping scenario cleanly with zero stranded reservations.
+		"""
+		wh = self.wh_shared
+		item = self.item_code
+
+		baseline_res_stock = flt(frappe.db.get_value("Bin", {"item_code": item, "warehouse": wh}, "reserved_stock") or 0.0)
+		baseline_res_qty = flt(frappe.db.get_value("Bin", {"item_code": item, "warehouse": wh}, "reserved_qty") or 0.0)
+
+		# 1 & 2. Create SO + native SRE
+		so = self._create_ready_order_with_reservation("SH-EXT-M-001", qty=4.0)
+		sre_name = frappe.db.get_value("Stock Reservation Entry", {"voucher_no": so.name, "docstatus": 1}, "name")
+		self.assertIsNotNone(sre_name)
+
+		# 3. Prove Bin reservation increased natively
+		bin_res_stock_active = flt(frappe.db.get_value("Bin", {"item_code": item, "warehouse": wh}, "reserved_stock"))
+		bin_res_qty_active = flt(frappe.db.get_value("Bin", {"item_code": item, "warehouse": wh}, "reserved_qty"))
+		self.assertEqual(bin_res_stock_active, baseline_res_stock + 4.0)
+		self.assertEqual(bin_res_qty_active, baseline_res_qty + 4.0)
+
+		# 4. Cancel SRE natively
+		sre_doc = frappe.get_doc("Stock Reservation Entry", sre_name)
+		sre_doc.flags.ignore_permissions = True
+		sre_doc.cancel()
+
+		# Prove Bin.reserved_stock returns exactly to baseline
+		bin_res_stock_after_sre = flt(frappe.db.get_value("Bin", {"item_code": item, "warehouse": wh}, "reserved_stock"))
+		self.assertEqual(bin_res_stock_after_sre, baseline_res_stock)
+
+		# 5. Cancel SO natively
+		so_doc = frappe.get_doc("Sales Order", so.name)
+		so_doc.flags.ignore_permissions = True
+		so_doc.cancel()
+
+		# Prove Bin.reserved_qty returns exactly to baseline
+		bin_res_qty_after_so = flt(frappe.db.get_value("Bin", {"item_code": item, "warehouse": wh}, "reserved_qty"))
+		self.assertEqual(bin_res_qty_after_so, baseline_res_qty)
+
+		# 6. Next independent shipping scenario succeeds with zero stranded reservations
+		so_next = self._create_ready_order_with_reservation("SH-EXT-M-002", qty=2.0)
+		pl_next = create_pick_ticket(so_next.name, submit=True)
+		dn_next = create_shipping_ticket(pl_next.name, submit=True)
+		self.assertEqual(dn_next.docstatus, 1)
+		self.assertEqual(get_shipping_ticket_status(dn_next), ShippingTicketStatus.SHIPPED)
