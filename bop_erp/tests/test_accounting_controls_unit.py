@@ -7,13 +7,11 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 
 from bop_erp.accounts import (
-	AccountingPeriodClosedError,
 	CompanyMismatchError,
 	CreditLimitExceededError,
 	FinancialInvariantViolationError,
 	FinancialTraceabilityError,
 	MaterialTaxMismatchError,
-	PostingDateFrozenError,
 	check_payment_entry_invariants,
 	check_purchase_invoice_invariants,
 	check_sales_invoice_invariants,

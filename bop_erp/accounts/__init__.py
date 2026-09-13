@@ -2,7 +2,6 @@
 # See license.txt
 
 from bop_erp.accounts.exceptions import (
-	AccountingPeriodClosedError,
 	CompanyMismatchError,
 	CreditLimitExceededError,
 	CurrencyMismatchError,
@@ -25,7 +24,6 @@ from bop_erp.accounts.exceptions import (
 	PaymentEligibilityError,
 	PaymentMappingDriftError,
 	PaymentReconciliationError,
-	PostingDateFrozenError,
 	RefundDriftError,
 	RefundEligibilityError,
 	RefundError,
@@ -94,7 +92,6 @@ from bop_erp.accounts.financial_invariants import (
 )
 
 __all__ = [
-	"AccountingPeriodClosedError",
 	"CompanyMismatchError",
 	"CreditLimitExceededError",
 	"CurrencyMismatchError",
@@ -117,7 +114,6 @@ __all__ = [
 	"PaymentEligibilityError",
 	"PaymentMappingDriftError",
 	"PaymentReconciliationError",
-	"PostingDateFrozenError",
 	"RefundDriftError",
 	"RefundEligibilityError",
 	"RefundError",

@@ -144,14 +144,7 @@ class FinancialInvariantViolationError(frappe.ValidationError):
 	pass
 
 
-class AccountingPeriodClosedError(frappe.ValidationError):
-	"""Raised when an external or integrated transaction attempts to post into a closed Accounting Period."""
-	pass
 
-
-class PostingDateFrozenError(frappe.ValidationError):
-	"""Raised when a transaction posting date falls on or before the company accounts frozen date."""
-	pass
 
 
 

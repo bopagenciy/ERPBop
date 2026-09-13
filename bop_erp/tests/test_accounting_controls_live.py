@@ -15,6 +15,7 @@ from bop_erp.accounts import (
 	check_purchase_invoice_invariants,
 	check_sales_invoice_invariants,
 	create_sales_invoice_from_fulfillment,
+	get_customer_current_exposure,
 	get_purchasing_financial_traceability,
 	get_sales_financial_traceability,
 	reconcile_external_taxes,
@@ -479,8 +480,15 @@ class TestAccountingControlsLive(FrappeTestCase):
 			except Exception:
 				pass
 
-		# 6. Clean Stock Reservation Entries
+		# 6. Clean Stock Reservation Entries, IRR, Integration Events, Accounting Periods, and Order Mappings
 		frappe.db.delete("Stock Reservation Entry", {"item_code": cls.item_code})
+		frappe.db.delete("Inventory Reservation Reference", {"item_code": cls.item_code})
+		frappe.db.delete("Integration Event", {"external_id": ["like", f"{cls.FIXTURE_PREFIX}%"]})
+		frappe.db.delete("Accounting Period", {"name": ["like", f"{cls.FIXTURE_PREFIX}%"]})
+		frappe.db.delete("External ID Mapping", {
+			"external_entity_type": "ORDER",
+			"external_id": ["like", f"{cls.FIXTURE_PREFIX}%"],
+		})
 
 		frappe.db.commit()
 
@@ -516,7 +524,7 @@ class TestAccountingControlsLive(FrappeTestCase):
 		frappe.db.delete("Channel Inventory Source", {"sales_channel": "TID", "warehouse": "Stores - IDP"})
 
 		# Clean up created master data and templates
-		for dt in ["Customer", "Supplier", "Item", "Payment Terms Template", "Payment Term", "Account"]:
+		for dt in ["Customer", "Supplier", "Item", "Payment Terms Template", "Payment Term", "Account", "Accounting Period"]:
 			names = frappe.get_all(dt, filters={"name": ["like", f"{cls.FIXTURE_PREFIX}%"]}, pluck="name")
 			for n in names:
 				try:
@@ -1727,9 +1735,410 @@ class TestAccountingControlsLive(FrappeTestCase):
 		self.assertEqual(len(res_pe["violations"]), 0)
 
 	# =========================================================================
-	# TEST 14: Fixture Cleanup Proof Live
+	# TEST 14: Closed Accounting Period Live Proof (Section A)
 	# =========================================================================
-	def test_14_fixture_cleanup_proof_live(self):
+	def test_14_closed_accounting_period_live(self):
+		"""
+		Section A: Closed Accounting Period Live Proof.
+		Proves a Bop/integration-created accounting document whose posting date
+		falls inside a closed Accounting Period cannot submit.
+		Uses native ERPNext lifecycle (validate_accounting_period).
+		Expected:
+		- document submission blocked (frappe.ValidationError)
+		- GL Entry delta = 0
+		- Payment Ledger Entry delta = 0
+		- Zero validation bypass
+		- Baseline periods preserved; TEST-1T-owned fixture removed.
+		"""
+		# 1. Capture baseline Accounting Periods count
+		baseline_ap_count = frappe.db.count("Accounting Period", {"name": ["not like", f"{self.FIXTURE_PREFIX}%"]})
+
+		# 2. Create ownership-safe TEST-1T Accounting Period fixture
+		period_name = f"{self.FIXTURE_PREFIX}AP-CLOSED"
+		if frappe.db.exists("Accounting Period", period_name):
+			frappe.delete_doc("Accounting Period", period_name, force=True, ignore_permissions=True)
+
+		ap = frappe.get_doc({
+			"doctype": "Accounting Period",
+			"period_name": period_name,
+			"company": self.company_a,
+			"start_date": "2026-06-01",
+			"end_date": "2026-06-30",
+			"disabled": 0,
+			"closed_documents": [
+				{
+					"document_type": "Sales Invoice",
+					"closed": 1,
+				}
+			],
+		})
+		ap.insert(ignore_permissions=True)
+		frappe.db.commit()
+
+		si_name = None
+		try:
+			# 3. Create Bop Sales Invoice in draft
+			si = frappe.get_doc({
+				"doctype": "Sales Invoice",
+				"company": self.company_a,
+				"customer": self.customer_a,
+				"debit_to": self.receivable_acc_a,
+				"posting_date": nowdate(),
+				"currency": self.currency_a,
+				"items": [
+					{
+						"item_code": self.item_code,
+						"qty": 1.0,
+						"rate": 1000.0,
+						"income_account": self.income_acc_a,
+						"cost_center": self.cost_center_a,
+					}
+				],
+			})
+			si.insert(ignore_permissions=True)
+			si_name = si.name
+
+			# Set posting date to closed period via DB value before submission
+			frappe.db.set_value("Sales Invoice", si.name, {"set_posting_time": 1, "posting_date": "2026-06-15"})
+			frappe.db.commit()
+
+			# 4. Snapshot GL Entry and Payment Ledger Entry counts
+			gl_before = frappe.db.count("GL Entry")
+			ple_before = frappe.db.count("Payment Ledger Entry")
+			si_submitted_before = frappe.db.count("Sales Invoice", {"docstatus": 1})
+
+			# 5. Attempt submission through real Bop invoice submission entry point
+			with self.assertRaises(frappe.ValidationError) as ctx:
+				submit_sales_invoice(si.name)
+
+			# Verify error indicates closed Accounting Period
+			self.assertIn("closed accounting period", str(ctx.exception).lower())
+
+			# 6. Verify zero accounting impact
+			gl_after = frappe.db.count("GL Entry")
+			ple_after = frappe.db.count("Payment Ledger Entry")
+			si_submitted_after = frappe.db.count("Sales Invoice", {"docstatus": 1})
+
+			self.assertEqual(gl_after - gl_before, 0, "GL Entry delta must be 0")
+			self.assertEqual(ple_after - ple_before, 0, "Payment Ledger Entry delta must be 0")
+			self.assertEqual(si_submitted_after - si_submitted_before, 0, "Submitted SI delta must be 0")
+
+			# Verify document was not submitted
+			reloaded = frappe.get_doc("Sales Invoice", si.name)
+			self.assertEqual(reloaded.docstatus, 0)
+		finally:
+			# 7. Clean up TEST-1T-owned fixture and invoice; preserve baseline periods
+			if si_name and frappe.db.exists("Sales Invoice", si_name):
+				frappe.delete_doc("Sales Invoice", si_name, force=True, ignore_permissions=True)
+			if frappe.db.exists("Accounting Period", ap.name):
+				frappe.delete_doc("Accounting Period", ap.name, force=True, ignore_permissions=True)
+			frappe.db.commit()
+
+			# Verify baseline preserved
+			baseline_after = frappe.db.count("Accounting Period", {"name": ["not like", f"{self.FIXTURE_PREFIX}%"]})
+			self.assertEqual(baseline_after, baseline_ap_count)
+
+	# =========================================================================
+	# TEST 15: Fiscal Year Control Live Proof (Section B)
+	# =========================================================================
+	def test_15_fiscal_year_control_live(self):
+		"""
+		Section B: Fiscal Year Live Proof.
+		Provides deterministic live proof that ERPNext Fiscal Year validation remains
+		active for Bop-created accounting documents.
+		Tests a posting date invalid for Company / Fiscal Year configuration.
+		Expected:
+		- submission blocked natively with FiscalYearError / ValidationError
+		- GL Entry delta = 0
+		- Payment Ledger Entry delta = 0
+		- Legitimate Fiscal Years untouched
+		- Baseline captured and verified intact.
+		"""
+		# 1. Capture baseline Fiscal Years
+		baseline_fys = frappe.get_all(
+			"Fiscal Year",
+			fields=["name", "year_start_date", "year_end_date", "disabled"],
+			order_by="name",
+		)
+
+		# 2. Date invalid for any active Fiscal Year (baseline has 2026: 2026-01-01 to 2026-12-31)
+		invalid_posting_date = "2024-05-15"
+
+		# 3. Snapshot counts before attempt
+		gl_before = frappe.db.count("GL Entry")
+		ple_before = frappe.db.count("Payment Ledger Entry")
+		si_submitted_before = frappe.db.count("Sales Invoice", {"docstatus": 1})
+
+		# 4. Attempt to create and submit Bop Sales Invoice with invalid fiscal year date
+		from erpnext.accounts.utils import FiscalYearError
+		si_name = None
+		with self.assertRaises((FiscalYearError, frappe.ValidationError)) as ctx:
+			si = frappe.get_doc({
+				"doctype": "Sales Invoice",
+				"company": self.company_a,
+				"customer": self.customer_a,
+				"debit_to": self.receivable_acc_a,
+				"set_posting_time": 1,
+				"posting_date": invalid_posting_date,
+				"currency": self.currency_a,
+				"items": [
+					{
+						"item_code": self.item_code,
+						"qty": 1.0,
+						"rate": 1000.0,
+						"income_account": self.income_acc_a,
+						"cost_center": self.cost_center_a,
+					}
+				],
+			})
+			si.insert(ignore_permissions=True)
+			si_name = si.name
+			submit_sales_invoice(si.name)
+
+		self.assertIn("fiscal year", str(ctx.exception).lower())
+
+		# 5. Verify zero financial mutations
+		gl_after = frappe.db.count("GL Entry")
+		ple_after = frappe.db.count("Payment Ledger Entry")
+		si_submitted_after = frappe.db.count("Sales Invoice", {"docstatus": 1})
+
+		self.assertEqual(gl_after - gl_before, 0, "GL Entry delta must be 0")
+		self.assertEqual(ple_after - ple_before, 0, "Payment Ledger Entry delta must be 0")
+		self.assertEqual(si_submitted_after - si_submitted_before, 0, "Submitted SI delta must be 0")
+
+		if si_name and frappe.db.exists("Sales Invoice", si_name):
+			frappe.delete_doc("Sales Invoice", si_name, force=True, ignore_permissions=True)
+			frappe.db.commit()
+
+		# 6. Verify baseline Fiscal Years were NOT modified or deleted
+		current_fys = frappe.get_all(
+			"Fiscal Year",
+			fields=["name", "year_start_date", "year_end_date", "disabled"],
+			order_by="name",
+		)
+		self.assertEqual(current_fys, baseline_fys, "Baseline Fiscal Years must remain exactly identical")
+
+	# =========================================================================
+	# TEST 16: Material Tax Mismatch Live Proof (Section C)
+	# =========================================================================
+	def test_16_material_tax_mismatch_live(self):
+		"""
+		Section C: Material Tax Mismatch Live Proof.
+		Exercises the REAL imported-order/fulfillment/accounting wired integration path:
+		SO -> DN -> create_sales_invoice_from_fulfillment -> submit_sales_invoice.
+		Proves:
+		- External tax materially different from native calculated tax raises MaterialTaxMismatchError
+		  or returns explicit REVIEW_REQUIRED in review mode.
+		- Blocked attempt creates:
+		  submitted Sales Invoice = 0
+		  GL Entry delta = 0
+		  Payment Ledger Entry delta = 0
+		  Payment Entry delta = 0
+		- Difference within configured currency tolerance -> allowed and submitted.
+		"""
+		# 1. Ingest upstream order via real ingestion pipeline (real wired flow)
+		order = ExternalOrder(
+			provider="PRESTASHOP",
+			sales_channel="TID",
+			external_order_id=f"{self.FIXTURE_PREFIX}ORD-TAX-01",
+			external_reference="PS-TAX-01",
+			order_state_id="2",
+			currency=self.currency_a,
+			customer=ExternalCustomer(external_customer_id=self.ext_cust_id),
+			lines=[
+				ExternalOrderLine(
+					external_line_id="L1",
+					external_product_id=self.ext_prod_id,
+					quantity=2.0,
+					unit_price_ex_tax=1000.0,
+					line_total_ex_tax=2000.0,
+				)
+			],
+			totals=ExternalTotals(
+				total_products_ex_tax=2000.0,
+				total_paid=2000.0,
+				currency=self.currency_a,
+			),
+		)
+		ingest_res = ingest_order_pipeline(order)
+		so_name = ingest_res["sales_order"]
+		so = frappe.get_doc("Sales Order", so_name)
+
+		dn = frappe.get_doc({
+			"doctype": "Delivery Note",
+			"company": self.company_a,
+			"customer": so.customer,
+			"posting_date": nowdate(),
+			"items": [
+				{
+					"item_code": self.item_code,
+					"qty": 2.0,
+					"rate": 1000.0,
+					"against_sales_order": so.name,
+					"so_detail": so.items[0].name,
+					"warehouse": "Stores - IDP",
+					"cost_center": self.cost_center_a,
+				}
+			],
+		})
+		dn.insert(ignore_permissions=True)
+		dn.submit()
+
+		# 2. Create draft Sales Invoice from fulfillment via real Bop factory
+		si = create_sales_invoice_from_fulfillment(dn.name)
+		# Add 19% VAT tax to invoice: Net total = 2000.0, Tax = 380.0
+		si.append("taxes", {
+			"charge_type": "On Net Total",
+			"account_head": self.tax_acc_a,
+			"description": "VAT 19%",
+			"rate": 19.0,
+		})
+		si.save()
+		frappe.db.commit()
+
+		native_tax = sum(flt(t.tax_amount) for t in si.taxes)
+		self.assertAlmostEqual(native_tax, 380.0, places=2)
+
+		# 3. Snapshot state before material mismatch submission attempt
+		si_submitted_before = frappe.db.count("Sales Invoice", {"docstatus": 1})
+		gl_before = frappe.db.count("GL Entry")
+		ple_before = frappe.db.count("Payment Ledger Entry")
+		pe_before = frappe.db.count("Payment Entry")
+
+		# 4. Material mismatch test: External tax = 600.0 (diff 220.0 >> tolerance 0.02 COP)
+		with self.assertRaises(MaterialTaxMismatchError):
+			submit_sales_invoice(si.name, external_tax_amount=600.0)
+
+		# Verify all 4 invariants remain strictly 0
+		self.assertEqual(frappe.db.count("Sales Invoice", {"docstatus": 1}) - si_submitted_before, 0, "Submitted SI delta must be 0")
+		self.assertEqual(frappe.db.count("GL Entry") - gl_before, 0, "GL Entry delta must be 0")
+		self.assertEqual(frappe.db.count("Payment Ledger Entry") - ple_before, 0, "Payment Ledger Entry delta must be 0")
+		self.assertEqual(frappe.db.count("Payment Entry") - pe_before, 0, "Payment Entry delta must be 0")
+
+		# Verify review mode policy returns REVIEW_REQUIRED without raising
+		review_res = reconcile_external_taxes(si, external_tax_amount=600.0, currency=self.currency_a, allow_review=True)
+		self.assertEqual(review_res["status"], "REVIEW_REQUIRED")
+		self.assertFalse(review_res["allowed"])
+		self.assertFalse(review_res["reconciled"])
+
+		# 5. Within tolerance test: External tax = 380.01 (diff 0.01 <= tolerance 0.02 COP)
+		# Real invoice integration submission succeeds
+		submitted_si = submit_sales_invoice(si.name, external_tax_amount=380.01)
+		self.assertEqual(submitted_si.docstatus, 1)
+		self.assertEqual(frappe.db.count("Sales Invoice", {"docstatus": 1}) - si_submitted_before, 1)
+		self.assertGreater(frappe.db.count("GL Entry") - gl_before, 0, "GL Entry delta must be > 0 on valid submission")
+		self.assertEqual(frappe.db.count("Payment Entry") - pe_before, 0, "Payment Entry delta must remain 0")
+
+	# =========================================================================
+	# TEST 17: Credit Limit Block Live Proof (Section D)
+	# =========================================================================
+	def test_17_credit_limit_block_live(self):
+		"""
+		Section D: Credit Limit Block Live Proof.
+		Exercises the REAL imported-order ingestion flow (ingest_order_pipeline).
+		Customer has explicit TEST-1T credit limit (5000.0).
+		Case 1: existing exposure (0) + new order (2000.0) <= limit -> imported Sales Order succeeds.
+		Case 2: existing exposure (2000.0) + new order (4000.0) = 6000.0 > limit -> CreditLimitExceededError.
+		Prove blocked attempt creates:
+		- Sales Order delta = 0
+		- Stock Reservation Entry delta = 0
+		- Inventory Reservation Reference delta = 0
+		- Integration publication intent delta = 0 (Integration Event)
+		- GL Entry delta = 0
+		Uses native Customer Credit Limit data; zero shadow credit ledgers.
+		"""
+		# 1. Configure explicit TEST-1T native credit limit
+		cust_doc = frappe.get_doc("Customer", self.credit_customer)
+		cust_doc.credit_limits = []
+		cust_doc.append("credit_limits", {
+			"company": self.company_a,
+			"credit_limit": 5000.0,
+		})
+		cust_doc.save(ignore_permissions=True)
+		frappe.db.commit()
+
+		# Case 1: Order within limit (2000.0 <= 5000.0)
+		order_1 = ExternalOrder(
+			provider="PRESTASHOP",
+			sales_channel="TID",
+			external_order_id=f"{self.FIXTURE_PREFIX}ORD-CREDIT-CASE1",
+			external_reference="PS-CREDIT-OK",
+			order_state_id="2",
+			currency=self.currency_a,
+			customer=ExternalCustomer(external_customer_id=self.ext_cust_id),
+			lines=[
+				ExternalOrderLine(
+					external_line_id="L1",
+					external_product_id=self.ext_prod_id,
+					quantity=4.0,
+					unit_price_ex_tax=500.0,
+					line_total_ex_tax=2000.0,
+				)
+			],
+			totals=ExternalTotals(
+				total_products_ex_tax=2000.0,
+				total_paid=2000.0,
+				currency=self.currency_a,
+			),
+		)
+
+		res_1 = ingest_order_pipeline(order_1)
+		self.assertTrue(res_1.get("success"), "Order within credit limit must succeed")
+		so_1_name = res_1.get("sales_order")
+		self.assertTrue(bool(so_1_name))
+		so_1_doc = frappe.get_doc("Sales Order", so_1_name)
+		self.assertEqual(so_1_doc.docstatus, 1)
+
+		# Verify current exposure is now 2000.0
+		exp_after_case1 = get_customer_current_exposure(self.credit_customer, self.company_a)
+		self.assertAlmostEqual(exp_after_case1, 2000.0, places=2)
+
+		# Case 2: New order above limit (existing 2000.0 + new 4000.0 = 6000.0 > 5000.0)
+		order_2 = ExternalOrder(
+			provider="PRESTASHOP",
+			sales_channel="TID",
+			external_order_id=f"{self.FIXTURE_PREFIX}ORD-CREDIT-CASE2",
+			external_reference="PS-CREDIT-BLOCK",
+			order_state_id="2",
+			currency=self.currency_a,
+			customer=ExternalCustomer(external_customer_id=self.ext_cust_id),
+			lines=[
+				ExternalOrderLine(
+					external_line_id="L1",
+					external_product_id=self.ext_prod_id,
+					quantity=8.0,
+					unit_price_ex_tax=500.0,
+					line_total_ex_tax=4000.0,
+				)
+			],
+			totals=ExternalTotals(
+				total_products_ex_tax=4000.0,
+				total_paid=4000.0,
+				currency=self.currency_a,
+			),
+		)
+
+		# Snapshot exact baseline before blocked attempt
+		so_count_before = frappe.db.count("Sales Order")
+		sre_count_before = frappe.db.count("Stock Reservation Entry")
+		irr_count_before = frappe.db.count("Inventory Reservation Reference")
+		intent_count_before = frappe.db.count("Integration Event")
+		gl_count_before = frappe.db.count("GL Entry")
+
+		with self.assertRaises(CreditLimitExceededError):
+			ingest_order_pipeline(order_2)
+
+		# PROOF: All 5 targets create exactly ZERO deltas
+		self.assertEqual(frappe.db.count("Sales Order") - so_count_before, 0, "Blocked Sales Order delta must be 0")
+		self.assertEqual(frappe.db.count("Stock Reservation Entry") - sre_count_before, 0, "Blocked SRE delta must be 0")
+		self.assertEqual(frappe.db.count("Inventory Reservation Reference") - irr_count_before, 0, "Blocked IRR delta must be 0")
+		self.assertEqual(frappe.db.count("Integration Event") - intent_count_before, 0, "Blocked publication intent delta must be 0")
+		self.assertEqual(frappe.db.count("GL Entry") - gl_count_before, 0, "Blocked GL delta must be 0")
+
+	# =========================================================================
+	# TEST 18: Fixture Cleanup Proof Live
+	# =========================================================================
+	def test_18_fixture_cleanup_proof_live(self):
 		"""Cleans all test vouchers and confirms zero lingering TEST-1T-* records."""
 		self._cleanup_module_fixtures()
 
@@ -1762,3 +2171,23 @@ class TestAccountingControlsLive(FrappeTestCase):
 			pluck="name",
 		)
 		self.assertEqual(len(residual_pis), 0)
+
+		residual_sos = frappe.db.sql(
+			"""
+			SELECT name FROM `tabSales Order`
+			WHERE customer LIKE %s OR name LIKE %s
+			""",
+			(f"{self.FIXTURE_PREFIX}%", f"{self.FIXTURE_PREFIX}%"),
+			pluck="name",
+		)
+		self.assertEqual(len(residual_sos), 0)
+
+		residual_aps = frappe.db.sql(
+			"""
+			SELECT name FROM `tabAccounting Period`
+			WHERE name LIKE %s OR period_name LIKE %s
+			""",
+			(f"{self.FIXTURE_PREFIX}%", f"{self.FIXTURE_PREFIX}%"),
+			pluck="name",
+		)
+		self.assertEqual(len(residual_aps), 0)
