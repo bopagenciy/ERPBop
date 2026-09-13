@@ -42,10 +42,12 @@ from bop_erp.migration.adapters.sql_executor import (
 )
 from bop_erp.migration.prophet21_readiness import (
 	Prophet21AccessMode,
+	Prophet21CompanyScopeMode,
 	Prophet21ConnectionConfig,
 	Prophet21ReadinessReport,
 	Prophet21ReadinessStatus,
 	SchemaSnapshot,
+	SnapshotProvenanceMetadata,
 	assess_prophet21_readiness,
 	audit_sql_account_privileges,
 	classify_data_volume,
@@ -132,8 +134,10 @@ __all__ = [
 	"SourceSchemaMetadata",
 	"extract_entity_to_staging",
 	"Prophet21AccessMode",
+	"Prophet21CompanyScopeMode",
 	"Prophet21ConnectionConfig",
 	"SchemaSnapshot",
+	"SnapshotProvenanceMetadata",
 	"Prophet21ReadinessStatus",
 	"Prophet21ReadinessReport",
 	"assess_prophet21_readiness",

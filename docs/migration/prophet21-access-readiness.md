@@ -23,12 +23,26 @@ Please complete and return the following technical parameters (do **not** includ
 | **Underlying Database Engine** | Microsoft SQL Server version / edition | |
 | **Preferred Access Mode** | e.g., Restored Snapshot, Dedicated Replica, ODBC | |
 | **Database Server Name / Host** | Hostname or internal IP (non-public) | |
-| **Database Name** | Name of the P21 production/reporting database | |
+| **Database Name** | Name of the P21 production/reporting database (required) | |
 | **Network Security Requirements** | VPN required? IP Allowlisting required? | |
 | **Database Timezone** | Server timezone (e.g., UTC, America/Bogota, EST) | |
 | **Database Collation** | Server / Database default collation | |
-| **Company Structure** | Single-company DB or Multi-company segregated? | |
+| **Company Scope Mode** | Must confirm one of: `SINGLE_COMPANY_DATABASE`, `SEPARATE_DATABASE_PER_COMPANY`, `EXPLICIT_COLUMN`, `RELATIONAL_MAPPING`, `OTHER_VERIFIED` | |
+| **Source Company Identifier(s)** | e.g., `company_id`, branch IDs, or `N/A` if single-company | |
+| **Target Bop Company** | Destination Company in Bop ERP (default: `Industrial DP`) | |
 | **Location / Branch Hierarchy** | How branches/warehouses map to company entities | |
+
+### 2.1 Mandatory Company Scope Confirmation (Fail-Closed Policy)
+
+To prevent cross-tenant data contamination or partial data migration, Bop ERP requires unambiguous proof of company segregation before a data source can be classified as `READY`. Client IT must declare and confirm the applicable mode:
+
+1. **`SINGLE_COMPANY_DATABASE`**: The database contains only records for a single operating entity. No tenant segregation column is present or required.
+2. **`SEPARATE_DATABASE_PER_COMPANY`**: Multi-company setup where each entity resides in its own discrete database catalog.
+3. **`EXPLICIT_COLUMN`**: Multi-tenant database where tables contain a discriminator column (e.g., `company_id`, `company_no`).
+4. **`RELATIONAL_MAPPING`**: Company tenancy is inferred via relational association (e.g., branch / location mapping table).
+5. **`OTHER_VERIFIED`**: Alternative documented and audit-verified segregation scheme.
+
+> **FAIL-CLOSED POLICY**: If the company scope mode is `UNKNOWN` or unconfirmed, readiness status will remain strictly **`BLOCKED`**.
 
 ---
 

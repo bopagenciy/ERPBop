@@ -18,10 +18,12 @@ from bop_erp.migration.prophet21_readiness import (
 	FieldRequirementLevel,
 	LOGICAL_ENTITY_REQUIREMENTS,
 	Prophet21AccessMode,
+	Prophet21CompanyScopeMode,
 	Prophet21ConnectionConfig,
 	Prophet21ReadinessReport,
 	Prophet21ReadinessStatus,
 	SchemaSnapshot,
+	SnapshotProvenanceMetadata,
 	TableSnapshot,
 	assess_prophet21_readiness,
 	audit_sql_account_privileges,
@@ -43,6 +45,7 @@ class TestProphet21ReadinessUnit(FrappeTestCase):
 		self.sample_snapshot_dict = {
 			"source_system": "PROPHET_21",
 			"source_instance": "MOCK_P21",
+			"database_name": "p21_snapshot_db",
 			"captured_at": "2026-09-13T12:00:00Z",
 			"database_version": "Microsoft SQL Server 2019",
 			"p21_version": "2021.2",
@@ -496,7 +499,15 @@ class TestProphet21ReadinessUnit(FrappeTestCase):
 			source_instance_id="MAIN",
 			environment="SNAPSHOT",
 			access_mode=Prophet21AccessMode.RESTORED_DATABASE_SNAPSHOT,
+			target_bop_company="Industrial DP",
+			database="p21_snapshot_db",
 			password_reference="SEC_VAULT_KEY",
+			provenance=SnapshotProvenanceMetadata(
+				provenance_verified=True,
+				source_instance_confirmed=True,
+				capture_timestamp_known=True,
+				database_identity_confirmed=True,
+			),
 		)
 		privs = ["CONNECT", "SELECT", "VIEW DEFINITION"]
 		report = assess_prophet21_readiness(cfg, snapshot, self.sample_mappings, reported_privileges=privs)
@@ -510,6 +521,8 @@ class TestProphet21ReadinessUnit(FrappeTestCase):
 			source_instance_id="MAIN",
 			environment="SNAPSHOT",
 			access_mode=Prophet21AccessMode.SQL_SERVER_READONLY,
+			target_bop_company="Industrial DP",
+			database="p21_snapshot_db",
 			# password_reference unset causes warning -> PARTIAL
 		)
 		privs = ["CONNECT", "SELECT"]
@@ -576,3 +589,318 @@ class TestProphet21ReadinessUnit(FrappeTestCase):
 					access_mode=Prophet21AccessMode.SQL_SERVER_READONLY,
 					host=bad_domain,
 				)
+
+	# 31. Company Scope: UNKNOWN and no column fails closed
+	def test_31_company_scope_mode_unknown_and_no_column_fails_closed(self):
+		modified = dict(self.sample_snapshot_dict)
+		for tbl in modified["tables"]:
+			tbl["columns"] = [c for c in tbl["columns"] if c["name"] != "company_id"]
+		snapshot = SchemaSnapshot.from_dict(modified)
+		cfg = Prophet21ConnectionConfig(
+			source_instance_id="MAIN",
+			environment="SNAPSHOT",
+			access_mode=Prophet21AccessMode.RESTORED_DATABASE_SNAPSHOT,
+			target_bop_company="Industrial DP",
+			database="p21_snapshot_db",
+			company_scope_mode=Prophet21CompanyScopeMode.UNKNOWN,
+			provenance=SnapshotProvenanceMetadata(
+				provenance_verified=True,
+				source_instance_confirmed=True,
+				capture_timestamp_known=True,
+				database_identity_confirmed=True,
+			),
+		)
+		report = assess_prophet21_readiness(cfg, snapshot, self.sample_mappings)
+		self.assertEqual(report.status, Prophet21ReadinessStatus.BLOCKED)
+		self.assertFalse(report.company_discriminator_finding["is_company_scoped"])
+		self.assertTrue(any("company scope is UNKNOWN" in b or "Company scope is ambiguous" in b for b in report.blockers))
+
+	# 32. Company Scope: SINGLE_COMPANY_DATABASE verified
+	def test_32_company_scope_single_company_database_verified(self):
+		modified = dict(self.sample_snapshot_dict)
+		for tbl in modified["tables"]:
+			tbl["columns"] = [c for c in tbl["columns"] if c["name"] != "company_id"]
+		snapshot = SchemaSnapshot.from_dict(modified)
+		cfg = Prophet21ConnectionConfig(
+			source_instance_id="MAIN",
+			environment="SNAPSHOT",
+			access_mode=Prophet21AccessMode.RESTORED_DATABASE_SNAPSHOT,
+			target_bop_company="Industrial DP",
+			database="p21_snapshot_db",
+			company_scope_mode=Prophet21CompanyScopeMode.SINGLE_COMPANY_DATABASE,
+			company_scope_evidence="Client IT confirmed dedicated single-company instance",
+			provenance=SnapshotProvenanceMetadata(
+				provenance_verified=True,
+				source_instance_confirmed=True,
+				capture_timestamp_known=True,
+				database_identity_confirmed=True,
+			),
+		)
+		report = assess_prophet21_readiness(cfg, snapshot, self.sample_mappings)
+		self.assertTrue(report.company_discriminator_finding["is_company_scoped"])
+		self.assertEqual(report.company_discriminator_finding["status"], "VERIFIED_SINGLE_COMPANY")
+		self.assertFalse(any("company scope" in b.lower() for b in report.blockers))
+
+	# 33. Company Scope: Explicit column verified
+	def test_33_company_scope_explicit_column_verified(self):
+		snapshot = SchemaSnapshot.from_dict(self.sample_snapshot_dict)
+		cfg = Prophet21ConnectionConfig(
+			source_instance_id="MAIN",
+			environment="SNAPSHOT",
+			access_mode=Prophet21AccessMode.RESTORED_DATABASE_SNAPSHOT,
+			target_bop_company="Industrial DP",
+			database="p21_snapshot_db",
+			company_scope_mode=Prophet21CompanyScopeMode.EXPLICIT_COLUMN,
+			source_company_id="1",
+			provenance=SnapshotProvenanceMetadata(
+				provenance_verified=True,
+				source_instance_confirmed=True,
+				capture_timestamp_known=True,
+				database_identity_confirmed=True,
+			),
+		)
+		report = assess_prophet21_readiness(cfg, snapshot, self.sample_mappings)
+		self.assertTrue(report.company_discriminator_finding["is_company_scoped"])
+		self.assertIn("company_id", report.company_discriminator_finding["candidates"])
+		self.assertFalse(any("company scope" in b.lower() for b in report.blockers))
+
+	# 34. Company Scope: Relational mapping verified
+	def test_34_company_scope_relational_mapping_verified(self):
+		modified = dict(self.sample_snapshot_dict)
+		for tbl in modified["tables"]:
+			tbl["columns"] = [c for c in tbl["columns"] if c["name"] != "company_id"]
+		snapshot = SchemaSnapshot.from_dict(modified)
+		cfg = Prophet21ConnectionConfig(
+			source_instance_id="MAIN",
+			environment="SNAPSHOT",
+			access_mode=Prophet21AccessMode.RESTORED_DATABASE_SNAPSHOT,
+			target_bop_company="Industrial DP",
+			database="p21_snapshot_db",
+			company_scope_mode=Prophet21CompanyScopeMode.RELATIONAL_MAPPING,
+			company_scope_evidence="Branch hierarchy location.location_id maps to company 1",
+			provenance=SnapshotProvenanceMetadata(
+				provenance_verified=True,
+				source_instance_confirmed=True,
+				capture_timestamp_known=True,
+				database_identity_confirmed=True,
+			),
+		)
+		report = assess_prophet21_readiness(cfg, snapshot, self.sample_mappings)
+		self.assertTrue(report.company_discriminator_finding["is_company_scoped"])
+		self.assertEqual(report.company_discriminator_finding["status"], "VERIFIED_RELATIONAL_MAPPING")
+		self.assertFalse(any("company scope" in b.lower() for b in report.blockers))
+
+	# 35. Target Bop Company missing blocks
+	def test_35_target_bop_company_missing_blocked(self):
+		snapshot = SchemaSnapshot.from_dict(self.sample_snapshot_dict)
+		cfg = Prophet21ConnectionConfig(
+			source_instance_id="MAIN",
+			environment="SNAPSHOT",
+			access_mode=Prophet21AccessMode.RESTORED_DATABASE_SNAPSHOT,
+			target_bop_company="",  # Blank
+			database="p21_snapshot_db",
+			provenance=SnapshotProvenanceMetadata(
+				provenance_verified=True,
+				source_instance_confirmed=True,
+				capture_timestamp_known=True,
+				database_identity_confirmed=True,
+			),
+		)
+		report = assess_prophet21_readiness(cfg, snapshot, self.sample_mappings)
+		self.assertEqual(report.status, Prophet21ReadinessStatus.BLOCKED)
+		self.assertTrue(any("target bop company" in b.lower() for b in report.blockers))
+
+	# 36. Source database identity missing blocks
+	def test_36_source_database_identity_missing_blocked(self):
+		modified = dict(self.sample_snapshot_dict)
+		modified["database_name"] = None
+		snapshot = SchemaSnapshot.from_dict(modified)
+		cfg = Prophet21ConnectionConfig(
+			source_instance_id="MAIN",
+			environment="SNAPSHOT",
+			access_mode=Prophet21AccessMode.RESTORED_DATABASE_SNAPSHOT,
+			target_bop_company="Industrial DP",
+			database=None,  # No database provided in config or snapshot
+			provenance=SnapshotProvenanceMetadata(
+				provenance_verified=True,
+				source_instance_confirmed=True,
+				capture_timestamp_known=True,
+				database_identity_confirmed=True,
+			),
+		)
+		report = assess_prophet21_readiness(cfg, snapshot, self.sample_mappings)
+		self.assertEqual(report.status, Prophet21ReadinessStatus.BLOCKED)
+		self.assertTrue(any("database name/identity" in b.lower() for b in report.blockers))
+
+	# 37. Stable CUSTOMER key missing blocks when CUSTOMER in scope
+	def test_37_stable_customer_key_missing_blocked(self):
+		broken_mappings = dict(self.sample_mappings)
+		broken_mappings["CUSTOMER"] = {
+			"table_name": "customer",
+			"primary_key": None,  # Missing PK
+			"field_mappings": {"name": "customer_name"},
+		}
+		snapshot = SchemaSnapshot.from_dict(self.sample_snapshot_dict)
+		cfg = Prophet21ConnectionConfig(
+			source_instance_id="MAIN",
+			environment="SNAPSHOT",
+			access_mode=Prophet21AccessMode.RESTORED_DATABASE_SNAPSHOT,
+			target_bop_company="Industrial DP",
+			database="p21_snapshot_db",
+			provenance=SnapshotProvenanceMetadata(
+				provenance_verified=True,
+				source_instance_confirmed=True,
+				capture_timestamp_known=True,
+				database_identity_confirmed=True,
+			),
+		)
+		report = assess_prophet21_readiness(cfg, snapshot, broken_mappings, scope_entities=["CUSTOMER"])
+		self.assertEqual(report.status, Prophet21ReadinessStatus.BLOCKED)
+		self.assertTrue(any("CUSTOMER" in b and "stable primary key" in b.lower() for b in report.blockers))
+
+	# 38. Stable ITEM key missing blocks when ITEM in scope
+	def test_38_stable_item_key_missing_blocked(self):
+		broken_mappings = dict(self.sample_mappings)
+		broken_mappings["ITEM"] = {
+			"table_name": "inv_mast",
+			"primary_key": "missing_item_id_pk",
+			"field_mappings": {"item_code": "item_code"},
+		}
+		snapshot = SchemaSnapshot.from_dict(self.sample_snapshot_dict)
+		cfg = Prophet21ConnectionConfig(
+			source_instance_id="MAIN",
+			environment="SNAPSHOT",
+			access_mode=Prophet21AccessMode.RESTORED_DATABASE_SNAPSHOT,
+			target_bop_company="Industrial DP",
+			database="p21_snapshot_db",
+			provenance=SnapshotProvenanceMetadata(
+				provenance_verified=True,
+				source_instance_confirmed=True,
+				capture_timestamp_known=True,
+				database_identity_confirmed=True,
+			),
+		)
+		report = assess_prophet21_readiness(cfg, snapshot, broken_mappings, scope_entities=["ITEM"])
+		self.assertEqual(report.status, Prophet21ReadinessStatus.BLOCKED)
+		self.assertTrue(any("ITEM" in b and "missing_item_id_pk" in b for b in report.blockers))
+
+	# 39. Snapshot provenance unverified blocks
+	def test_39_snapshot_provenance_unverified_blocked(self):
+		snapshot = SchemaSnapshot.from_dict(self.sample_snapshot_dict)
+		cfg = Prophet21ConnectionConfig(
+			source_instance_id="MAIN",
+			environment="SNAPSHOT",
+			access_mode=Prophet21AccessMode.RESTORED_DATABASE_SNAPSHOT,
+			target_bop_company="Industrial DP",
+			database="p21_snapshot_db",
+			provenance=SnapshotProvenanceMetadata(
+				provenance_verified=False,  # Not fully verified
+				source_instance_confirmed=True,
+				capture_timestamp_known=True,
+				database_identity_confirmed=True,
+			),
+		)
+		report = assess_prophet21_readiness(cfg, snapshot, self.sample_mappings)
+		self.assertEqual(report.status, Prophet21ReadinessStatus.BLOCKED)
+		self.assertFalse(report.provenance_finding["verified"])
+		self.assertTrue(any("provenance" in b.lower() for b in report.blockers))
+
+	# 40. Snapshot provenance verified passes gate
+	def test_40_snapshot_provenance_verified_passes_gate(self):
+		snapshot = SchemaSnapshot.from_dict(self.sample_snapshot_dict)
+		cfg = Prophet21ConnectionConfig(
+			source_instance_id="MAIN",
+			environment="SNAPSHOT",
+			access_mode=Prophet21AccessMode.RESTORED_DATABASE_SNAPSHOT,
+			target_bop_company="Industrial DP",
+			database="p21_snapshot_db",
+			provenance=SnapshotProvenanceMetadata(
+				provenance_verified=True,
+				source_instance_confirmed=True,
+				capture_timestamp_known=True,
+				database_identity_confirmed=True,
+				backup_file_name="p21_prod_backup_20260913.bak",
+			),
+		)
+		report = assess_prophet21_readiness(cfg, snapshot, self.sample_mappings)
+		self.assertTrue(report.provenance_finding["verified"])
+		self.assertEqual(report.provenance_finding["status"], "VERIFIED")
+		self.assertFalse(any("provenance" in b.lower() for b in report.blockers))
+
+	# 41. Warning + Blocker precedence is BLOCKED, never PARTIAL
+	def test_41_warning_plus_blocker_precedence_is_blocked(self):
+		# Schema without timezone -> warning
+		modified = dict(self.sample_snapshot_dict)
+		modified["database_timezone"] = None
+		snapshot = SchemaSnapshot.from_dict(modified)
+		cfg = Prophet21ConnectionConfig(
+			source_instance_id="MAIN",
+			environment="SNAPSHOT",
+			access_mode=Prophet21AccessMode.RESTORED_DATABASE_SNAPSHOT,
+			target_bop_company=None,  # Blocker: missing target company
+			database="p21_snapshot_db",
+			provenance=SnapshotProvenanceMetadata(
+				provenance_verified=True,
+				source_instance_confirmed=True,
+				capture_timestamp_known=True,
+				database_identity_confirmed=True,
+			),
+		)
+		report = assess_prophet21_readiness(cfg, snapshot, self.sample_mappings)
+		self.assertGreater(len(report.warnings), 0)
+		self.assertGreater(len(report.blockers), 0)
+		# Hard precedence: MUST be BLOCKED, NEVER PARTIAL
+		self.assertEqual(report.status, Prophet21ReadinessStatus.BLOCKED)
+		self.assertNotEqual(report.status, Prophet21ReadinessStatus.PARTIAL)
+
+	# 42. Pure warnings only yields PARTIAL
+	def test_42_pure_warnings_only_yields_partial(self):
+		# Schema without timezone -> warning, but all blockers cleared
+		modified = dict(self.sample_snapshot_dict)
+		modified["database_timezone"] = None
+		snapshot = SchemaSnapshot.from_dict(modified)
+		cfg = Prophet21ConnectionConfig(
+			source_instance_id="MAIN",
+			environment="SNAPSHOT",
+			access_mode=Prophet21AccessMode.RESTORED_DATABASE_SNAPSHOT,
+			target_bop_company="Industrial DP",
+			database="p21_snapshot_db",
+			password_reference="SEC_KEY",
+			provenance=SnapshotProvenanceMetadata(
+				provenance_verified=True,
+				source_instance_confirmed=True,
+				capture_timestamp_known=True,
+				database_identity_confirmed=True,
+			),
+		)
+		privs = ["CONNECT", "SELECT", "VIEW DEFINITION"]
+		report = assess_prophet21_readiness(cfg, snapshot, self.sample_mappings, reported_privileges=privs)
+		self.assertEqual(len(report.blockers), 0)
+		self.assertGreater(len(report.warnings), 0)
+		self.assertEqual(report.status, Prophet21ReadinessStatus.PARTIAL)
+
+	# 43. All requirements satisfied yields READY
+	def test_43_all_requirements_satisfied_yields_ready(self):
+		snapshot = SchemaSnapshot.from_dict(self.sample_snapshot_dict)
+		cfg = Prophet21ConnectionConfig(
+			source_instance_id="MAIN",
+			environment="SNAPSHOT",
+			access_mode=Prophet21AccessMode.RESTORED_DATABASE_SNAPSHOT,
+			target_bop_company="Industrial DP",
+			database="p21_snapshot_db",
+			password_reference="SEC_VAULT_P21_KEY",
+			company_scope_mode=Prophet21CompanyScopeMode.EXPLICIT_COLUMN,
+			source_company_id="1",
+			provenance=SnapshotProvenanceMetadata(
+				provenance_verified=True,
+				source_instance_confirmed=True,
+				capture_timestamp_known=True,
+				database_identity_confirmed=True,
+				backup_file_name="p21_backup_20260913.bak",
+			),
+		)
+		privs = ["CONNECT", "SELECT", "VIEW DEFINITION"]
+		report = assess_prophet21_readiness(cfg, snapshot, self.sample_mappings, reported_privileges=privs)
+		self.assertEqual(len(report.blockers), 0)
+		self.assertEqual(len(report.warnings), 0)
+		self.assertEqual(report.status, Prophet21ReadinessStatus.READY)

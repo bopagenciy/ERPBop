@@ -147,6 +147,54 @@ ACCESS_MODE_EVALUATIONS: Dict[str, Dict[str, Any]] = {
 
 
 # -------------------------------------------------------------------------
+# A — Supported Company Scope Modes (Phase 1W.1)
+# -------------------------------------------------------------------------
+class Prophet21CompanyScopeMode:
+	SINGLE_COMPANY_DATABASE = "SINGLE_COMPANY_DATABASE"
+	EXPLICIT_COLUMN = "EXPLICIT_COLUMN"
+	RELATIONAL_MAPPING = "RELATIONAL_MAPPING"
+	SEPARATE_DATABASE_PER_COMPANY = "SEPARATE_DATABASE_PER_COMPANY"
+	OTHER_VERIFIED = "OTHER_VERIFIED"
+	UNKNOWN = "UNKNOWN"
+
+	ALL_VERIFIED = {
+		SINGLE_COMPANY_DATABASE,
+		EXPLICIT_COLUMN,
+		RELATIONAL_MAPPING,
+		SEPARATE_DATABASE_PER_COMPANY,
+		OTHER_VERIFIED,
+	}
+
+
+# -------------------------------------------------------------------------
+# D — Snapshot / Backup Provenance Model (Phase 1W.1)
+# -------------------------------------------------------------------------
+@dataclass
+class SnapshotProvenanceMetadata:
+	"""
+	Verifiable provenance tracking for restored snapshots or database copies.
+	Guarantees the source artifact actually belongs to the verified client instance.
+	"""
+
+	provenance_verified: bool = False
+	source_instance_confirmed: bool = False
+	capture_timestamp_known: bool = False
+	database_identity_confirmed: bool = False
+	backup_source_host: Optional[str] = None
+	backup_file_name: Optional[str] = None
+	backup_checksum: Optional[str] = None
+	notes: Optional[str] = None
+
+	def is_fully_verified(self) -> bool:
+		return (
+			self.provenance_verified
+			and self.source_instance_confirmed
+			and self.capture_timestamp_known
+			and self.database_identity_confirmed
+		)
+
+
+# -------------------------------------------------------------------------
 # P — Read-Only Connection Config Model
 # -------------------------------------------------------------------------
 @dataclass
@@ -160,6 +208,11 @@ class Prophet21ConnectionConfig:
 	source_instance_id: str
 	environment: str  # SYNTHETIC, SNAPSHOT, REPLICA, PRODUCTION
 	access_mode: str  # Member of Prophet21AccessMode.ALL
+	target_bop_company: Optional[str] = None  # Explicit destination Bop Company
+	company_scope_mode: str = Prophet21CompanyScopeMode.UNKNOWN
+	source_company_id: Optional[str] = None
+	company_scope_evidence: Optional[str] = None
+	provenance: Optional[SnapshotProvenanceMetadata] = None
 	host: Optional[str] = None
 	port: int = 1433
 	database: Optional[str] = None
@@ -177,6 +230,9 @@ class Prophet21ConnectionConfig:
 		self.source_instance_id = canonical_source_instance_id(self.source_instance_id)
 		self.environment = str(self.environment).strip().upper()
 		self.access_mode = str(self.access_mode).strip().upper()
+		self.company_scope_mode = str(self.company_scope_mode).strip().upper()
+		if self.target_bop_company:
+			self.target_bop_company = str(self.target_bop_company).strip()
 
 		# Guard against production host denylist
 		if self.host and is_forbidden_production_host(self.host):
@@ -198,6 +254,11 @@ class Prophet21ConnectionConfig:
 			"source_instance_id": self.source_instance_id,
 			"environment": self.environment,
 			"access_mode": self.access_mode,
+			"target_bop_company": self.target_bop_company,
+			"company_scope_mode": self.company_scope_mode,
+			"source_company_id": self.source_company_id,
+			"company_scope_evidence": self.company_scope_evidence,
+			"provenance_set": bool(self.provenance and self.provenance.is_fully_verified()),
 			"host": self.host,
 			"port": self.port,
 			"database": self.database,
@@ -252,6 +313,7 @@ class SchemaSnapshot:
 	source_instance: str
 	captured_at: str
 	database_version: str
+	database_name: Optional[str] = None
 	p21_version: Optional[str] = None
 	database_timezone: Optional[str] = None
 	database_collation: Optional[str] = None
@@ -293,6 +355,7 @@ class SchemaSnapshot:
 			source_instance=canonical_source_instance_id(data.get("source_instance", "MAIN")),
 			captured_at=data.get("captured_at", datetime.now(timezone.utc).isoformat()),
 			database_version=data.get("database_version", "Unknown"),
+			database_name=data.get("database_name"),
 			p21_version=data.get("p21_version"),
 			database_timezone=data.get("database_timezone"),
 			database_collation=data.get("database_collation"),
@@ -432,6 +495,7 @@ class Prophet21ReadinessReport:
 	warnings: List[str]
 	entity_readiness: Dict[str, Dict[str, Any]]
 	company_discriminator_finding: Dict[str, Any]
+	provenance_finding: Dict[str, Any]
 	data_volume_classification: Dict[str, Any]
 	delta_capability_finding: Dict[str, Any]
 	timezone_finding: Dict[str, Any]
@@ -453,6 +517,7 @@ class Prophet21ReadinessReport:
 			"warnings": self.warnings,
 			"entity_readiness": self.entity_readiness,
 			"company_discriminator_finding": self.company_discriminator_finding,
+			"provenance_finding": self.provenance_finding,
 			"data_volume_classification": self.data_volume_classification,
 			"delta_capability_finding": self.delta_capability_finding,
 			"timezone_finding": self.timezone_finding,
@@ -487,15 +552,20 @@ def assess_prophet21_readiness(
 	schema_snapshot: Optional[SchemaSnapshot] = None,
 	logical_mappings: Optional[Dict[str, Dict[str, str]]] = None,
 	reported_privileges: Optional[List[str]] = None,
+	scope_entities: Optional[List[str]] = None,
 ) -> Prophet21ReadinessReport:
 	"""
 	Provider-specific readiness audit service for Prophet 21 migration intake.
 	Performs pure offline, deterministic analysis.
 	ZERO network calls. ZERO production contact. ZERO credentials evaluated.
+	Fails closed on any ambiguous company scope, missing target company, missing stable key, or unverified provenance.
 	"""
 	blockers: List[str] = []
 	warnings: List[str] = []
 	next_actions: List[str] = []
+
+	# In-scope entities (default all 4)
+	active_scope = [e.upper() for e in (scope_entities or ["CUSTOMER", "VENDOR", "ITEM", "WAREHOUSE"])]
 
 	# 1. Access Mode Validation
 	if config.access_mode not in Prophet21AccessMode.ALL:
@@ -510,7 +580,12 @@ def assess_prophet21_readiness(
 			"Environment is set to PRODUCTION. Direct connection to production Prophet 21 is strictly forbidden."
 		)
 
-	# 3. Security & Privilege Validation
+	# 3. Connection Encryption Policy
+	if config.access_mode in (Prophet21AccessMode.SQL_SERVER_READONLY, Prophet21AccessMode.ODBC_READONLY):
+		if not config.encrypt:
+			blockers.append("Connection encryption policy violated: remote connection must enforce encrypt=True.")
+
+	# 4. Security & Privilege Validation
 	sec_audit = {"compliant": True, "violations": []}
 	if reported_privileges is not None:
 		is_comp, priv_violations, allowed = audit_sql_account_privileges(reported_privileges)
@@ -527,13 +602,67 @@ def assess_prophet21_readiness(
 	):
 		warnings.append("No secure password reference configured (password_reference is unset).")
 
-	# 4. Schema Snapshot Assessment
-	entity_readiness = {}
+	# 5. Target Bop Company Must Be Explicit (Hard Blocker)
+	if not config.target_bop_company or not config.target_bop_company.strip():
+		blockers.append("Target Bop Company is not explicitly configured on migration setup.")
+	elif config.target_bop_company in ("UNKNOWN", "NONE", "UNSET"):
+		blockers.append(f"Target Bop Company '{config.target_bop_company}' is invalid.")
+
+	# 6. Source Company Scope Assessment (Fail-Closed Policy)
 	company_discriminator = {
 		"status": "UNVERIFIED",
+		"mode": config.company_scope_mode,
 		"discriminator_column": None,
 		"is_company_scoped": False,
+		"evidence": config.company_scope_evidence,
 	}
+
+	# Check if company scope is unambiguously verified
+	if config.company_scope_mode == Prophet21CompanyScopeMode.SINGLE_COMPANY_DATABASE:
+		if not config.company_scope_evidence:
+			warnings.append("Single-company database mode selected without formal documentation notes.")
+		company_discriminator["status"] = "VERIFIED_SINGLE_COMPANY"
+		company_discriminator["is_company_scoped"] = True
+	elif config.company_scope_mode == Prophet21CompanyScopeMode.SEPARATE_DATABASE_PER_COMPANY:
+		company_discriminator["status"] = "VERIFIED_SEPARATE_DATABASE"
+		company_discriminator["is_company_scoped"] = True
+	elif config.company_scope_mode == Prophet21CompanyScopeMode.RELATIONAL_MAPPING:
+		company_discriminator["status"] = "VERIFIED_RELATIONAL_MAPPING"
+		company_discriminator["is_company_scoped"] = True
+	elif config.company_scope_mode == Prophet21CompanyScopeMode.OTHER_VERIFIED:
+		company_discriminator["status"] = "VERIFIED_OTHER"
+		company_discriminator["is_company_scoped"] = True
+	elif config.company_scope_mode == Prophet21CompanyScopeMode.EXPLICIT_COLUMN:
+		company_discriminator["status"] = "VERIFIED_EXPLICIT_COLUMN"
+		company_discriminator["is_company_scoped"] = True
+	else:
+		# UNKNOWN or unspecified -> check if schema provides explicit columns
+		pass
+
+	# 7. Snapshot / Backup Provenance Assessment
+	provenance_finding = {
+		"required": False,
+		"status": "NOT_APPLICABLE",
+		"verified": False,
+	}
+	if config.access_mode in (
+		Prophet21AccessMode.RESTORED_DATABASE_SNAPSHOT,
+		Prophet21AccessMode.SANITIZED_DATABASE_COPY,
+		Prophet21AccessMode.DATABASE_BACKUP_RESTORE,
+	):
+		provenance_finding["required"] = True
+		if not config.provenance or not config.provenance.is_fully_verified():
+			provenance_finding["status"] = "UNVERIFIED"
+			blockers.append(
+				f"Access mode '{config.access_mode}' requires verified snapshot/backup provenance. "
+				"Source instance, database identity, and capture timestamp must be confirmed."
+			)
+		else:
+			provenance_finding["status"] = "VERIFIED"
+			provenance_finding["verified"] = True
+
+	# 8. Schema Snapshot Assessment
+	entity_readiness = {}
 	delta_capability = {
 		"status": "NONE_DETECTED",
 		"candidates": [],
@@ -548,6 +677,12 @@ def assess_prophet21_readiness(
 		blockers.append("Schema snapshot not captured or provided. Run read-only schema discovery script.")
 		next_actions.append("Capture p21_schema_snapshot.json from read-only replica or staging restore.")
 	else:
+		# Check Source Database Identity
+		if not schema_snapshot.database_name or not schema_snapshot.database_name.strip():
+			# If config.database is also missing, block
+			if not config.database or not config.database.strip():
+				blockers.append("Source database name/identity is unknown or absent in both config and schema snapshot.")
+
 		# Timezone check
 		if schema_snapshot.database_timezone:
 			tz_finding["status"] = "SPECIFIED"
@@ -559,13 +694,10 @@ def assess_prophet21_readiness(
 		if schema_snapshot.database_collation:
 			text_finding["collation"] = schema_snapshot.database_collation
 
-		# Check for delta candidates (timestamp, rowversion, etc.)
-		all_delta_cols = []
+		# Check for delta candidates
 		total_rows = 0
 		for tbl_name, tbl_meta in schema_snapshot.tables.items():
 			total_rows += tbl_meta.approximate_row_count
-			if tbl_meta.has_timestamp_col or tbl_meta.has_rowversion_col:
-				all_delta_cols.append(tbl_name)
 			for col_name, col_meta in tbl_meta.columns.items():
 				c_lower = col_name.lower()
 				if any(k in c_lower for k in ("last_modified", "date_modified", "rowversion", "change_tracking")):
@@ -580,9 +712,38 @@ def assess_prophet21_readiness(
 
 		vol_classification = classify_data_volume(total_rows)
 
+		# Auto-detect company column candidate if not explicitly verified via mode
+		comp_col_candidates = set()
+		for tbl in schema_snapshot.tables.values():
+			for col in tbl.columns:
+				c_low = col.lower()
+				if any(k in c_low for k in ("company_id", "company_no", "corp_id", "entity_id", "business_unit")):
+					comp_col_candidates.add(col)
+
+		if comp_col_candidates:
+			company_discriminator["candidates"] = sorted(list(comp_col_candidates))
+			company_discriminator["discriminator_column"] = sorted(list(comp_col_candidates))[0]
+			if config.company_scope_mode == Prophet21CompanyScopeMode.UNKNOWN:
+				company_discriminator["status"] = "EXPLICIT_COLUMN_VERIFIED"
+				company_discriminator["is_company_scoped"] = True
+				company_discriminator["mode"] = Prophet21CompanyScopeMode.EXPLICIT_COLUMN
+
+		# If company scope remains unverified, FAIL CLOSED (Hard Blocker)
+		if not company_discriminator["is_company_scoped"]:
+			company_discriminator["status"] = "NO_EXPLICIT_COLUMN_FOUND"
+			blockers.append(
+				"Source company scope is UNKNOWN. Must explicitly confirm SINGLE_COMPANY_DATABASE, "
+				"SEPARATE_DATABASE_PER_COMPANY, RELATIONAL_MAPPING, or EXPLICIT_COLUMN. "
+				"Cannot infer single-company scope from column absence."
+			)
+			warnings.append(
+				"No explicit company discriminator column found and company scope unconfirmed."
+			)
+
 		# Evaluate entity mappings against schema snapshot
 		mappings = logical_mappings or {}
-		for e_type, req_fields in LOGICAL_ENTITY_REQUIREMENTS.items():
+		for e_type in active_scope:
+			req_fields = LOGICAL_ENTITY_REQUIREMENTS.get(e_type, {})
 			ent_report = {
 				"mapped": False,
 				"table": None,
@@ -595,37 +756,39 @@ def assess_prophet21_readiness(
 			tbl_name = tbl_mapping.get("table_name")
 			if not tbl_name:
 				ent_report["status"] = "UNMAPPED"
-				warnings.append(f"Entity '{e_type}' has no table mapping configured.")
+				blockers.append(f"In-scope entity '{e_type}' has no table mapping configured.")
 			elif tbl_name not in schema_snapshot.tables:
 				ent_report["status"] = "TABLE_MISSING"
-				blockers.append(f"Entity '{e_type}' mapped to table '{tbl_name}' which does not exist in schema.")
+				blockers.append(f"In-scope entity '{e_type}' mapped to table '{tbl_name}' which does not exist in schema.")
 			else:
 				ent_report["mapped"] = True
 				ent_report["table"] = tbl_name
 				tbl_snap = schema_snapshot.tables[tbl_name]
 				ent_report["primary_key"] = tbl_mapping.get("primary_key")
 
-				# Stable key verification
+				# Stable key verification (Hard Blocker for in-scope entity)
 				pk = ent_report["primary_key"]
 				if not pk:
-					blockers.append(f"Entity '{e_type}' lacks a designated primary_key.")
+					blockers.append(f"In-scope entity '{e_type}' lacks a designated stable primary key.")
 				elif pk not in tbl_snap.columns:
-					blockers.append(f"Primary key '{pk}' for entity '{e_type}' not found in table '{tbl_name}'.")
+					blockers.append(
+						f"Primary key '{pk}' for in-scope entity '{e_type}' not found in table '{tbl_name}'."
+					)
 
 				# Check logical fields
 				field_maps = tbl_mapping.get("field_mappings", {})
 				for l_field, req_lvl in req_fields.items():
 					if l_field == "source_company_id":
-						continue  # Evaluated separately below
+						continue
 					phys_col = field_maps.get(l_field)
 					if not phys_col:
 						if req_lvl == FieldRequirementLevel.REQUIRED:
 							ent_report["missing_required_fields"].append(l_field)
-							blockers.append(f"Entity '{e_type}' missing required logical field mapping: '{l_field}'.")
+							blockers.append(f"In-scope entity '{e_type}' missing required logical field mapping: '{l_field}'.")
 						elif req_lvl == FieldRequirementLevel.REVIEW_REQUIRED_IF_MISSING:
 							ent_report["missing_optional_fields"].append(l_field)
 							warnings.append(
-								f"Entity '{e_type}' missing '{l_field}'. Requires explicit business review/default."
+								f"In-scope entity '{e_type}' missing '{l_field}'. Requires explicit business review/default."
 							)
 						else:
 							ent_report["missing_optional_fields"].append(l_field)
@@ -637,27 +800,6 @@ def assess_prophet21_readiness(
 				ent_report["status"] = "READY" if not ent_report["missing_required_fields"] else "INCOMPLETE"
 
 			entity_readiness[e_type] = ent_report
-
-		# Company Discriminator Assessment
-		# Look for company discriminator candidate in tables
-		comp_col_candidates = set()
-		for tbl in schema_snapshot.tables.values():
-			for col in tbl.columns:
-				c_low = col.lower()
-				if any(k in c_low for k in ("company_id", "company_no", "corp_id", "entity_id", "business_unit")):
-					comp_col_candidates.add(col)
-
-		if comp_col_candidates:
-			company_discriminator["status"] = "CANDIDATE_DISCRIMINATOR_FOUND"
-			company_discriminator["discriminator_column"] = sorted(list(comp_col_candidates))[0]
-			company_discriminator["candidates"] = sorted(list(comp_col_candidates))
-			company_discriminator["is_company_scoped"] = True
-		else:
-			warnings.append(
-				"No explicit company discriminator column identified in schema. "
-				"Must confirm if database is single-company or multi-company via location/branch hierarchy."
-			)
-			company_discriminator["status"] = "NO_EXPLICIT_COLUMN_FOUND"
 
 	# Null Sentinel Value Policy (evidence based)
 	null_sentinel_policy = {
@@ -673,7 +815,7 @@ def assess_prophet21_readiness(
 		},
 	}
 
-	# Compute Final Status
+	# Compute Final Status: Hard blockers unconditionally produce BLOCKED, regardless of warnings
 	if blockers:
 		status = Prophet21ReadinessStatus.BLOCKED
 	elif warnings or any(e.get("status") != "READY" for e in entity_readiness.values()):
@@ -683,7 +825,7 @@ def assess_prophet21_readiness(
 
 	# Next Actions recommendations
 	if status == Prophet21ReadinessStatus.BLOCKED:
-		next_actions.append("Resolve all critical security and schema blockers before attempting connection.")
+		next_actions.append("Resolve all critical security, company-scope, and schema blockers before proceeding.")
 	elif status == Prophet21ReadinessStatus.PARTIAL:
 		next_actions.append("Complete entity field mappings and obtain client IT company structure clarification.")
 	else:
@@ -700,6 +842,7 @@ def assess_prophet21_readiness(
 		warnings=warnings,
 		entity_readiness=entity_readiness,
 		company_discriminator_finding=company_discriminator,
+		provenance_finding=provenance_finding,
 		data_volume_classification=vol_classification,
 		delta_capability_finding=delta_capability,
 		timezone_finding=tz_finding,
