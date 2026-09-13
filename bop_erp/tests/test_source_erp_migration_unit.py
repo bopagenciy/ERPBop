@@ -25,6 +25,14 @@ from bop_erp.migration.exceptions import (
 	StagingError,
 )
 from bop_erp.migration.import_boundary import import_validated_entity
+from bop_erp.migration.namespaces import (
+	canonical_company_tag,
+	canonical_provider,
+	canonical_source_instance_id,
+	canonical_source_namespace,
+	canonical_source_system,
+	compute_migration_channel_id,
+)
 from bop_erp.migration.normalization import (
 	normalize_customer,
 	normalize_item,
@@ -458,10 +466,8 @@ class TestSourceERPMigrationUnit(FrappeTestCase):
 
 		ch_a = get_or_create_migration_channel(self.company, "PROPHET_21", "client-A")
 		ch_b = get_or_create_migration_channel(self.company, "PROPHET_21", "client-B")
-		self.assertNotEqual(ch_a, ch_b)
-
-		prov_a = "PROPHET_21:client-A"
-		prov_b = "PROPHET_21:client-B"
+		prov_a = canonical_provider("PROPHET_21", "client-A")
+		prov_b = canonical_provider("PROPHET_21", "client-B")
 
 		key_a = compute_active_external_key(ch_a, ExternalEntityType.CUSTOMER, "123", provider=prov_a)
 		key_b = compute_active_external_key(ch_b, ExternalEntityType.CUSTOMER, "123", provider=prov_b)
@@ -617,3 +623,157 @@ class TestSourceERPMigrationUnit(FrappeTestCase):
 		for r in (run1.name, run2.name, run3.name):
 			frappe.db.delete("Migration Staging Row", {"migration_run": r})
 			frappe.delete_doc("Migration Run", r, force=True, ignore_permissions=True)
+
+	# 29. Canonical Source Namespace Rules & Case Normalization
+	def test_29_canonical_source_namespace_rules(self):
+		# source_system rules
+		self.assertEqual(canonical_source_system("prophet_21"), "PROPHET_21")
+		self.assertEqual(canonical_source_system(" PROPHET_21 "), "PROPHET_21")
+		self.assertEqual(canonical_source_system("p21"), "P21")
+		with self.assertRaises(ValueError):
+			canonical_source_system("")
+		with self.assertRaises(ValueError):
+			canonical_source_system("   ")
+		with self.assertRaises(ValueError):
+			canonical_source_system(None)
+
+		# source_instance_id rules
+		self.assertEqual(canonical_source_instance_id("client-a"), "CLIENT-A")
+		self.assertEqual(canonical_source_instance_id(" CLIENT-A "), "CLIENT-A")
+		self.assertEqual(canonical_source_instance_id(""), "DEFAULT")
+		self.assertEqual(canonical_source_instance_id("   "), "DEFAULT")
+		self.assertEqual(canonical_source_instance_id(None), "DEFAULT")
+
+		# canonical_provider helper
+		self.assertEqual(canonical_provider(" prophet_21 ", " client-a "), "PROPHET_21:CLIENT-A")
+		self.assertEqual(canonical_provider("PROPHET_21", None), "PROPHET_21:DEFAULT")
+
+		# Casing & whitespace invariance in compute_staging_identity
+		k1 = compute_staging_identity("prophet_21", "client-a", "customer", "123", company=self.company)
+		k2 = compute_staging_identity(" PROPHET_21 ", " CLIENT-A ", "CUSTOMER", "123", company=self.company)
+		self.assertEqual(k1, k2, "Casing and surrounding whitespace must converge to identical staging key.")
+
+	# 30. Company Migration Channel Isolation
+	def test_30_company_migration_channel_isolation(self):
+		# Different companies produce different migration channels
+		ch_co_a = compute_migration_channel_id("Company A", "PROPHET_21", "INST-1")
+		ch_co_b = compute_migration_channel_id("Company B", "PROPHET_21", "INST-1")
+		self.assertNotEqual(ch_co_a, ch_co_b, "Different companies must have isolated migration channels.")
+
+		# Replay converges to identical channel
+		ch_co_a_replay = compute_migration_channel_id("Company A", "PROPHET_21", "INST-1")
+		self.assertEqual(ch_co_a, ch_co_a_replay)
+
+		# Same company with different instance produces different channel
+		ch_co_a_inst2 = compute_migration_channel_id("Company A", "PROPHET_21", "INST-2")
+		self.assertNotEqual(ch_co_a, ch_co_a_inst2)
+
+	# 31. External ID Mapping Target Identity Complete Matrix
+	def test_31_external_id_mapping_target_identity_matrix(self):
+		from bop_erp.bop_erp.doctype.external_id_mapping.external_id_mapping import compute_active_external_key
+
+		# Matrix:
+		# 1. Company A / P21 / INST-1 / CUSTOMER / 123
+		# 2. Company A / P21 / INST-2 / CUSTOMER / 123
+		# 3. Company B / P21 / INST-1 / CUSTOMER / 123
+		ch_a1 = compute_migration_channel_id("Company A", "P21", "INST-1")
+		prov_a1 = canonical_provider("P21", "INST-1")
+		key_a1 = compute_active_external_key(ch_a1, ExternalEntityType.CUSTOMER, "123", provider=prov_a1)
+
+		ch_a2 = compute_migration_channel_id("Company A", "P21", "INST-2")
+		prov_a2 = canonical_provider("P21", "INST-2")
+		key_a2 = compute_active_external_key(ch_a2, ExternalEntityType.CUSTOMER, "123", provider=prov_a2)
+
+		ch_b1 = compute_migration_channel_id("Company B", "P21", "INST-1")
+		prov_b1 = canonical_provider("P21", "INST-1")
+		key_b1 = compute_active_external_key(ch_b1, ExternalEntityType.CUSTOMER, "123", provider=prov_b1)
+
+		# All three keys must be strictly distinct
+		self.assertNotEqual(key_a1, key_a2, "Company A INST-1 and INST-2 must not collide.")
+		self.assertNotEqual(key_a1, key_b1, "Company A and Company B INST-1 must not collide.")
+		self.assertNotEqual(key_a2, key_b1, "Company A INST-2 and Company B INST-1 must not collide.")
+
+		# Replay converges exactly
+		key_a1_replay = compute_active_external_key(ch_a1, ExternalEntityType.CUSTOMER, "123", provider=prov_a1)
+		self.assertEqual(key_a1, key_a1_replay)
+
+	# 32. Company-Scoped Cross-Run Snapshot Chain & Isolation
+	def test_32_company_scoped_cross_run_snapshot_chain(self):
+		co_a = self.company
+		# Run A1
+		run_a1 = frappe.get_doc({
+			"doctype": "Migration Run",
+			"run_id": f"TEST-RUN-A1-{frappe.generate_hash(length=6)}",
+			"source_system": "P21",
+			"source_instance_id": "INST-1",
+			"company": co_a,
+			"status": "DRAFT",
+		}).insert(ignore_permissions=True)
+
+		# Run A2
+		run_a2 = frappe.get_doc({
+			"doctype": "Migration Run",
+			"run_id": f"TEST-RUN-A2-{frappe.generate_hash(length=6)}",
+			"source_system": "P21",
+			"source_instance_id": "INST-1",
+			"company": co_a,
+			"status": "DRAFT",
+		}).insert(ignore_permissions=True)
+
+		payload_v1 = {"id": "SHARED-ITEM-01", "name": "Item V1"}
+
+		# Run A1 stages v1 -> NEW
+		row_a1, is_new_a1 = stage_source_record(
+			run_id=run_a1.name,
+			source_system=run_a1.source_system,
+			source_instance_id=run_a1.source_instance_id,
+			entity_type="ITEM",
+			source_record=payload_v1,
+		)
+		self.assertTrue(is_new_a1)
+		self.assertEqual(row_a1.snapshot_state, "NEW")
+		frappe.db.set_value("Migration Run", run_a1.name, "status", "STAGED")
+
+		# Interleaved Run B1 for a DIFFERENT company stages changed payload -> NEW (not polluted by Company A)
+		co_b = frappe.db.get_value("Company", {"name": ["!=", co_a]}, "name") or "Bamal Fastener Corp"
+		run_b1 = frappe.get_doc({
+			"doctype": "Migration Run",
+			"run_id": f"TEST-RUN-B1-{frappe.generate_hash(length=6)}",
+			"source_system": "P21",
+			"source_instance_id": "INST-1",
+			"company": co_b,
+			"status": "DRAFT",
+		}).insert(ignore_permissions=True)
+
+		row_b1, is_new_b1 = stage_source_record(
+			run_id=run_b1.name,
+			source_system=run_b1.source_system,
+			source_instance_id=run_b1.source_instance_id,
+			entity_type="ITEM",
+			source_record={"id": "SHARED-ITEM-01", "name": "Item V2 Modified for Company B"},
+		)
+		self.assertTrue(is_new_b1)
+		self.assertEqual(row_b1.snapshot_state, "NEW", "Company B must not use Company A snapshot as prior state.")
+		frappe.db.set_value("Migration Run", run_b1.name, "status", "STAGED")
+
+		# Run A2 stages identical v1 -> UNCHANGED (compares to Run A1, NOT Run B1)
+		row_a2, is_new_a2 = stage_source_record(
+			run_id=run_a2.name,
+			source_system=run_a2.source_system,
+			source_instance_id=run_a2.source_instance_id,
+			entity_type="ITEM",
+			source_record=payload_v1,
+		)
+		self.assertTrue(is_new_a2)
+		self.assertEqual(row_a2.snapshot_state, "UNCHANGED", "Company A Run 2 must compare to Company A Run 1, ignoring Company B.")
+
+		# Reconciliation on Run A2 compares against Run A1, ignoring Company B
+		rep_a2 = reconcile_migration_run(run_a2.name)
+		self.assertEqual(rep_a2["prior_run_id"], run_a1.name)
+		self.assertEqual(rep_a2["by_entity_type"]["ITEM"]["unchanged_count"], 1)
+
+		# Clean test docs
+		for r in (run_a1.name, run_a2.name, run_b1.name):
+			frappe.db.delete("Migration Staging Row", {"migration_run": r})
+			frappe.delete_doc("Migration Run", r, force=True, ignore_permissions=True)
+

@@ -6,6 +6,12 @@ from frappe import _
 from frappe.model.document import Document
 
 
+from bop_erp.migration.namespaces import (
+	canonical_source_instance_id,
+	canonical_source_system,
+)
+
+
 class MigrationRunStatus:
 	DRAFT = "DRAFT"
 	EXTRACTING = "EXTRACTING"
@@ -52,6 +58,12 @@ class MigrationRun(Document):
 	def validate(self):
 		self.validate_status_transition()
 		self.validate_company()
+		self.canonicalize_namespaces()
+
+	def canonicalize_namespaces(self):
+		if self.source_system:
+			self.source_system = canonical_source_system(self.source_system)
+		self.source_instance_id = canonical_source_instance_id(self.source_instance_id)
 
 	def validate_company(self):
 		if self.company and not frappe.db.exists("Company", self.company):

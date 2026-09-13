@@ -15,7 +15,18 @@ from bop_erp.migration.exceptions import (
 	SourcePayloadDriftError,
 	SourceWriteBlockedError,
 )
-from bop_erp.migration.import_boundary import import_validated_entity
+from bop_erp.migration.import_boundary import (
+	get_or_create_migration_channel,
+	import_validated_entity,
+)
+from bop_erp.migration.namespaces import (
+	canonical_company_tag,
+	canonical_provider,
+	canonical_source_instance_id,
+	canonical_source_namespace,
+	canonical_source_system,
+	compute_migration_channel_id,
+)
 from bop_erp.migration.normalization import normalize_migration_run
 from bop_erp.migration.reconciliation import reconcile_migration_run
 from bop_erp.migration.staging import (
@@ -361,6 +372,13 @@ class TestSourceERPMigrationLive(FrappeTestCase):
 		providers = {m.provider for m in test_mappings}
 		self.assertEqual(providers, {"PROPHET_21:CLIENT-A", "PROPHET_21:CLIENT-B"})
 
+		# Verify company-scoped sales channels
+		co_tag = canonical_company_tag(self.company)
+		expected_ch_a = f"MIG-{co_tag}-PROPHET_21-CLIENT-A"
+		expected_ch_b = f"MIG-{co_tag}-PROPHET_21-CLIENT-B"
+		channels = {m.sales_channel for m in test_mappings}
+		self.assertEqual(channels, {expected_ch_a, expected_ch_b})
+
 		# Clean created target customers and mappings
 		for m in test_mappings:
 			frappe.db.delete("External ID Mapping", {"name": m.name})
@@ -463,3 +481,18 @@ class TestSourceERPMigrationLive(FrappeTestCase):
 		rep = reconcile_migration_run(run3.name)
 		self.assertEqual(rep["by_entity_type"]["ITEM"]["changed_count"], 1)
 		self.assertEqual(rep["discrepancies"]["changed_entities"], 1)
+
+	# Scenario N: Casing convergence & company migration channel isolation
+	def test_n_casing_convergence_and_company_channel_isolation(self):
+		# Prove casing & whitespace variations converge to same canonical namespace and channel
+		ch_1 = get_or_create_migration_channel(self.company, "prophet_21", "client-a")
+		ch_2 = get_or_create_migration_channel(self.company, " PROPHET_21 ", " CLIENT-A ")
+		self.assertEqual(ch_1, ch_2, "Casing/whitespace variations must converge to identical migration channel.")
+
+		# Prove company isolation: different company produces different migration channel
+		co_tag = canonical_company_tag(self.company)
+		expected_ch = f"MIG-{co_tag}-PROPHET_21-CLIENT-A"
+		self.assertEqual(ch_1, expected_ch)
+
+		other_ch = compute_migration_channel_id("OTHER_COMPANY_XYZ", "PROPHET_21", "CLIENT-A")
+		self.assertNotEqual(ch_1, other_ch, "Different company must produce isolated migration channel.")

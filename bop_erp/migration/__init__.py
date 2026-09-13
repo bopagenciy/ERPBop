@@ -40,9 +40,23 @@ from bop_erp.migration.staging import (
 	extract_and_stage_from_adapter,
 	stage_source_record,
 )
+from bop_erp.migration.namespaces import (
+	canonical_company_tag,
+	canonical_provider,
+	canonical_source_instance_id,
+	canonical_source_namespace,
+	canonical_source_system,
+	compute_migration_channel_id,
+)
 from bop_erp.migration.validation import validate_migration_run
 
 __all__ = [
+	"canonical_source_system",
+	"canonical_source_instance_id",
+	"canonical_source_namespace",
+	"canonical_provider",
+	"canonical_company_tag",
+	"compute_migration_channel_id",
 	"SourceAdapter",
 	"SyntheticSourceAdapter",
 	"execute_dry_run",

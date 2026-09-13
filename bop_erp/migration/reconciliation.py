@@ -7,6 +7,9 @@ import frappe
 from frappe import _
 
 
+from bop_erp.migration.namespaces import canonical_source_namespace
+
+
 def reconcile_migration_run(
 	run_id: str,
 	source_metadata: Optional[Dict[str, Any]] = None,
@@ -19,23 +22,25 @@ def reconcile_migration_run(
 	run_doc = frappe.get_doc("Migration Run", run_id)
 	entity_types = ["CUSTOMER", "VENDOR", "ITEM", "WAREHOUSE"]
 
-	# Find most recent prior run for the same source system & instance
+	canonical_sys, canonical_inst = canonical_source_namespace(run_doc.source_system, run_doc.source_instance_id)
+
+	# Find most recent prior run for the same company, source system & instance
 	prior_run = frappe.db.sql(
 		"""
 		SELECT name FROM `tabMigration Run`
-		WHERE source_system = %s AND source_instance_id = %s
+		WHERE company = %s AND source_system = %s AND source_instance_id = %s
 		  AND name != %s AND status IN ('STAGED', 'READY', 'COMPLETED', 'RECONCILING', 'IMPORTING')
 		ORDER BY creation DESC LIMIT 1
 		""",
-		(run_doc.source_system, run_doc.source_instance_id, run_id),
+		(run_doc.company, canonical_sys, canonical_inst, run_id),
 		as_dict=True,
 	)
 	prior_run_id = prior_run[0].name if prior_run else None
 
 	report = {
 		"run_id": run_id,
-		"source_system": run_doc.source_system,
-		"source_instance_id": run_doc.source_instance_id,
+		"source_system": canonical_sys,
+		"source_instance_id": canonical_inst,
 		"company": run_doc.company,
 		"status": run_doc.status,
 		"prior_run_id": prior_run_id,

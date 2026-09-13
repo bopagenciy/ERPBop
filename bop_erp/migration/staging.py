@@ -13,6 +13,11 @@ from bop_erp.migration.exceptions import (
 	SourcePayloadDriftError,
 	StagingError,
 )
+from bop_erp.migration.namespaces import (
+	canonical_source_instance_id,
+	canonical_source_namespace,
+	canonical_source_system,
+)
 
 
 def compute_staging_identity(
@@ -20,17 +25,32 @@ def compute_staging_identity(
 	source_instance_id: str,
 	entity_type: str,
 	source_record_id: str,
+	company: Optional[str] = None,
 ) -> str:
 	"""
 	Computes the canonical SHA-256 staging identity key for a source record.
-	Identity tuple: [source_system, source_instance_id, entity_type, source_record_id].
+	Uses canonical source namespace.
+	Identity tuple: [opt(company), source_system, source_instance_id, entity_type, source_record_id].
 	"""
-	identity_tuple = [
-		str(source_system).strip().upper(),
-		str(source_instance_id).strip(),
-		str(entity_type).strip().upper(),
-		str(source_record_id).strip(),
-	]
+	sys, inst = canonical_source_namespace(source_system, source_instance_id)
+	ent = str(entity_type).strip().upper()
+	rec = str(source_record_id).strip()
+
+	if company and str(company).strip():
+		identity_tuple = [
+			str(company).strip(),
+			sys,
+			inst,
+			ent,
+			rec,
+		]
+	else:
+		identity_tuple = [
+			sys,
+			inst,
+			ent,
+			rec,
+		]
 	canonical_json = json.dumps(identity_tuple, ensure_ascii=False, separators=(",", ":"))
 	return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
@@ -72,8 +92,16 @@ def stage_source_record(
 	- Identical identity & differing payload -> detects payload drift (raises SourcePayloadDriftError).
 	- New identity -> inserts new row.
 	"""
+	# Resolve run company and canonicalize source namespace
+	run_doc = frappe.get_cached_doc("Migration Run", run_id) if hasattr(frappe, "db") and frappe.db else None
+	run_company = run_doc.company if run_doc else None
+	sys, inst = canonical_source_namespace(
+		source_system or (run_doc.source_system if run_doc else "DEFAULT"),
+		source_instance_id or (run_doc.source_instance_id if run_doc else "DEFAULT"),
+	)
+
 	rec_id = extract_record_id(source_record, entity_type)
-	identity_key = compute_staging_identity(source_system, source_instance_id, entity_type, rec_id)
+	identity_key = compute_staging_identity(sys, inst, entity_type, rec_id, company=run_company)
 	payload_hash = compute_payload_hash(source_record)
 	payload_json = json.dumps(source_record, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
@@ -97,18 +125,42 @@ def stage_source_record(
 				f"Expected hash {existing.source_payload_hash[:12]}..., got {payload_hash[:12]}..."
 			)
 
-	# Cross-run snapshot comparison: find the latest prior snapshot row for this identity across previous runs
-	prior_snapshot = frappe.db.sql(
-		"""
-		SELECT name, source_payload_hash, creation
-		FROM `tabMigration Staging Row`
-		WHERE staging_identity_key = %s AND migration_run != %s
-		ORDER BY creation DESC, name DESC
-		LIMIT 1
-		""",
-		(identity_key, run_id),
-		as_dict=True,
-	)
+	# Cross-run snapshot comparison: scoped by (company, canonical source_system, canonical source_instance_id)
+	if run_company:
+		prior_snapshot = frappe.db.sql(
+			"""
+			SELECT r.name, r.source_payload_hash, r.creation
+			FROM `tabMigration Staging Row` r
+			INNER JOIN `tabMigration Run` m ON r.migration_run = m.name
+			WHERE m.company = %s
+			  AND m.source_system = %s
+			  AND m.source_instance_id = %s
+			  AND r.entity_type = %s
+			  AND r.source_record_id = %s
+			  AND r.migration_run != %s
+			ORDER BY r.creation DESC, r.name DESC
+			LIMIT 1
+			""",
+			(run_company, sys, inst, entity_type.upper(), rec_id, run_id),
+			as_dict=True,
+		)
+	else:
+		prior_snapshot = frappe.db.sql(
+			"""
+			SELECT r.name, r.source_payload_hash, r.creation
+			FROM `tabMigration Staging Row` r
+			INNER JOIN `tabMigration Run` m ON r.migration_run = m.name
+			WHERE m.source_system = %s
+			  AND m.source_instance_id = %s
+			  AND r.entity_type = %s
+			  AND r.source_record_id = %s
+			  AND r.migration_run != %s
+			ORDER BY r.creation DESC, r.name DESC
+			LIMIT 1
+			""",
+			(sys, inst, entity_type.upper(), rec_id, run_id),
+			as_dict=True,
+		)
 
 	if prior_snapshot:
 		if prior_snapshot[0].source_payload_hash == payload_hash:

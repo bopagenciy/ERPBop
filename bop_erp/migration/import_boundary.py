@@ -9,6 +9,12 @@ from frappe import _
 
 from bop_erp.constants import ExternalEntityType
 from bop_erp.migration.exceptions import ImportBoundaryError
+from bop_erp.migration.namespaces import (
+	canonical_company_tag,
+	canonical_provider,
+	canonical_source_namespace,
+	compute_migration_channel_id,
+)
 
 
 def get_or_create_migration_channel(
@@ -18,15 +24,17 @@ def get_or_create_migration_channel(
 ) -> str:
 	"""
 	Ensures a persistent Sales Channel exists for scoping migration External ID Mappings,
-	uniquely keyed by source_system and source_instance_id.
+	uniquely keyed by (company, source_system, source_instance_id).
 	"""
-	inst = str(source_instance_id or "DEFAULT").strip().upper()
-	channel_id = f"MIG-{str(source_system).strip().upper()}-{inst}"
+	channel_id = compute_migration_channel_id(company, source_system, source_instance_id)
+	sys, inst = canonical_source_namespace(source_system, source_instance_id)
+	co_tag = canonical_company_tag(company)
+
 	if not frappe.db.exists("Sales Channel", channel_id):
 		ch = frappe.get_doc({
 			"doctype": "Sales Channel",
 			"channel_id": channel_id,
-			"channel_name": f"{source_system} ({inst}) Migration Channel",
+			"channel_name": f"{sys} ({inst}) Migration Channel - {co_tag}",
 			"channel_type": "INTERNAL",
 			"company": company,
 			"active": 1,
@@ -151,10 +159,10 @@ def import_validated_entity(row_name: str) -> Dict[str, Any]:
 		raise ImportBoundaryError(f"Unsupported entity type '{e_type}' at import boundary.")
 
 	# Canonical External ID Mapping
-	canonical_provider = f"{run_doc.source_system.strip().upper()}:{str(run_doc.source_instance_id or 'DEFAULT').strip()}"
+	canonical_prov = canonical_provider(run_doc.source_system, run_doc.source_instance_id)
 	map_filters = {
 		"sales_channel": channel_id,
-		"provider": canonical_provider,
+		"provider": canonical_prov,
 		"external_entity_type": map_entity_type,
 		"external_id": row_doc.source_record_id,
 		"active": 1,
@@ -163,7 +171,7 @@ def import_validated_entity(row_name: str) -> Dict[str, Any]:
 		mapping_doc = frappe.get_doc({
 			"doctype": "External ID Mapping",
 			"sales_channel": channel_id,
-			"provider": canonical_provider,
+			"provider": canonical_prov,
 			"external_entity_type": map_entity_type,
 			"external_id": row_doc.source_record_id,
 			"erp_doctype": target_doc.doctype,
