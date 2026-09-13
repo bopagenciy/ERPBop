@@ -77,7 +77,7 @@ def stage_source_record(
 	payload_hash = compute_payload_hash(source_record)
 	payload_json = json.dumps(source_record, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
-	# Check for existing record within this run or prior runs for the same identity
+	# Check for existing record within this run
 	existing = frappe.db.get_value(
 		"Migration Staging Row",
 		{"migration_run": run_id, "staging_identity_key": identity_key},
@@ -87,27 +87,36 @@ def stage_source_record(
 
 	if existing:
 		if existing.source_payload_hash == payload_hash:
-			# Replay convergence: identical payload, return existing document without mutating
+			# Replay convergence within same run: identical payload, return existing document without mutating
 			doc = frappe.get_doc("Migration Staging Row", existing.name)
 			return doc, False
 		else:
-			# Drift detected on replay
+			# Drift detected on replay within same run
 			raise SourcePayloadDriftError(
-				f"Source payload drift detected for {entity_type} '{rec_id}' (identity {identity_key[:12]}). "
+				f"Source payload drift detected on replay within run for {entity_type} '{rec_id}' (identity {identity_key[:12]}). "
 				f"Expected hash {existing.source_payload_hash[:12]}..., got {payload_hash[:12]}..."
 			)
 
-	# Cross-run drift check: if an earlier run staged this same identity, ensure no silent mutation
-	prior_runs = frappe.db.get_value(
-		"Migration Staging Row",
-		{"staging_identity_key": identity_key},
-		["name", "source_payload_hash", "migration_run"],
+	# Cross-run snapshot comparison: find the latest prior snapshot row for this identity across previous runs
+	prior_snapshot = frappe.db.sql(
+		"""
+		SELECT name, source_payload_hash, creation
+		FROM `tabMigration Staging Row`
+		WHERE staging_identity_key = %s AND migration_run != %s
+		ORDER BY creation DESC, name DESC
+		LIMIT 1
+		""",
+		(identity_key, run_id),
 		as_dict=True,
 	)
-	if prior_runs and prior_runs.source_payload_hash != payload_hash:
-		# Historical drift between runs is detected
-		# We still allow staging in the new run, but record the prior drift
-		pass
+
+	if prior_snapshot:
+		if prior_snapshot[0].source_payload_hash == payload_hash:
+			snapshot_state = "UNCHANGED"
+		else:
+			snapshot_state = "CHANGED"
+	else:
+		snapshot_state = "NEW"
 
 	row_doc = frappe.get_doc({
 		"doctype": "Migration Staging Row",
@@ -116,6 +125,7 @@ def stage_source_record(
 		"source_record_id": rec_id,
 		"source_parent_id": source_parent_id,
 		"staging_identity_key": identity_key,
+		"snapshot_state": snapshot_state,
 		"source_payload_hash": payload_hash,
 		"source_payload_json": payload_json,
 		"validation_status": "PENDING",

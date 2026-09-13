@@ -11,16 +11,22 @@ from bop_erp.constants import ExternalEntityType
 from bop_erp.migration.exceptions import ImportBoundaryError
 
 
-def get_or_create_migration_channel(company: str, source_system: str) -> str:
+def get_or_create_migration_channel(
+	company: str,
+	source_system: str,
+	source_instance_id: Optional[str] = None,
+) -> str:
 	"""
-	Ensures a persistent Sales Channel exists for scoping migration External ID Mappings.
+	Ensures a persistent Sales Channel exists for scoping migration External ID Mappings,
+	uniquely keyed by source_system and source_instance_id.
 	"""
-	channel_id = f"MIG-{str(source_system).strip().upper()}"
+	inst = str(source_instance_id or "DEFAULT").strip().upper()
+	channel_id = f"MIG-{str(source_system).strip().upper()}-{inst}"
 	if not frappe.db.exists("Sales Channel", channel_id):
 		ch = frappe.get_doc({
 			"doctype": "Sales Channel",
 			"channel_id": channel_id,
-			"channel_name": f"{source_system} Migration Channel",
+			"channel_name": f"{source_system} ({inst}) Migration Channel",
 			"channel_type": "INTERNAL",
 			"company": company,
 			"active": 1,
@@ -33,7 +39,8 @@ def import_validated_entity(row_name: str) -> Dict[str, Any]:
 	"""
 	Strictly controlled import boundary.
 	Only rows from a Migration Run in READY or IMPORTING status,
-	with validation_status in ('VALID', 'WARNING'), can become target ERP documents.
+	with validation_status == 'VALID', can become target ERP documents.
+	Rows with WARNING or ERROR are strictly blocked from automated import.
 	Direct adapter -> target ERP calls are strictly prohibited.
 	"""
 	row_doc = frappe.get_doc("Migration Staging Row", row_name)
@@ -46,11 +53,13 @@ def import_validated_entity(row_name: str) -> Dict[str, Any]:
 			"Import is only permitted on runs in 'READY' or 'IMPORTING' status."
 		)
 
-	# Invariant gate 2: Staging row validation status must not be ERROR
-	if row_doc.validation_status == "ERROR":
+	# Invariant gate 2: Staging row validation status must be strictly VALID
+	if row_doc.validation_status != "VALID":
 		raise ImportBoundaryError(
-			f"Cannot import row '{row_doc.name}' because its validation_status is 'ERROR'. "
-			f"Errors: {row_doc.validation_errors_json}"
+			f"Cannot import row '{row_doc.name}' because its validation_status is '{row_doc.validation_status}'. "
+			"Only rows with validation_status 'VALID' are eligible for automated import; "
+			"rows with 'WARNING' or 'ERROR' are strictly blocked from auto-import and require review. "
+			f"Errors/Warnings: {row_doc.validation_errors_json or row_doc.validation_warnings_json}"
 		)
 
 	if row_doc.import_status == "IMPORTED":
@@ -66,7 +75,7 @@ def import_validated_entity(row_name: str) -> Dict[str, Any]:
 	candidate = json.loads(row_doc.normalized_payload_json)
 	e_type = row_doc.entity_type
 	target_doc = None
-	channel_id = get_or_create_migration_channel(run_doc.company, run_doc.source_system)
+	channel_id = get_or_create_migration_channel(run_doc.company, run_doc.source_system, run_doc.source_instance_id)
 
 	# Entity Creation / Target Document Mapping
 	if e_type == "CUSTOMER":
@@ -142,9 +151,10 @@ def import_validated_entity(row_name: str) -> Dict[str, Any]:
 		raise ImportBoundaryError(f"Unsupported entity type '{e_type}' at import boundary.")
 
 	# Canonical External ID Mapping
+	canonical_provider = f"{run_doc.source_system.strip().upper()}:{str(run_doc.source_instance_id or 'DEFAULT').strip()}"
 	map_filters = {
 		"sales_channel": channel_id,
-		"provider": run_doc.source_system,
+		"provider": canonical_provider,
 		"external_entity_type": map_entity_type,
 		"external_id": row_doc.source_record_id,
 		"active": 1,
@@ -153,7 +163,7 @@ def import_validated_entity(row_name: str) -> Dict[str, Any]:
 		mapping_doc = frappe.get_doc({
 			"doctype": "External ID Mapping",
 			"sales_channel": channel_id,
-			"provider": run_doc.source_system,
+			"provider": canonical_provider,
 			"external_entity_type": map_entity_type,
 			"external_id": row_doc.source_record_id,
 			"erp_doctype": target_doc.doctype,

@@ -12,6 +12,7 @@
   "source_parent_id",
   "staging_identity_key",
   "column_break_1",
+  "snapshot_state",
   "validation_status",
   "import_status",
   "target_doctype",
@@ -68,6 +69,16 @@
   {
    "fieldname": "column_break_1",
    "fieldtype": "Column Break"
+  },
+  {
+   "default": "NEW",
+   "fieldname": "snapshot_state",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Snapshot State",
+   "options": "NEW\nUNCHANGED\nCHANGED",
+   "reqd": 1
   },
   {
    "default": "PENDING",

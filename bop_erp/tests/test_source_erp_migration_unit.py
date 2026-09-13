@@ -433,3 +433,187 @@ class TestSourceERPMigrationUnit(FrappeTestCase):
 
 		with self.assertRaises(SourceSafetyViolationError):
 			assert_safe_source_target("http://api.theindustrialdepot.com:443/v1")
+
+	# 25. Write-Capable CTE Safety Proof
+	def test_25_write_capable_cte_safety(self):
+		# CTE with DELETE RETURNING
+		with self.assertRaises(SourceWriteBlockedError):
+			assert_read_only_sql("WITH del AS (DELETE FROM p21_customer RETURNING *) SELECT * FROM del")
+
+		# CTE with UPDATE RETURNING
+		with self.assertRaises(SourceWriteBlockedError):
+			assert_read_only_sql("WITH upd AS (UPDATE items SET price = 0 RETURNING *) SELECT * FROM upd")
+
+		# CTE with INSERT RETURNING
+		with self.assertRaises(SourceWriteBlockedError):
+			assert_read_only_sql("WITH ins AS (INSERT INTO vendors (name) VALUES ('x') RETURNING *) SELECT * FROM ins")
+
+		# Safe CTE with pure SELECT
+		assert_read_only_sql("WITH safe_cte AS (SELECT id, name FROM items WHERE active = 1) SELECT * FROM safe_cte")
+
+	# 26. Source Instance Identity in External ID Mapping
+	def test_26_source_instance_external_id_mapping(self):
+		from bop_erp.bop_erp.doctype.external_id_mapping.external_id_mapping import compute_active_external_key
+		from bop_erp.migration.import_boundary import get_or_create_migration_channel
+
+		ch_a = get_or_create_migration_channel(self.company, "PROPHET_21", "client-A")
+		ch_b = get_or_create_migration_channel(self.company, "PROPHET_21", "client-B")
+		self.assertNotEqual(ch_a, ch_b)
+
+		prov_a = "PROPHET_21:client-A"
+		prov_b = "PROPHET_21:client-B"
+
+		key_a = compute_active_external_key(ch_a, ExternalEntityType.CUSTOMER, "123", provider=prov_a)
+		key_b = compute_active_external_key(ch_b, ExternalEntityType.CUSTOMER, "123", provider=prov_b)
+		self.assertNotEqual(key_a, key_b, "Mappings for client-A and client-B on same external ID must not collide!")
+
+	# 27. Import Boundary VALID-Only Policy
+	def test_27_import_boundary_valid_only(self):
+		run = frappe.get_doc({
+			"doctype": "Migration Run",
+			"run_id": f"TEST-VAL-ONLY-{frappe.generate_hash(length=6)}",
+			"source_system": "SYNTHETIC",
+			"source_instance_id": "INST_TEST",
+			"company": self.company,
+			"status": "READY",
+		}).insert(ignore_permissions=True)
+
+		# WARNING row cannot be imported
+		row_warn = frappe.get_doc({
+			"doctype": "Migration Staging Row",
+			"migration_run": run.name,
+			"entity_type": "CUSTOMER",
+			"source_record_id": "C-WARN-01",
+			"staging_identity_key": "1" * 64,
+			"source_payload_hash": "2" * 64,
+			"source_payload_json": json.dumps({"id": "C-WARN-01"}),
+			"normalized_payload_json": json.dumps({"customer_name": "Warn Cust", "company": self.company}),
+			"validation_status": "WARNING",
+			"validation_warnings_json": json.dumps(["Minor warning"]),
+			"import_status": "PENDING",
+		}).insert(ignore_permissions=True)
+
+		with self.assertRaises(ImportBoundaryError) as cm_warn:
+			import_validated_entity(row_warn.name)
+		self.assertIn("WARNING", str(cm_warn.exception))
+
+		# ERROR row cannot be imported
+		row_err = frappe.get_doc({
+			"doctype": "Migration Staging Row",
+			"migration_run": run.name,
+			"entity_type": "CUSTOMER",
+			"source_record_id": "C-ERR-01",
+			"staging_identity_key": "3" * 64,
+			"source_payload_hash": "4" * 64,
+			"source_payload_json": json.dumps({"id": "C-ERR-01"}),
+			"normalized_payload_json": json.dumps({"customer_name": "Err Cust", "company": self.company}),
+			"validation_status": "ERROR",
+			"validation_errors_json": json.dumps(["Fatal error"]),
+			"import_status": "PENDING",
+		}).insert(ignore_permissions=True)
+
+		with self.assertRaises(ImportBoundaryError) as cm_err:
+			import_validated_entity(row_err.name)
+		self.assertIn("ERROR", str(cm_err.exception))
+
+		# Cleanup
+		frappe.db.delete("Migration Staging Row", {"migration_run": run.name})
+		frappe.delete_doc("Migration Run", run.name, force=True, ignore_permissions=True)
+
+	# 28. Cross-Run Immutable Snapshot Semantics & Drift Classification
+	def test_28_cross_run_snapshot_semantics_and_drift(self):
+		run1 = frappe.get_doc({
+			"doctype": "Migration Run",
+			"run_id": f"TEST-SNAP1-{frappe.generate_hash(length=6)}",
+			"source_system": "SYNTHETIC",
+			"source_instance_id": "SNAP_INST",
+			"company": self.company,
+			"status": "DRAFT",
+		}).insert(ignore_permissions=True)
+
+		run2 = frappe.get_doc({
+			"doctype": "Migration Run",
+			"run_id": f"TEST-SNAP2-{frappe.generate_hash(length=6)}",
+			"source_system": "SYNTHETIC",
+			"source_instance_id": "SNAP_INST",
+			"company": self.company,
+			"status": "DRAFT",
+		}).insert(ignore_permissions=True)
+
+		run3 = frappe.get_doc({
+			"doctype": "Migration Run",
+			"run_id": f"TEST-SNAP3-{frappe.generate_hash(length=6)}",
+			"source_system": "SYNTHETIC",
+			"source_instance_id": "SNAP_INST",
+			"company": self.company,
+			"status": "DRAFT",
+		}).insert(ignore_permissions=True)
+
+		payload_v1 = {"id": "REC-SNAP-01", "name": "Version 1"}
+		payload_v2 = {"id": "REC-SNAP-01", "name": "Version 2"}
+
+		# Run 1: initial stage -> NEW
+		row1, is_new1 = stage_source_record(
+			run_id=run1.name,
+			source_system=run1.source_system,
+			source_instance_id=run1.source_instance_id,
+			entity_type="CUSTOMER",
+			source_record=payload_v1,
+		)
+		self.assertTrue(is_new1)
+		self.assertEqual(row1.snapshot_state, "NEW")
+
+		# Intra-run replay convergence in Run 1
+		row1_replay, is_new_replay = stage_source_record(
+			run_id=run1.name,
+			source_system=run1.source_system,
+			source_instance_id=run1.source_instance_id,
+			entity_type="CUSTOMER",
+			source_record=payload_v1,
+		)
+		self.assertFalse(is_new_replay)
+		self.assertEqual(row1_replay.name, row1.name)
+
+		# Intra-run payload drift in Run 1 -> raises SourcePayloadDriftError
+		with self.assertRaises(SourcePayloadDriftError):
+			stage_source_record(
+				run_id=run1.name,
+				source_system=run1.source_system,
+				source_instance_id=run1.source_instance_id,
+				entity_type="CUSTOMER",
+				source_record=payload_v2,
+			)
+
+		# Run 2: identical payload across different run -> UNCHANGED, new row, does not mutate Run 1
+		row2, is_new2 = stage_source_record(
+			run_id=run2.name,
+			source_system=run2.source_system,
+			source_instance_id=run2.source_instance_id,
+			entity_type="CUSTOMER",
+			source_record=payload_v1,
+		)
+		self.assertTrue(is_new2)
+		self.assertNotEqual(row2.name, row1.name)
+		self.assertEqual(row2.snapshot_state, "UNCHANGED")
+
+		# Run 3: modified payload across different run -> CHANGED, new row, does not mutate Run 1 or Run 2
+		row3, is_new3 = stage_source_record(
+			run_id=run3.name,
+			source_system=run3.source_system,
+			source_instance_id=run3.source_instance_id,
+			entity_type="CUSTOMER",
+			source_record=payload_v2,
+		)
+		self.assertTrue(is_new3)
+		self.assertNotEqual(row3.name, row2.name)
+		self.assertEqual(row3.snapshot_state, "CHANGED")
+
+		# Reconciliation surfaces snapshot states
+		rep3 = reconcile_migration_run(run3.name)
+		self.assertEqual(rep3["by_entity_type"]["CUSTOMER"]["changed_count"], 1)
+		self.assertEqual(rep3["discrepancies"]["changed_entities"], 1)
+
+		# Cleanup
+		for r in (run1.name, run2.name, run3.name):
+			frappe.db.delete("Migration Staging Row", {"migration_run": r})
+			frappe.delete_doc("Migration Run", r, force=True, ignore_permissions=True)

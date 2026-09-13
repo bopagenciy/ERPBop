@@ -72,6 +72,7 @@ class TestSourceERPMigrationLive(FrappeTestCase):
 
 	def setUp(self):
 		super().setUp()
+		self._test_runs = []
 		self.adapter = SyntheticSourceAdapter(
 			source_system=f"{self.FIXTURE_PREFIX}SYN",
 			source_instance_id="MAIN",
@@ -286,3 +287,179 @@ class TestSourceERPMigrationLive(FrappeTestCase):
 		residual_run = frappe.db.count("Migration Run", {"name": run.name})
 		self.assertEqual(residual_rows, 0, "Residual staging rows leaked!")
 		self.assertEqual(residual_run, 0, "Residual migration run leaked!")
+
+	# Scenario K: Source Instance isolation in External ID Mapping
+	def test_k_source_instance_mapping_isolation(self):
+		run_a = frappe.get_doc({
+			"doctype": "Migration Run",
+			"run_id": f"{self.FIXTURE_PREFIX}INST-A-{frappe.generate_hash(length=6)}",
+			"source_system": "PROPHET_21",
+			"source_instance_id": "client-A",
+			"company": self.company,
+			"status": "DRAFT",
+		}).insert(ignore_permissions=True)
+		self._test_runs.append(run_a.name)
+		frappe.db.set_value("Migration Run", run_a.name, "status", "READY")
+		run_a.reload()
+
+		run_b = frappe.get_doc({
+			"doctype": "Migration Run",
+			"run_id": f"{self.FIXTURE_PREFIX}INST-B-{frappe.generate_hash(length=6)}",
+			"source_system": "PROPHET_21",
+			"source_instance_id": "client-B",
+			"company": self.company,
+			"status": "DRAFT",
+		}).insert(ignore_permissions=True)
+		self._test_runs.append(run_b.name)
+		frappe.db.set_value("Migration Run", run_b.name, "status", "READY")
+		run_b.reload()
+
+		cust_payload = {"id": "123", "name": f"{self.FIXTURE_PREFIX}Cust-123"}
+		row_a, _ = stage_source_record(
+			run_id=run_a.name,
+			source_system=run_a.source_system,
+			source_instance_id=run_a.source_instance_id,
+			entity_type="CUSTOMER",
+			source_record=cust_payload,
+		)
+		row_a.normalized_payload_json = json.dumps({
+			"customer_name": f"{self.FIXTURE_PREFIX}Client A Customer",
+			"company": self.company,
+		})
+		row_a.validation_status = "VALID"
+		row_a.save(ignore_permissions=True)
+
+		row_b, _ = stage_source_record(
+			run_id=run_b.name,
+			source_system=run_b.source_system,
+			source_instance_id=run_b.source_instance_id,
+			entity_type="CUSTOMER",
+			source_record=cust_payload,
+		)
+		row_b.normalized_payload_json = json.dumps({
+			"customer_name": f"{self.FIXTURE_PREFIX}Client B Customer",
+			"company": self.company,
+		})
+		row_b.validation_status = "VALID"
+		row_b.save(ignore_permissions=True)
+
+		# Import both records
+		res_a = import_validated_entity(row_a.name)
+		res_b = import_validated_entity(row_b.name)
+
+		self.assertEqual(res_a["status"], "IMPORTED")
+		self.assertEqual(res_b["status"], "IMPORTED")
+
+		# Check External ID Mapping: both exist without collision
+		mappings = frappe.get_all(
+			"External ID Mapping",
+			filters={"external_id": "123", "external_entity_type": ExternalEntityType.CUSTOMER},
+			fields=["name", "sales_channel", "provider", "erp_document"],
+		)
+		test_mappings = [m for m in mappings if "client-a" in (m.provider or "").lower() or "client-b" in (m.provider or "").lower()]
+		self.assertEqual(len(test_mappings), 2)
+		providers = {m.provider for m in test_mappings}
+		self.assertEqual(providers, {"PROPHET_21:CLIENT-A", "PROPHET_21:CLIENT-B"})
+
+		# Clean created target customers and mappings
+		for m in test_mappings:
+			frappe.db.delete("External ID Mapping", {"name": m.name})
+			if frappe.db.exists("Customer", m.erp_document):
+				frappe.delete_doc("Customer", m.erp_document, force=True, ignore_permissions=True)
+
+	# Scenario L: Import boundary blocks WARNING and ERROR
+	def test_l_import_boundary_blocks_warning_and_error(self):
+		run = self._create_test_run("WARN-ERR-L")
+		frappe.db.set_value("Migration Run", run.name, "status", "READY")
+		run.reload()
+
+		# Row with WARNING
+		row_w = frappe.get_doc({
+			"doctype": "Migration Staging Row",
+			"migration_run": run.name,
+			"entity_type": "CUSTOMER",
+			"source_record_id": "WARN-1",
+			"staging_identity_key": "w" * 64,
+			"source_payload_hash": "w" * 64,
+			"source_payload_json": json.dumps({"id": "WARN-1"}),
+			"normalized_payload_json": json.dumps({"customer_name": "Warn Cust", "company": self.company}),
+			"validation_status": "WARNING",
+			"validation_warnings_json": json.dumps(["Warning reason"]),
+			"import_status": "PENDING",
+		}).insert(ignore_permissions=True)
+
+		with self.assertRaises(ImportBoundaryError):
+			import_validated_entity(row_w.name)
+
+		# Row with ERROR
+		row_e = frappe.get_doc({
+			"doctype": "Migration Staging Row",
+			"migration_run": run.name,
+			"entity_type": "CUSTOMER",
+			"source_record_id": "ERR-1",
+			"staging_identity_key": "e" * 64,
+			"source_payload_hash": "e" * 64,
+			"source_payload_json": json.dumps({"id": "ERR-1"}),
+			"normalized_payload_json": json.dumps({"customer_name": "Err Cust", "company": self.company}),
+			"validation_status": "ERROR",
+			"validation_errors_json": json.dumps(["Error reason"]),
+			"import_status": "PENDING",
+		}).insert(ignore_permissions=True)
+
+		with self.assertRaises(ImportBoundaryError):
+			import_validated_entity(row_e.name)
+
+	# Scenario M: Cross-run immutable snapshot semantics and drift classification
+	def test_m_cross_run_snapshot_immutability_and_drift(self):
+		run1 = self._create_test_run("RUN1-M")
+		run2 = self._create_test_run("RUN2-M")
+		run3 = self._create_test_run("RUN3-M")
+
+		raw_v1 = {"id": "ITEM-SNAP-99", "name": "Item Original", "sku": "SKU-99"}
+		raw_v2 = {"id": "ITEM-SNAP-99", "name": "Item Modified", "sku": "SKU-99"}
+
+		# Run 1: stage v1
+		row1, is_new1 = stage_source_record(
+			run_id=run1.name,
+			source_system=run1.source_system,
+			source_instance_id=run1.source_instance_id,
+			entity_type="ITEM",
+			source_record=raw_v1,
+		)
+		self.assertTrue(is_new1)
+		self.assertEqual(row1.snapshot_state, "NEW")
+
+		# Run 2: stage same v1
+		row2, is_new2 = stage_source_record(
+			run_id=run2.name,
+			source_system=run2.source_system,
+			source_instance_id=run2.source_instance_id,
+			entity_type="ITEM",
+			source_record=raw_v1,
+		)
+		self.assertTrue(is_new2)
+		self.assertEqual(row2.snapshot_state, "UNCHANGED")
+		# Verify Run 1 row was NOT mutated
+		row1_fresh = frappe.get_doc("Migration Staging Row", row1.name)
+		self.assertEqual(row1_fresh.source_payload_hash, row1.source_payload_hash)
+		self.assertEqual(row1_fresh.snapshot_state, "NEW")
+
+		# Run 3: stage changed v2
+		row3, is_new3 = stage_source_record(
+			run_id=run3.name,
+			source_system=run3.source_system,
+			source_instance_id=run3.source_instance_id,
+			entity_type="ITEM",
+			source_record=raw_v2,
+		)
+		self.assertTrue(is_new3)
+		self.assertEqual(row3.snapshot_state, "CHANGED")
+		# Verify Run 1 and Run 2 rows were NOT mutated
+		row2_fresh = frappe.get_doc("Migration Staging Row", row2.name)
+		self.assertEqual(row2_fresh.source_payload_hash, row2.source_payload_hash)
+		self.assertEqual(row2_fresh.snapshot_state, "UNCHANGED")
+
+		# Reconcile Run 3
+		rep = reconcile_migration_run(run3.name)
+		self.assertEqual(rep["by_entity_type"]["ITEM"]["changed_count"], 1)
+		self.assertEqual(rep["discrepancies"]["changed_entities"], 1)
