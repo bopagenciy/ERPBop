@@ -213,10 +213,18 @@ class TestExternalRefundLive(unittest.TestCase):
 			or frappe.db.get_value("Account", {"company": cls.company, "account_type": "Stock Adjustment", "is_group": 0, "disabled": 0}, "name")
 		)
 
-		# Snapshot baselines for stock
+		# Snapshot baselines for stock and reservations
 		cls.baseline_stock = {
 			cls.item_code: flt(frappe.db.get_value("Bin", {"item_code": cls.item_code, "warehouse": cls.warehouse}, "actual_qty") or 0.0),
 			cls.item_code_2: flt(frappe.db.get_value("Bin", {"item_code": cls.item_code_2, "warehouse": cls.warehouse}, "actual_qty") or 0.0),
+		}
+		cls.baseline_reserved_stock = {
+			cls.item_code: flt(frappe.db.get_value("Bin", {"item_code": cls.item_code, "warehouse": cls.warehouse}, "reserved_stock") or 0.0),
+			cls.item_code_2: flt(frappe.db.get_value("Bin", {"item_code": cls.item_code_2, "warehouse": cls.warehouse}, "reserved_stock") or 0.0),
+		}
+		cls.baseline_reserved_qty = {
+			cls.item_code: flt(frappe.db.get_value("Bin", {"item_code": cls.item_code, "warehouse": cls.warehouse}, "reserved_qty") or 0.0),
+			cls.item_code_2: flt(frappe.db.get_value("Bin", {"item_code": cls.item_code_2, "warehouse": cls.warehouse}, "reserved_qty") or 0.0),
 		}
 		cls.baseline_stock_reconciliations = set(frappe.get_all("Stock Reconciliation", pluck="name"))
 
@@ -379,8 +387,15 @@ class TestExternalRefundLive(unittest.TestCase):
 			pluck="name",
 		)
 		for sre_name in sres:
-			frappe.db.set_value("Stock Reservation Entry", sre_name, "docstatus", 2)
-			frappe.delete_doc("Stock Reservation Entry", sre_name, force=True, ignore_permissions=True)
+			if frappe.db.exists("Stock Reservation Entry", sre_name):
+				try:
+					sre_doc = frappe.get_doc("Stock Reservation Entry", sre_name)
+					if sre_doc.docstatus == 1:
+						sre_doc.flags.ignore_permissions = True
+						sre_doc.cancel()
+				except Exception:
+					frappe.db.set_value("Stock Reservation Entry", sre_name, "docstatus", 2)
+				frappe.delete_doc("Stock Reservation Entry", sre_name, force=True, ignore_permissions=True)
 
 		frappe.db.sql(
 			"""
@@ -403,12 +418,18 @@ class TestExternalRefundLive(unittest.TestCase):
 			frappe.delete_doc("Account", bank_acc, force=True, ignore_permissions=True)
 
 		# 10. Clean Bins, Items, Warehouses
-		for ic in [f"{cls.FIXTURE_PREFIX}ITEM-01", f"{cls.FIXTURE_PREFIX}ITEM-02"]:
+		wh = f"{cls.FIXTURE_PREFIX}WH-{abbr} - {abbr}"
+		test_items = [f"{cls.FIXTURE_PREFIX}ITEM-01", f"{cls.FIXTURE_PREFIX}ITEM-02"]
+
+		# Purge SLEs for synthetic module fixtures so warehouse and item can be deleted cleanly
+		frappe.db.delete("Stock Ledger Entry", {"warehouse": wh})
+		frappe.db.delete("Stock Ledger Entry", {"item_code": ["in", test_items]})
+
+		for ic in test_items:
 			frappe.db.delete("Bin", {"item_code": ic})
 			if frappe.db.exists("Item", ic):
 				frappe.delete_doc("Item", ic, force=True, ignore_permissions=True)
 
-		wh = f"{cls.FIXTURE_PREFIX}WH-{abbr} - {abbr}"
 		if frappe.db.exists("Warehouse", wh):
 			frappe.delete_doc("Warehouse", wh, force=True, ignore_permissions=True)
 
@@ -423,6 +444,13 @@ class TestExternalRefundLive(unittest.TestCase):
 
 	def tearDown(self):
 		self._cleanup_test_docs()
+		for itm in [self.item_code, self.item_code_2]:
+			actual = flt(frappe.db.get_value("Bin", {"item_code": itm, "warehouse": self.warehouse}, "actual_qty") or 0.0)
+			res_stock = flt(frappe.db.get_value("Bin", {"item_code": itm, "warehouse": self.warehouse}, "reserved_stock") or 0.0)
+			res_qty = flt(frappe.db.get_value("Bin", {"item_code": itm, "warehouse": self.warehouse}, "reserved_qty") or 0.0)
+			self.assertEqual(actual, self.baseline_stock[itm])
+			self.assertEqual(res_stock, self.baseline_reserved_stock[itm])
+			self.assertEqual(res_qty, self.baseline_reserved_qty[itm])
 		super().tearDown()
 
 	def _seed_stock(self, item_code: str, target_qty: float):
@@ -434,6 +462,9 @@ class TestExternalRefundLive(unittest.TestCase):
 				"company": self.company,
 				"purpose": "Opening Stock",
 				"expense_account": self.opening_diff_account,
+				"set_posting_time": 1,
+				"posting_date": nowdate(),
+				"posting_time": "00:00:01",
 				"items": [{
 					"item_code": item_code,
 					"warehouse": self.warehouse,
@@ -501,7 +532,6 @@ class TestExternalRefundLive(unittest.TestCase):
 					si.cancel()
 				frappe.delete_doc("Sales Invoice", s_name, force=True, ignore_permissions=True)
 				frappe.db.delete("GL Entry", {"voucher_no": s_name})
-				frappe.db.delete("Stock Ledger Entry", {"voucher_no": s_name})
 
 		# Clean Delivery Notes
 		dn_names = frappe.db.sql(
@@ -524,7 +554,34 @@ class TestExternalRefundLive(unittest.TestCase):
 					dn.cancel()
 				frappe.delete_doc("Delivery Note", d_name, force=True, ignore_permissions=True)
 				frappe.db.delete("GL Entry", {"voucher_no": d_name})
-				frappe.db.delete("Stock Ledger Entry", {"voucher_no": d_name})
+
+		# Clean SREs and IRRs natively before Sales Orders
+		sres = frappe.db.sql(
+			"""
+			SELECT name FROM `tabStock Reservation Entry`
+			WHERE item_code LIKE %s
+			""",
+			(f"{self.FIXTURE_PREFIX}%",),
+			pluck="name",
+		)
+		for sre_name in sres:
+			if frappe.db.exists("Stock Reservation Entry", sre_name):
+				try:
+					sre_doc = frappe.get_doc("Stock Reservation Entry", sre_name)
+					if sre_doc.docstatus == 1:
+						sre_doc.flags.ignore_permissions = True
+						sre_doc.cancel()
+				except Exception:
+					frappe.db.set_value("Stock Reservation Entry", sre_name, "docstatus", 2)
+				frappe.delete_doc("Stock Reservation Entry", sre_name, force=True, ignore_permissions=True)
+
+		frappe.db.sql(
+			"""
+			DELETE FROM `tabInventory Reservation Reference`
+			WHERE item_code LIKE %s
+			""",
+			(f"{self.FIXTURE_PREFIX}%",),
+		)
 
 		# Clean Sales Orders
 		so_names = frappe.db.sql(
@@ -542,29 +599,9 @@ class TestExternalRefundLive(unittest.TestCase):
 			if frappe.db.exists("Sales Order", so_name):
 				so = frappe.get_doc("Sales Order", so_name)
 				if so.docstatus == 1:
+					so.flags.ignore_permissions = True
 					so.cancel()
 				frappe.delete_doc("Sales Order", so_name, force=True, ignore_permissions=True)
-
-		# Clean SREs and IRRs
-		sres = frappe.db.sql(
-			"""
-			SELECT name FROM `tabStock Reservation Entry`
-			WHERE item_code LIKE %s
-			""",
-			(f"{self.FIXTURE_PREFIX}%",),
-			pluck="name",
-		)
-		for sre_name in sres:
-			frappe.db.set_value("Stock Reservation Entry", sre_name, "docstatus", 2)
-			frappe.delete_doc("Stock Reservation Entry", sre_name, force=True, ignore_permissions=True)
-
-		frappe.db.sql(
-			"""
-			DELETE FROM `tabInventory Reservation Reference`
-			WHERE item_code LIKE %s
-			""",
-			(f"{self.FIXTURE_PREFIX}%",),
-		)
 
 		# Clean Stock Reconciliations
 		sr_names = frappe.db.sql(
@@ -582,7 +619,6 @@ class TestExternalRefundLive(unittest.TestCase):
 					sr.cancel()
 				frappe.delete_doc("Stock Reconciliation", sr_name, force=True, ignore_permissions=True)
 				frappe.db.delete("GL Entry", {"voucher_no": sr_name})
-				frappe.db.delete("Stock Ledger Entry", {"voucher_no": sr_name})
 
 		# Clean refund mappings
 		for ch in [f"{self.FIXTURE_PREFIX}CH-A", f"{self.FIXTURE_PREFIX}CH-B"]:
