@@ -1,0 +1,220 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "format:MRUN-{YYYY}-{MM}-{#####}",
+ "creation": "2026-09-13 17:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "run_id",
+  "source_system",
+  "source_instance_id",
+  "company",
+  "status",
+  "dry_run",
+  "column_break_1",
+  "started_at",
+  "completed_at",
+  "snapshot_at",
+  "source_watermark",
+  "source_schema_version",
+  "source_checksum",
+  "normalization_version",
+  "section_break_counts",
+  "total_rows",
+  "valid_rows",
+  "warning_rows",
+  "column_break_counts",
+  "error_rows",
+  "imported_rows",
+  "skipped_rows",
+  "section_break_audit",
+  "created_by_user",
+  "notes"
+ ],
+ "fields": [
+  {
+   "fieldname": "run_id",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Run ID",
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "source_system",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Source System",
+   "reqd": 1
+  },
+  {
+   "default": "DEFAULT",
+   "fieldname": "source_instance_id",
+   "fieldtype": "Data",
+   "label": "Source Instance ID",
+   "reqd": 1
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Company",
+   "options": "Company",
+   "reqd": 1
+  },
+  {
+   "default": "DRAFT",
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Status",
+   "options": "DRAFT\nEXTRACTING\nSTAGED\nVALIDATING\nREADY\nIMPORTING\nRECONCILING\nCOMPLETED\nFAILED\nREVIEW_REQUIRED\nCANCELLED",
+   "reqd": 1
+  },
+  {
+   "default": "1",
+   "fieldname": "dry_run",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "label": "Dry Run"
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "started_at",
+   "fieldtype": "Datetime",
+   "label": "Started At"
+  },
+  {
+   "fieldname": "completed_at",
+   "fieldtype": "Datetime",
+   "label": "Completed At"
+  },
+  {
+   "fieldname": "snapshot_at",
+   "fieldtype": "Datetime",
+   "label": "Snapshot At"
+  },
+  {
+   "fieldname": "source_watermark",
+   "fieldtype": "Data",
+   "label": "Source Watermark"
+  },
+  {
+   "fieldname": "source_schema_version",
+   "fieldtype": "Data",
+   "label": "Source Schema Version"
+  },
+  {
+   "fieldname": "source_checksum",
+   "fieldtype": "Data",
+   "label": "Source Checksum"
+  },
+  {
+   "default": "1.0.0",
+   "fieldname": "normalization_version",
+   "fieldtype": "Data",
+   "label": "Normalization Version"
+  },
+  {
+   "fieldname": "section_break_counts",
+   "fieldtype": "Section Break",
+   "label": "Record Metrics"
+  },
+  {
+   "default": "0",
+   "fieldname": "total_rows",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Total Rows",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "valid_rows",
+   "fieldtype": "Int",
+   "label": "Valid Rows",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "warning_rows",
+   "fieldtype": "Int",
+   "label": "Warning Rows",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_counts",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "fieldname": "error_rows",
+   "fieldtype": "Int",
+   "label": "Error Rows",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "imported_rows",
+   "fieldtype": "Int",
+   "label": "Imported Rows",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "skipped_rows",
+   "fieldtype": "Int",
+   "label": "Skipped Rows",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_audit",
+   "fieldtype": "Section Break",
+   "label": "Audit & Notes"
+  },
+  {
+   "fieldname": "created_by_user",
+   "fieldtype": "Data",
+   "label": "Created By User"
+  },
+  {
+   "fieldname": "notes",
+   "fieldtype": "Long Text",
+   "label": "Notes"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-09-13 17:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "bop_erp",
+ "name": "Migration Run",
+ "naming_rule": "Expression",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

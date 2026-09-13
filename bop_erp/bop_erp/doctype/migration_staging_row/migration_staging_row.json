@@ -1,0 +1,180 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "hash",
+ "creation": "2026-09-13 17:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "migration_run",
+  "entity_type",
+  "source_record_id",
+  "source_parent_id",
+  "staging_identity_key",
+  "column_break_1",
+  "validation_status",
+  "import_status",
+  "target_doctype",
+  "target_name",
+  "section_break_payloads",
+  "source_payload_hash",
+  "normalized_payload_hash",
+  "column_break_hashes",
+  "source_payload_json",
+  "normalized_payload_json",
+  "section_break_validation",
+  "validation_errors_json",
+  "validation_warnings_json"
+ ],
+ "fields": [
+  {
+   "fieldname": "migration_run",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Migration Run",
+   "options": "Migration Run",
+   "reqd": 1
+  },
+  {
+   "fieldname": "entity_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Entity Type",
+   "options": "CUSTOMER\nVENDOR\nITEM\nWAREHOUSE",
+   "reqd": 1
+  },
+  {
+   "fieldname": "source_record_id",
+   "fieldtype": "Small Text",
+   "in_list_view": 1,
+   "label": "Source Record ID",
+   "reqd": 1
+  },
+  {
+   "fieldname": "source_parent_id",
+   "fieldtype": "Small Text",
+   "label": "Source Parent ID"
+  },
+  {
+   "fieldname": "staging_identity_key",
+   "fieldtype": "Data",
+   "label": "Staging Identity Key (SHA-256)",
+   "length": 64,
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "PENDING",
+   "fieldname": "validation_status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Validation Status",
+   "options": "PENDING\nVALID\nWARNING\nERROR",
+   "reqd": 1
+  },
+  {
+   "default": "PENDING",
+   "fieldname": "import_status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Import Status",
+   "options": "PENDING\nIMPORTED\nSKIPPED\nFAILED",
+   "reqd": 1
+  },
+  {
+   "fieldname": "target_doctype",
+   "fieldtype": "Link",
+   "label": "Target DocType",
+   "options": "DocType"
+  },
+  {
+   "fieldname": "target_name",
+   "fieldtype": "Data",
+   "label": "Target Name"
+  },
+  {
+   "fieldname": "section_break_payloads",
+   "fieldtype": "Section Break",
+   "label": "Payloads"
+  },
+  {
+   "fieldname": "source_payload_hash",
+   "fieldtype": "Data",
+   "label": "Source Payload Hash (SHA-256)",
+   "length": 64,
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "normalized_payload_hash",
+   "fieldtype": "Data",
+   "label": "Normalized Payload Hash (SHA-256)",
+   "length": 64,
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_hashes",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "source_payload_json",
+   "fieldtype": "Long Text",
+   "label": "Source Payload JSON",
+   "reqd": 1
+  },
+  {
+   "fieldname": "normalized_payload_json",
+   "fieldtype": "Long Text",
+   "label": "Normalized Payload JSON"
+  },
+  {
+   "fieldname": "section_break_validation",
+   "fieldtype": "Section Break",
+   "label": "Validation Results"
+  },
+  {
+   "fieldname": "validation_errors_json",
+   "fieldtype": "Long Text",
+   "label": "Validation Errors JSON"
+  },
+  {
+   "fieldname": "validation_warnings_json",
+   "fieldtype": "Long Text",
+   "label": "Validation Warnings JSON"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-09-13 17:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "bop_erp",
+ "name": "Migration Staging Row",
+ "naming_rule": "Random",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}
