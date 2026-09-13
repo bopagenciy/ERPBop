@@ -40,6 +40,16 @@ from bop_erp.migration.adapters.sql_executor import (
 	coerce_source_record,
 	coerce_source_value,
 )
+from bop_erp.migration.prophet21_readiness import (
+	Prophet21AccessMode,
+	Prophet21ConnectionConfig,
+	Prophet21ReadinessReport,
+	Prophet21ReadinessStatus,
+	SchemaSnapshot,
+	assess_prophet21_readiness,
+	audit_sql_account_privileges,
+	classify_data_volume,
+)
 from bop_erp.migration.import_boundary import import_validated_entity
 from bop_erp.migration.normalization import (
 	normalize_customer,
@@ -121,6 +131,14 @@ __all__ = [
 	"SourceTableMetadata",
 	"SourceSchemaMetadata",
 	"extract_entity_to_staging",
+	"Prophet21AccessMode",
+	"Prophet21ConnectionConfig",
+	"SchemaSnapshot",
+	"Prophet21ReadinessStatus",
+	"Prophet21ReadinessReport",
+	"assess_prophet21_readiness",
+	"audit_sql_account_privileges",
+	"classify_data_volume",
 	"ReadOnlySqlExecutor",
 	"SyntheticSqlExecutor",
 	"LogicalEntityMapping",
