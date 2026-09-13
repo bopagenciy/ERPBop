@@ -79,10 +79,16 @@ class TestInventoryMigrationLive(unittest.TestCase):
 			}
 		]
 
-		# Record pre-test baseline counts
-		sle_baseline = frappe.db.count("Stock Ledger Entry")
-		bin_baseline = frappe.db.count("Bin")
+		# Record pre-test baseline counts and states
+		baseline_sle_ids = set(frappe.get_all("Stock Ledger Entry", pluck="name"))
+		baseline_bin_qty = flt(frappe.db.get_value("Bin", {"item_code": self.item_code, "warehouse": self.warehouse}, "actual_qty") or 0.0)
 		price_baseline = frappe.db.count("Item Price")
+
+		# Ensure clean starting state for the smoke batch
+		for b in frappe.get_all("Inventory Migration Batch", filters={"batch_id": batch_id}, pluck="name"):
+			frappe.db.delete("Inventory Migration Row", {"batch": b})
+			frappe.delete_doc("Inventory Migration Batch", b, force=True, ignore_permissions=True)
+		frappe.db.commit()
 
 		# 1. Stage
 		batch_name = MigrationImporter.stage_batch(
@@ -101,17 +107,18 @@ class TestInventoryMigrationLive(unittest.TestCase):
 		self.assertEqual(val_res["error_rows"], 0)
 
 		# Confirm NO stock writes during dry run
-		self.assertEqual(frappe.db.count("Stock Ledger Entry") - sle_baseline, 0)
-		self.assertEqual(frappe.db.count("Bin") - bin_baseline, 0)
-		self.assertEqual(frappe.db.count("Stock Ledger Entry", {"item_code": self.item_code}), 0)
-		self.assertEqual(frappe.db.count("Bin", {"item_code": self.item_code}), 0)
+		current_sle_ids = set(frappe.get_all("Stock Ledger Entry", pluck="name"))
+		self.assertEqual(current_sle_ids, baseline_sle_ids, "No new Stock Ledger Entries should be created during validation")
+		current_bin_qty = flt(frappe.db.get_value("Bin", {"item_code": self.item_code, "warehouse": self.warehouse}, "actual_qty") or 0.0)
+		self.assertEqual(current_bin_qty, baseline_bin_qty, "Bin quantity must not change during validation")
+		self.assertEqual(frappe.db.count("Stock Ledger Entry", {"item_code": self.item_code, "is_cancelled": 0}), 0)
 
 		# 3. Preview
 		preview = MigrationPreview.get_reconciliation_preview(batch_name)
 		self.assertEqual(preview["total_opening_qty"], 150.0)
-		self.assertEqual(preview["total_current_qty"], 0.0)
-		self.assertEqual(preview["total_adjustment_delta"], 150.0)
-		self.assertEqual(preview["total_inventory_value"], 3750.0)
+		self.assertEqual(preview["total_current_qty"], baseline_bin_qty)
+		self.assertEqual(preview["total_adjustment_delta"], 150.0 - baseline_bin_qty)
+		self.assertEqual(preview["total_inventory_value"], (150.0 - baseline_bin_qty) * 25.0)
 
 		# 4. Explicit Apply
 		apply_res = MigrationExecutor.apply_batch(batch_name)
@@ -122,34 +129,55 @@ class TestInventoryMigrationLive(unittest.TestCase):
 		# 5. Verify live stock snapshot via InventoryService
 		snap = InventoryService.get_warehouse_inventory(self.item_code, self.warehouse)
 		self.assertEqual(snap.actual_qty, 150.0)
-		self.assertEqual(frappe.db.count("Stock Ledger Entry") - sle_baseline, 1)
-		self.assertEqual(frappe.db.count("Bin") - bin_baseline, 1)
-		self.assertEqual(frappe.db.count("Stock Ledger Entry", {"item_code": self.item_code}), 1)
-		self.assertEqual(frappe.db.count("Bin", {"item_code": self.item_code}), 1)
+		current_bin_qty = flt(frappe.db.get_value("Bin", {"item_code": self.item_code, "warehouse": self.warehouse}, "actual_qty") or 0.0)
+		self.assertEqual(current_bin_qty, 150.0)
+		self.assertEqual(frappe.db.count("Stock Ledger Entry", {"voucher_no": reco_name, "is_cancelled": 0}), 1)
 
 		# 6. Verify duplicate apply blocked
 		with self.assertRaises(frappe.ValidationError):
 			MigrationExecutor.apply_batch(batch_name)
 
-		# 7. Clean test teardown: Cancel and delete Stock Reconciliation to restore baseline
+		# 7. Clean test teardown: Cancel Stock Reconciliation natively
 		reco = frappe.get_doc("Stock Reconciliation", reco_name)
-		reco.cancel()
-		frappe.delete_doc("Stock Reconciliation", reco_name, force=True, ignore_permissions=True)
-
-		# Explicitly purge test ledger artifacts created during test run
-		frappe.db.delete("Stock Ledger Entry", {"voucher_no": reco_name})
-		frappe.db.delete("GL Entry", {"voucher_no": reco_name})
-		frappe.db.delete("Bin", {"item_code": self.item_code})
+		if reco.docstatus == 1:
+			reco.cancel()
 
 		# Delete staged batch and rows
 		frappe.db.delete("Inventory Migration Row", {"batch": batch_name})
 		frappe.delete_doc("Inventory Migration Batch", batch_name, force=True, ignore_permissions=True)
 		frappe.db.commit()
 
-		# 8. Assert safety invariance restored
-		self.assertEqual(frappe.db.count("Stock Ledger Entry") - sle_baseline, 0, "Stock Ledger Entries must restore to baseline")
-		self.assertEqual(frappe.db.count("Bin") - bin_baseline, 0, "Bins must restore to baseline")
+		# 8. Assert safety invariance restored (baseline-safe and immutable-ledger compliant)
+		final_bin_qty = flt(frappe.db.get_value("Bin", {"item_code": self.item_code, "warehouse": self.warehouse}, "actual_qty") or 0.0)
+		self.assertEqual(final_bin_qty, baseline_bin_qty, f"Physical stock must restore to baseline {baseline_bin_qty}")
 		self.assertEqual(frappe.db.count("Item Price") - price_baseline, 0, "Item Prices must restore to baseline")
-		self.assertEqual(frappe.db.count("Stock Ledger Entry", {"item_code": self.item_code}), 0)
-		self.assertEqual(frappe.db.count("Bin", {"item_code": self.item_code}), 0)
 		self.assertEqual(frappe.db.count("Item Price", {"item_code": self.item_code}), 0)
+
+		# Baseline SLE identities preserved (no baseline ledger deletion)
+		current_sle_ids = set(frappe.get_all("Stock Ledger Entry", pluck="name"))
+		self.assertTrue(baseline_sle_ids.issubset(current_sle_ids), "All baseline Stock Ledger Entries must be preserved")
+
+		# No active (un-cancelled) test stock state remains
+		self.assertEqual(
+			frappe.db.count("Stock Ledger Entry", {"voucher_no": reco_name, "is_cancelled": 0}),
+			0,
+			"No active Stock Ledger Entries should remain for test reconciliation",
+		)
+		self.assertEqual(
+			frappe.db.count("Stock Ledger Entry", {"item_code": self.item_code, "is_cancelled": 0}),
+			0,
+			"No active Stock Ledger Entries should remain for test item",
+		)
+
+		# Test Stock Reconciliation is natively cancelled, no active reconciliation
+		reco_docstatus = frappe.db.get_value("Stock Reconciliation", reco_name, "docstatus")
+		self.assertEqual(reco_docstatus, 2, "Test Stock Reconciliation must have docstatus 2 (Cancelled)")
+		self.assertEqual(
+			frappe.db.count("Stock Reconciliation", {"name": reco_name, "docstatus": 1}),
+			0,
+			"No active (submitted) Stock Reconciliation should remain",
+		)
+
+		# Cancelled reversal SLEs remain as immutable audit trail
+		reco_cancelled_sles = frappe.db.count("Stock Ledger Entry", {"voucher_no": reco_name, "is_cancelled": 1})
+		self.assertGreaterEqual(reco_cancelled_sles, 1, "Cancelled/reversal SLE rows must remain in immutable ledger history")
