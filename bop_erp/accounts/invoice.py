@@ -255,6 +255,7 @@ def create_sales_invoice_from_fulfillment(
 	posting_date: Optional[str] = None,
 	idempotency_key: Optional[str] = None,
 	submit: bool = False,
+	external_tax_amount: Optional[Union[float, int, str]] = None,
 ) -> Any:
 	"""
 	Provider-neutral Bop Sales Invoice / Accounts Receivable creation service.
@@ -433,8 +434,15 @@ def create_sales_invoice_from_fulfillment(
 			)
 		)
 
+	# Resolve external tax evidence if present
+	ext_tax = external_tax_amount
+	if ext_tax is None and so_doc:
+		ext_tax = getattr(so_doc, "external_tax_amount", None)
+	if ext_tax is None and dn_doc:
+		ext_tax = getattr(dn_doc, "external_tax_amount", None)
+
 	# 10. Financial Reconciliation Pre-check
-	_reconcile_invoice_financials(si_doc, dn_doc, so_doc)
+	_reconcile_invoice_financials(si_doc, dn_doc, so_doc, external_tax_amount=ext_tax)
 
 	# 11. Save Draft Sales Invoice (Normal validations enabled)
 	si_doc.flags.ignore_validate = False
@@ -447,12 +455,15 @@ def create_sales_invoice_from_fulfillment(
 
 	# 12. Submit if requested
 	if submit:
-		return submit_sales_invoice(si_doc)
+		return submit_sales_invoice(si_doc, external_tax_amount=ext_tax)
 
 	return si_doc
 
 
-def submit_sales_invoice(sales_invoice: Union[str, Any]) -> Any:
+def submit_sales_invoice(
+	sales_invoice: Union[str, Any],
+	external_tax_amount: Optional[Union[float, int, str]] = None,
+) -> Any:
 	"""
 	Submits a Sales Invoice using native ERPNext lifecycle methods.
 	Strictly verifies:
@@ -490,6 +501,18 @@ def submit_sales_invoice(sales_invoice: Union[str, Any]) -> Any:
 	si_doc.flags.ignore_validate = False
 	si_doc.flags.ignore_mandatory = False
 	si_doc.flags.ignore_permissions = False
+
+	# Invariant: External Tax Reconciliation Check before submission
+	ext_tax = external_tax_amount
+	if ext_tax is None:
+		ext_tax = getattr(si_doc, "external_tax_amount", None)
+	if ext_tax is not None:
+		from bop_erp.accounts.tax_reconciliation import reconcile_external_taxes
+		reconcile_external_taxes(
+			si_doc,
+			external_tax_amount=ext_tax,
+			currency=si_doc.currency,
+		)
 
 	# Savepoint for clean rollback on error
 	sp_submit = f"sp_si_sub_{frappe.generate_hash(length=8)}"
@@ -542,6 +565,7 @@ def _reconcile_invoice_financials(
 	si_doc: Any,
 	dn_doc: Any,
 	so_doc: Optional[Any] = None,
+	external_tax_amount: Optional[Union[float, int, str]] = None,
 ) -> None:
 	"""
 	Performs sanity reconciliation against upstream document totals.
@@ -583,3 +607,12 @@ def _reconcile_invoice_financials(
 				raise SalesInvoiceError(
 					_("Income account '{0}' is an account group. A ledger account is required.").format(item.income_account)
 				)
+
+	# Invariant: Reconcile external tax evidence if present
+	if external_tax_amount is not None:
+		from bop_erp.accounts.tax_reconciliation import reconcile_external_taxes
+		reconcile_external_taxes(
+			si_doc,
+			external_tax_amount=external_tax_amount,
+			currency=si_doc.currency,
+		)

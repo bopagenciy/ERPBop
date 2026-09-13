@@ -195,15 +195,39 @@ class TestAccountingControlsUnit(FrappeTestCase):
 	# 9. Tax mismatch blocks and requires review
 	# -------------------------------------------------------------------------
 	def test_09_tax_mismatch_blocks_reviews(self):
-		"""Verifies that material tax discrepancy raises MaterialTaxMismatchError."""
+		"""Verifies that material tax discrepancy raises MaterialTaxMismatchError or returns review status."""
 		si = MockDocument(
 			name="ACC-SI-009",
 			currency="USD",
 			taxes=[MockDocument(tax_amount=10.0)],
 		)
-		# External tax is 15.0 (diff 5.0 exceeds USD tolerance 0.02)
+		# 1. External tax is 15.0 (diff 5.0 exceeds USD 2-decimal tolerance 0.02)
 		with self.assertRaises(MaterialTaxMismatchError):
 			reconcile_external_taxes(si, external_tax_amount=15.0, currency="USD")
+
+		# 2. Allow review mode returns REVIEW_REQUIRED
+		rev = reconcile_external_taxes(si, external_tax_amount=15.0, currency="USD", allow_review=True)
+		self.assertFalse(rev["allowed"])
+		self.assertFalse(rev["reconciled"])
+		self.assertEqual(rev["status"], "REVIEW_REQUIRED")
+
+		# 3. 0-decimal currency (JPY): tolerance = 1.0
+		si_jpy = MockDocument(name="ACC-SI-JPY", currency="JPY", taxes=[MockDocument(tax_amount=100.0)])
+		# within tolerance (diff 1.0)
+		jpy_ok = reconcile_external_taxes(si_jpy, external_tax_amount=101.0, currency="JPY")
+		self.assertTrue(jpy_ok["reconciled"])
+		# outside tolerance (diff 2.0 > 1.0)
+		with self.assertRaises(MaterialTaxMismatchError):
+			reconcile_external_taxes(si_jpy, external_tax_amount=102.0, currency="JPY")
+
+		# 4. 3-decimal currency (BHD): tolerance = 0.005
+		si_bhd = MockDocument(name="ACC-SI-BHD", currency="BHD", taxes=[MockDocument(tax_amount=10.000)])
+		# within tolerance (diff 0.004 <= 0.005)
+		bhd_ok = reconcile_external_taxes(si_bhd, external_tax_amount=10.004, currency="BHD")
+		self.assertTrue(bhd_ok["reconciled"])
+		# outside tolerance (diff 0.010 > 0.005)
+		with self.assertRaises(MaterialTaxMismatchError):
+			reconcile_external_taxes(si_bhd, external_tax_amount=10.010, currency="BHD")
 
 	# -------------------------------------------------------------------------
 	# 10. Credit note tax reversal

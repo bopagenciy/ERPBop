@@ -813,6 +813,20 @@ def ingest_order_pipeline(
 			)
 		)
 
+	# 7b. Customer Credit Control Validation (Native ERPNext Credit Protection)
+	from bop_erp.accounts.credit_control import validate_customer_credit_control
+	order_amount = (
+		flt(getattr(external_order.totals, "total_paid", 0.0))
+		or flt(getattr(external_order.totals, "total_products_inc_tax", 0.0))
+		or expected_product_total
+	)
+	validate_customer_credit_control(
+		customer=customer_name,
+		company=company,
+		extra_amount=order_amount,
+		allow_review=False,
+	)
+
 	# 8. Multi-line All-Or-Nothing Ingestion with Pre-Claim & Savepoint Rollback Protection
 	sp_order = f"sp_ord_ingest_{frappe.generate_hash(length=8)}"
 	frappe.db.savepoint(sp_order)

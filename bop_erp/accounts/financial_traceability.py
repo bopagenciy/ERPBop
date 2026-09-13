@@ -16,14 +16,23 @@ def _doc_summary(doc: Any) -> Dict[str, Any]:
 	
 	posting_date = getattr(doc, "posting_date", None) or getattr(doc, "transaction_date", None)
 	
+	doctype = getattr(doc, "doctype", "")
+	currency = getattr(doc, "currency", None)
+	if not currency and doctype == "Payment Entry":
+		currency = getattr(doc, "paid_from_account_currency", None) or getattr(doc, "paid_to_account_currency", "")
+
+	grand_total = flt(getattr(doc, "grand_total", 0.0))
+	if not grand_total and doctype == "Payment Entry":
+		grand_total = flt(getattr(doc, "paid_amount", 0.0) or getattr(doc, "received_amount", 0.0))
+
 	return {
-		"doctype": getattr(doc, "doctype", ""),
+		"doctype": doctype,
 		"name": getattr(doc, "name", ""),
 		"docstatus": docstatus,
 		"docstatus_label": status_label,
 		"company": getattr(doc, "company", ""),
-		"currency": getattr(doc, "currency", ""),
-		"grand_total": flt(getattr(doc, "grand_total", 0.0)),
+		"currency": currency or "",
+		"grand_total": grand_total,
 		"outstanding_amount": flt(getattr(doc, "outstanding_amount", 0.0)),
 		"posting_date": str(posting_date) if posting_date else None,
 		"linked_accounting_docs": [],

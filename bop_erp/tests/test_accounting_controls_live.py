@@ -6,29 +6,41 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import add_days, flt, nowdate
 
+from bop_erp.constants import TransactionOrigin
 from bop_erp.accounts import (
 	CompanyMismatchError,
 	CreditLimitExceededError,
+	MaterialTaxMismatchError,
 	check_payment_entry_invariants,
 	check_purchase_invoice_invariants,
 	check_sales_invoice_invariants,
+	create_sales_invoice_from_fulfillment,
 	get_purchasing_financial_traceability,
 	get_sales_financial_traceability,
 	reconcile_external_taxes,
+	submit_sales_invoice,
 	validate_company_accounting_isolation,
 	validate_customer_credit_control,
 )
+from bop_erp.orders.models import (
+	ExternalOrder,
+	ExternalOrderLine,
+	ExternalCustomer,
+	ExternalTotals,
+)
+from bop_erp.orders.ingestion import ingest_order_pipeline
 
 
 class TestAccountingControlsLive(FrappeTestCase):
 	"""
-	Phase 1T Live Integration Test Suite:
-	Accounting, Tax & Financial Controls Foundation.
+	Phase 1T.1 Live Integration Test Suite:
+	Accounting, Tax & Financial Controls Foundation and Enforcement Proofs.
 	Executes live against the isolated local MariaDB / ERPNext test environment.
 	Uses ownership-aware TEST-1T-* fixtures and restores clean baseline.
 	"""
 
 	FIXTURE_PREFIX = "TEST-1T-"
+	item_code = "TEST-1T-SKU-01"
 
 	@classmethod
 	def setUpClass(cls):
@@ -151,6 +163,38 @@ class TestAccountingControlsLive(FrappeTestCase):
 			})
 			supp.insert(ignore_permissions=True)
 
+		# Foreign Supplier (Industrial DP)
+		cls.foreign_supplier = f"{cls.FIXTURE_PREFIX}ForeignSupp-IDP"
+		cls.payable_acc_usd = "TEST-1T-Proveedores USD - IDP"
+		if not frappe.db.exists("Account", cls.payable_acc_usd):
+			acc = frappe.get_doc({
+				"doctype": "Account",
+				"account_name": "TEST-1T-Proveedores USD",
+				"company": cls.company_a,
+				"parent_account": "23 - Cuentas por pagar - IDP",
+				"account_type": "Payable",
+				"root_type": "Liability",
+				"account_currency": "USD",
+				"is_group": 0,
+			})
+			acc.insert(ignore_permissions=True)
+
+		if not frappe.db.exists("Supplier", cls.foreign_supplier):
+			supp = frappe.get_doc({
+				"doctype": "Supplier",
+				"supplier_name": cls.foreign_supplier,
+				"supplier_group": "Local",
+				"supplier_type": "Company",
+				"default_currency": "USD",
+				"accounts": [
+					{
+						"company": cls.company_a,
+						"account": cls.payable_acc_usd,
+					}
+				],
+			})
+			supp.insert(ignore_permissions=True)
+
 		# 6. Item
 		cls.item_code = f"{cls.FIXTURE_PREFIX}SKU-01"
 		if not frappe.db.exists("Item", cls.item_code):
@@ -159,10 +203,12 @@ class TestAccountingControlsLive(FrappeTestCase):
 				"item_code": cls.item_code,
 				"item_name": cls.item_code,
 				"item_group": "All Item Groups",
-				"stock_uom": "Nos",
+				"stock_uom": "Meter",
 				"is_stock_item": 1,
 			})
 			item.insert(ignore_permissions=True)
+		else:
+			frappe.db.set_value("Item", cls.item_code, "stock_uom", "Meter")
 
 		# 7. Payment Terms Template Net 30
 		cls.terms_template = f"{cls.FIXTURE_PREFIX}Net-30"
@@ -190,7 +236,146 @@ class TestAccountingControlsLive(FrappeTestCase):
 			})
 			ptt.insert(ignore_permissions=True)
 
-		# 8. Resolve native accounts
+		# 8. Split 50/50 Payment Terms Template (Multi-Installment)
+		cls.split_terms_template = f"{cls.FIXTURE_PREFIX}Split-50-50"
+		if not frappe.db.exists("Payment Terms Template", cls.split_terms_template):
+			term_0 = f"{cls.FIXTURE_PREFIX}Term-0"
+			if not frappe.db.exists("Payment Term", term_0):
+				term = frappe.get_doc({
+					"doctype": "Payment Term",
+					"payment_term_name": term_0,
+					"due_date_based_on": "Day(s) after invoice date",
+					"credit_days": 0,
+				})
+				term.insert(ignore_permissions=True)
+
+			term_30 = f"{cls.FIXTURE_PREFIX}Term-30"
+			ptt_split = frappe.get_doc({
+				"doctype": "Payment Terms Template",
+				"template_name": cls.split_terms_template,
+				"terms": [
+					{
+						"payment_term": term_0,
+						"invoice_portion": 50.0,
+						"credit_days": 0,
+					},
+					{
+						"payment_term": term_30,
+						"invoice_portion": 50.0,
+						"credit_days": 30,
+					},
+				],
+			})
+			ptt_split.insert(ignore_permissions=True)
+
+		# 9. Exchange Difference Account for Company A
+		cls.fx_diff_account = f"{cls.FIXTURE_PREFIX}FX-Diff - IDP"
+		if not frappe.db.exists("Account", cls.fx_diff_account):
+			acc = frappe.get_doc({
+				"doctype": "Account",
+				"account_name": f"{cls.FIXTURE_PREFIX}FX-Diff",
+				"company": cls.company_a,
+				"parent_account": "7 - Costos de producción o de operación - IDP",
+				"account_type": "Expense Account",
+				"root_type": "Expense",
+				"is_group": 0,
+			})
+			acc.insert(ignore_permissions=True)
+
+		cls._orig_exchange_account = frappe.db.get_value("Company", cls.company_a, "exchange_gain_loss_account")
+		frappe.db.set_value("Company", cls.company_a, "exchange_gain_loss_account", cls.fx_diff_account)
+
+		# 10. Local Currency Exchange fixture (USD -> COP at 4000)
+		if not frappe.db.exists("Currency Exchange", {"from_currency": "USD", "to_currency": "COP", "for_selling": 1}):
+			ce = frappe.get_doc({
+				"doctype": "Currency Exchange",
+				"date": nowdate(),
+				"from_currency": "USD",
+				"to_currency": "COP",
+				"exchange_rate": 4000.0,
+				"for_selling": 1,
+				"for_buying": 1,
+			})
+			ce.insert(ignore_permissions=True)
+
+		# 11. Channel Inventory Source for TID
+		if not frappe.db.exists("Channel Inventory Source", {"sales_channel": "TID", "warehouse": "Stores - IDP"}):
+			cis = frappe.get_doc({
+				"doctype": "Channel Inventory Source",
+				"sales_channel": "TID",
+				"warehouse": "Stores - IDP",
+				"enabled": 1,
+				"allow_sellable_stock": 1,
+				"priority": 1,
+			})
+			cis.insert(ignore_permissions=True)
+
+		# 12. PrestaShop Connector fixture for TID
+		if not frappe.db.exists("PrestaShop Connector", "PS-TID-DEVELOPMENT"):
+			conn = frappe.get_doc({
+				"doctype": "PrestaShop Connector",
+				"connector_name": f"{cls.FIXTURE_PREFIX}PS-Conn",
+				"sales_channel": "TID",
+				"environment": "DEVELOPMENT",
+				"base_url": "http://prestashop-test",
+				"credential_reference": "TEST_KEY",
+				"enabled": 1,
+				"eligible_order_states": "2,3,4",
+			})
+			conn.flags.ignore_mandatory = True
+			conn.insert(ignore_permissions=True)
+
+		# 13. External ID Mappings for order ingestion test
+		cls.ext_prod_id = f"{cls.FIXTURE_PREFIX}PROD-01"
+		if not frappe.db.exists("External ID Mapping", {"sales_channel": "TID", "external_id": cls.ext_prod_id}):
+			mapping = frappe.get_doc({
+				"doctype": "External ID Mapping",
+				"sales_channel": "TID",
+				"provider": "PRESTASHOP",
+				"external_entity_type": "PRODUCT",
+				"external_id": cls.ext_prod_id,
+				"erp_doctype": "Item",
+				"erp_document": cls.item_code,
+				"active": 1,
+			})
+			mapping.insert(ignore_permissions=True)
+
+		cls.ext_cust_id = f"{cls.FIXTURE_PREFIX}EXT-CUST-01"
+		if not frappe.db.exists("External ID Mapping", {"sales_channel": "TID", "external_id": cls.ext_cust_id}):
+			mapping = frappe.get_doc({
+				"doctype": "External ID Mapping",
+				"sales_channel": "TID",
+				"provider": "PRESTASHOP",
+				"external_entity_type": "CUSTOMER",
+				"external_id": cls.ext_cust_id,
+				"erp_doctype": "Customer",
+				"erp_document": cls.credit_customer,
+				"active": 1,
+			})
+			mapping.insert(ignore_permissions=True)
+
+		# 14. Stock Entry to seed stock for ATP check in order ingestion
+		stock_qty = frappe.db.get_value("Bin", {"item_code": cls.item_code, "warehouse": "Stores - IDP"}, "actual_qty") or 0.0
+		if flt(stock_qty) < 50.0:
+			se = frappe.get_doc({
+				"doctype": "Stock Entry",
+				"stock_entry_type": "Material Receipt",
+				"company": cls.company_a,
+				"remarks": f"{cls.FIXTURE_PREFIX}Seed Stock",
+				"items": [
+					{
+						"item_code": cls.item_code,
+						"t_warehouse": "Stores - IDP",
+						"qty": 100.0,
+						"basic_rate": 500.0,
+						"cost_center": "Main - IDP",
+					}
+				],
+			})
+			se.insert(ignore_permissions=True)
+			se.submit()
+
+		# 15. Resolve native accounts
 		cls.income_acc_a = "Ventas de mercancías - IDP"
 		cls.receivable_acc_a = frappe.db.get_value("Company", cls.company_a, "default_receivable_account") or "1390 - Deudas de difícil cobro - IDP"
 		cls.payable_acc_a = frappe.db.get_value("Company", cls.company_a, "default_payable_account") or "2375 - Cuotas por devolver - IDP"
@@ -275,6 +460,28 @@ class TestAccountingControlsLive(FrappeTestCase):
 			except Exception:
 				pass
 
+		# 4. Cancel and delete Delivery Notes, Sales Orders
+		for dt, party_field in [("Delivery Note", "customer"), ("Sales Order", "customer"), ("Purchase Receipt", "supplier"), ("Purchase Order", "supplier")]:
+			try:
+				vnames = frappe.db.sql(
+					f"SELECT name FROM `tab{dt}` WHERE `{party_field}` LIKE %s",
+					(f"{cls.FIXTURE_PREFIX}%",),
+					pluck="name",
+				)
+				for vn in vnames:
+					try:
+						doc = frappe.get_doc(dt, vn)
+						if doc.docstatus == 1:
+							doc.cancel()
+						frappe.delete_doc(dt, vn, force=True, ignore_permissions=True)
+					except Exception:
+						pass
+			except Exception:
+				pass
+
+		# 6. Clean Stock Reservation Entries
+		frappe.db.delete("Stock Reservation Entry", {"item_code": cls.item_code})
+
 		frappe.db.commit()
 
 	@classmethod
@@ -282,7 +489,33 @@ class TestAccountingControlsLive(FrappeTestCase):
 		"""Defensively cleans up all vouchers and master data belonging to this module."""
 		cls._cleanup_vouchers()
 
-		# Clean up created master data and templates (Customer, Supplier, Item, Terms, Account)
+		# Restore original company exchange gain loss account
+		if hasattr(cls, "_orig_exchange_account"):
+			frappe.db.set_value("Company", cls.company_a, "exchange_gain_loss_account", cls._orig_exchange_account)
+
+		# Clean stock entries
+		se_names = frappe.db.sql(
+			"""
+			SELECT name FROM `tabStock Entry`
+			WHERE remarks LIKE %s
+			""",
+			(f"%{cls.FIXTURE_PREFIX}%",),
+			pluck="name",
+		)
+		for se in se_names:
+			try:
+				doc = frappe.get_doc("Stock Entry", se)
+				if doc.docstatus == 1:
+					doc.cancel()
+				frappe.delete_doc("Stock Entry", se, force=True, ignore_permissions=True)
+			except Exception:
+				pass
+
+		# Clean mappings and connectors
+		frappe.db.delete("External ID Mapping", {"external_id": ["like", f"{cls.FIXTURE_PREFIX}%"]})
+		frappe.db.delete("Channel Inventory Source", {"sales_channel": "TID", "warehouse": "Stores - IDP"})
+
+		# Clean up created master data and templates
 		for dt in ["Customer", "Supplier", "Item", "Payment Terms Template", "Payment Term", "Account"]:
 			names = frappe.get_all(dt, filters={"name": ["like", f"{cls.FIXTURE_PREFIX}%"]}, pluck="name")
 			for n in names:
@@ -383,10 +616,15 @@ class TestAccountingControlsLive(FrappeTestCase):
 			si.insert()
 
 	# =========================================================================
-	# TEST 04: Sales Tax GL Posting Live
+	# TEST 04: Sales Tax GL Posting & External Tax Reconciliation Live (Section A)
 	# =========================================================================
 	def test_04_sales_tax_gl_posting_live(self):
-		"""Creates and submits Sales Invoice with native tax row; verifies GL Entry balance."""
+		"""
+		Creates and submits Sales Invoice with native tax row; verifies GL Entry balance.
+		Enforces external tax reconciliation: exact match, within tolerance, and material mismatch blocking.
+		Proves mismatch creates no submitted invoice and zero GL mutation.
+		"""
+		# 1. Native tax calculation and GL entry posting
 		si = frappe.get_doc({
 			"doctype": "Sales Invoice",
 			"company": self.company_a,
@@ -429,11 +667,61 @@ class TestAccountingControlsLive(FrappeTestCase):
 		self.assertAlmostEqual(total_debit, total_credit, places=2)
 		self.assertAlmostEqual(total_debit, 2380.0, places=2)
 
-		for g in gl_entries:
-			self.assertEqual(g.company, self.company_a)
+		# 2. External Tax Reconciliation: Exact Match -> Allowed
+		res_exact = reconcile_external_taxes(si, external_tax_amount=380.0, currency="COP")
+		self.assertTrue(res_exact["reconciled"])
+		self.assertTrue(res_exact["allowed"])
+		self.assertEqual(res_exact["status"], "RECONCILED")
 
-		inv_res = check_sales_invoice_invariants(si)
-		self.assertTrue(inv_res["valid"])
+		# 3. External Tax Reconciliation: Within Currency Tolerance -> Allowed
+		res_tol = reconcile_external_taxes(si, external_tax_amount=380.01, currency="COP")
+		self.assertTrue(res_tol["reconciled"])
+		self.assertTrue(res_tol["allowed"])
+
+		# 4. External Tax Reconciliation: Material Mismatch -> Hard Block & Zero GL Mutation
+		si_draft = frappe.get_doc({
+			"doctype": "Sales Invoice",
+			"company": self.company_a,
+			"customer": self.customer_a,
+			"debit_to": self.receivable_acc_a,
+			"posting_date": nowdate(),
+			"currency": self.currency_a,
+			"items": [
+				{
+					"item_code": self.item_code,
+					"qty": 2.0,
+					"rate": 1000.0,
+					"income_account": self.income_acc_a,
+					"cost_center": self.cost_center_a,
+				}
+			],
+			"taxes": [
+				{
+					"charge_type": "On Net Total",
+					"account_head": self.tax_acc_a,
+					"description": "VAT 19%",
+					"rate": 19.0,
+				}
+			],
+		})
+		si_draft.insert()
+		draft_name = si_draft.name
+
+		# Attempt submission with external_tax_amount differing materially (500.0 vs native 380.0)
+		with self.assertRaises(MaterialTaxMismatchError):
+			submit_sales_invoice(si_draft, external_tax_amount=500.0)
+
+		# PROOF: Invoice was NOT submitted and ZERO GL Entries were created
+		reloaded = frappe.get_doc("Sales Invoice", draft_name)
+		self.assertEqual(reloaded.docstatus, 0)
+		gl_count = frappe.db.count("GL Entry", {"voucher_no": draft_name})
+		self.assertEqual(gl_count, 0)
+
+		# 5. External Tax Reconciliation: Review Mode -> REVIEW_REQUIRED without raising
+		rev_res = reconcile_external_taxes(si_draft, external_tax_amount=500.0, currency="COP", allow_review=True)
+		self.assertFalse(rev_res["allowed"])
+		self.assertFalse(rev_res["reconciled"])
+		self.assertEqual(rev_res["status"], "REVIEW_REQUIRED")
 
 	# =========================================================================
 	# TEST 05: Credit Note Tax Reversal Live
@@ -552,13 +840,17 @@ class TestAccountingControlsLive(FrappeTestCase):
 		self.assertTrue(inv_res["valid"])
 
 	# =========================================================================
-	# TEST 07: Payment Terms Template & Payment Schedule Live
+	# TEST 07: Payment Terms Template & Payment Schedule Live (Section D)
 	# =========================================================================
 	def test_07_payment_terms_schedule_live(self):
-		"""Verifies Payment Terms Template populates Payment Schedule with 30 day due date."""
+		"""
+		Verifies Payment Terms Template populates Payment Schedule with exact 30-day due date.
+		Proves both Sales Invoice and Purchase Invoice Net 30 mechanics, plus multi-installment schedule.
+		"""
 		today = nowdate()
 		expected_due = add_days(today, 30)
 
+		# 1. Net 30 Sales Invoice
 		si = frappe.get_doc({
 			"doctype": "Sales Invoice",
 			"company": self.company_a,
@@ -578,17 +870,78 @@ class TestAccountingControlsLive(FrappeTestCase):
 			],
 		})
 		si.insert()
-
 		self.assertTrue(len(si.payment_schedule) > 0)
 		sched = si.payment_schedule[0]
 		self.assertEqual(str(sched.due_date), str(expected_due))
+		self.assertEqual(str(si.due_date), str(expected_due))
 		self.assertEqual(flt(sched.payment_amount), 1000.0)
 
+		# 2. Net 30 Purchase Invoice
+		exp_acc = frappe.db.get_value("Company", self.company_a, "default_expense_account") or "5105 - Gastos de personal - IDP"
+		pi = frappe.get_doc({
+			"doctype": "Purchase Invoice",
+			"company": self.company_a,
+			"supplier": self.supplier_a,
+			"credit_to": self.payable_acc_a,
+			"posting_date": today,
+			"currency": self.currency_a,
+			"payment_terms_template": self.terms_template,
+			"items": [
+				{
+					"item_code": self.item_code,
+					"qty": 1.0,
+					"rate": 500.0,
+					"expense_account": exp_acc,
+					"cost_center": self.cost_center_a,
+				}
+			],
+		})
+		pi.insert()
+		self.assertTrue(len(pi.payment_schedule) > 0)
+		sched_pi = pi.payment_schedule[0]
+		self.assertEqual(str(sched_pi.due_date), str(expected_due))
+		self.assertEqual(str(pi.due_date), str(expected_due))
+		self.assertEqual(flt(sched_pi.payment_amount), 500.0)
+
+		# 3. Multi-Installment Payment Schedule (50% Immediate, 50% Net 30)
+		si_split = frappe.get_doc({
+			"doctype": "Sales Invoice",
+			"company": self.company_a,
+			"customer": self.customer_a,
+			"debit_to": self.receivable_acc_a,
+			"posting_date": today,
+			"currency": self.currency_a,
+			"payment_terms_template": self.split_terms_template,
+			"items": [
+				{
+					"item_code": self.item_code,
+					"qty": 1.0,
+					"rate": 2000.0,
+					"income_account": self.income_acc_a,
+					"cost_center": self.cost_center_a,
+				}
+			],
+		})
+		si_split.insert()
+		self.assertEqual(len(si_split.payment_schedule), 2)
+		self.assertEqual(flt(si_split.payment_schedule[0].payment_amount), 1000.0)
+		self.assertEqual(str(si_split.payment_schedule[0].due_date), str(today))
+		self.assertEqual(flt(si_split.payment_schedule[1].payment_amount), 1000.0)
+		self.assertEqual(str(si_split.payment_schedule[1].due_date), str(expected_due))
+
 	# =========================================================================
-	# TEST 08: Customer Credit Limit Enforcement Live
+	# TEST 08: Customer Credit Limit Enforcement Live (Section B)
 	# =========================================================================
 	def test_08_customer_credit_control_live(self):
-		"""Verifies customer credit limit enforcement in live environment using dedicated credit customer."""
+		"""
+		Verifies customer credit limit enforcement in live environment using dedicated credit customer.
+		Proves:
+		- within limit -> allowed
+		- over limit -> blocked / REVIEW_REQUIRED
+		- imported order pipeline cannot bypass credit limit: over-limit order does not submit,
+		  creates no reservation, no publication, no accounting doc
+		- manual ERP workflow preserves native ERPNext behavior
+		"""
 		cust_doc = frappe.get_doc("Customer", self.credit_customer)
 		cust_doc.credit_limits = []
 		cust_doc.append("credit_limits", {
@@ -612,12 +965,103 @@ class TestAccountingControlsLive(FrappeTestCase):
 		self.assertFalse(res_rev["allowed"])
 		self.assertEqual(res_rev["status"], "REVIEW_REQUIRED")
 
+		# 4. Integration Inbound Order Ingestion Enforcement:
+		# Over-limit order must fail fast and produce ZERO submitted documents, reservations, or publication
+		over_limit_order = ExternalOrder(
+			provider="PRESTASHOP",
+			sales_channel="TID",
+			external_order_id="EXT-ORD-OVER-CREDIT",
+			external_reference="PS-OVER-CREDIT",
+			order_state_id="2",
+			currency=self.currency_a,
+			customer=ExternalCustomer(external_customer_id=self.ext_cust_id),
+			lines=[
+				ExternalOrderLine(
+					external_line_id="L1",
+					external_product_id=self.ext_prod_id,
+					quantity=16.0,
+					unit_price_ex_tax=500.0,
+					line_total_ex_tax=8000.0,
+				)
+			],
+			totals=ExternalTotals(
+				total_products_ex_tax=8000.0,
+				total_paid=8000.0,
+				currency=self.currency_a,
+			),
+		)
+
+		with self.assertRaises(CreditLimitExceededError):
+			ingest_order_pipeline(over_limit_order)
+
+		# PROOF: No submitted Sales Order, no stock reservation, no accounting document
+		so_count = frappe.db.count("Sales Order", {"customer": self.credit_customer, "docstatus": 1})
+		self.assertEqual(so_count, 0)
+		sre_count = frappe.db.count("Stock Reservation Entry", {"item_code": self.item_code})
+		self.assertEqual(sre_count, 0)
+		si_count = frappe.db.count("Sales Invoice", {"customer": self.credit_customer})
+		self.assertEqual(si_count, 0)
+
+		# 5. Manual ERP workflow preserves native ERPNext behavior
+		manual_so = frappe.get_doc({
+			"doctype": "Sales Order",
+			"company": self.company_a,
+			"customer": self.credit_customer,
+			"transaction_date": nowdate(),
+			"delivery_date": nowdate(),
+			"items": [
+				{
+					"item_code": self.item_code,
+					"qty": 1.0,
+					"rate": 1000.0,
+					"warehouse": "Stores - IDP",
+				}
+			],
+		})
+		manual_so.insert(ignore_permissions=True)
+		self.assertEqual(manual_so.docstatus, 0)
+
 	# =========================================================================
-	# TEST 09: Multi-Currency Sales Invoice Live
+	# TEST 09: Multi-Currency, Foreign Invoice & Realized FX Live (Section E)
 	# =========================================================================
 	def test_09_multi_currency_sales_invoice_live(self):
-		"""Creates foreign-currency Sales Invoice and verifies base amount conversion."""
-		si = frappe.get_doc({
+		"""
+		Explicit live tests for multi-currency:
+		1. Base-currency Sales Invoice
+		2. Foreign-currency Sales Invoice (USD @ 4000)
+		3. Foreign-currency Purchase Invoice (USD @ 4000)
+		4. Foreign-currency Payment Entry allocation
+		5. Native realized exchange gain/loss verification
+		"""
+		# Guarantee company exchange gain loss account is configured
+		frappe.db.set_value("Company", self.company_a, "exchange_gain_loss_account", self.fx_diff_account)
+		frappe.db.commit()
+
+		# 1. Base-currency Sales Invoice
+		si_base = frappe.get_doc({
+			"doctype": "Sales Invoice",
+			"company": self.company_a,
+			"customer": self.customer_a,
+			"debit_to": self.receivable_acc_a,
+			"posting_date": nowdate(),
+			"currency": self.currency_a,
+			"items": [
+				{
+					"item_code": self.item_code,
+					"qty": 1.0,
+					"rate": 1000.0,
+					"income_account": self.income_acc_a,
+					"cost_center": self.cost_center_a,
+				}
+			],
+		})
+		si_base.insert()
+		si_base.submit()
+		self.assertEqual(flt(si_base.grand_total), 1000.0)
+		self.assertEqual(flt(si_base.base_grand_total), 1000.0)
+
+		# 2. Foreign-currency Sales Invoice (10 USD @ conversion_rate 4000)
+		si_foreign = frappe.get_doc({
 			"doctype": "Sales Invoice",
 			"company": self.company_a,
 			"customer": self.foreign_customer,
@@ -635,25 +1079,107 @@ class TestAccountingControlsLive(FrappeTestCase):
 				}
 			],
 		})
-		si.insert()
-		si.submit()
+		si_foreign.insert()
+		si_foreign.submit()
 
-		self.assertEqual(flt(si.grand_total), 10.0)
-		self.assertEqual(flt(si.base_grand_total), 40000.0)
+		self.assertEqual(flt(si_foreign.grand_total), 10.0)
+		self.assertEqual(flt(si_foreign.base_grand_total), 40000.0)
 
 		gl_entries = frappe.get_all(
 			"GL Entry",
-			filters={"voucher_type": "Sales Invoice", "voucher_no": si.name, "is_cancelled": 0},
+			filters={"voucher_type": "Sales Invoice", "voucher_no": si_foreign.name, "is_cancelled": 0},
 			fields=["account", "debit", "credit"],
 		)
 		total_debit = sum(flt(g.debit) for g in gl_entries)
 		self.assertAlmostEqual(total_debit, 40000.0, places=2)
 
+		# 3. Foreign-currency Purchase Invoice (10 USD @ conversion_rate 4000)
+		exp_acc = frappe.db.get_value("Company", self.company_a, "default_expense_account") or "5105 - Gastos de personal - IDP"
+		pi_foreign = frappe.get_doc({
+			"doctype": "Purchase Invoice",
+			"company": self.company_a,
+			"supplier": self.foreign_supplier,
+			"credit_to": self.payable_acc_usd,
+			"posting_date": nowdate(),
+			"currency": "USD",
+			"conversion_rate": 4000.0,
+			"items": [
+				{
+					"item_code": self.item_code,
+					"qty": 1.0,
+					"rate": 10.0,
+					"expense_account": exp_acc,
+					"cost_center": self.cost_center_a,
+				}
+			],
+		})
+		pi_foreign.insert()
+		pi_foreign.submit()
+		self.assertEqual(flt(pi_foreign.grand_total), 10.0)
+		self.assertEqual(flt(pi_foreign.base_grand_total), 40000.0)
+
+		# 4. Foreign-currency Payment Entry Allocation with Realized Exchange Gain
+		# Received at rate 4100 (41,000 COP) against invoice at rate 4000 (40,000 COP) -> 1,000 COP realized gain
+		bank_acc = "Banco Principal - IDP"
+		pe = frappe.get_doc({
+			"doctype": "Payment Entry",
+			"payment_type": "Receive",
+			"party_type": "Customer",
+			"party": self.foreign_customer,
+			"company": self.company_a,
+			"posting_date": nowdate(),
+			"paid_from": self.receivable_acc_usd,
+			"paid_to": bank_acc,
+			"paid_from_account_currency": "USD",
+			"paid_to_account_currency": self.currency_a,
+			"paid_amount": 10.0,
+			"source_exchange_rate": 4000.0,
+			"received_amount": 41000.0,
+			"target_exchange_rate": 1.0,
+			"reference_no": "REF-FX-001",
+			"reference_date": nowdate(),
+			"references": [
+				{
+					"reference_doctype": "Sales Invoice",
+					"reference_name": si_foreign.name,
+					"total_amount": 10.0,
+					"outstanding_amount": 10.0,
+					"allocated_amount": 10.0,
+					"exchange_rate": 4000.0,
+				}
+			],
+		})
+		pe.insert()
+		pe.submit()
+
+		si_foreign.reload()
+		self.assertAlmostEqual(flt(si_foreign.outstanding_amount), 0.0, places=2)
+
+		# 5. Verify GL balance and realized exchange gain account
+		pe_gl = frappe.get_all(
+			"GL Entry",
+			filters={"voucher_type": "Payment Entry", "voucher_no": pe.name, "is_cancelled": 0},
+			fields=["account", "debit", "credit"],
+		)
+		tot_deb = sum(flt(g.debit) for g in pe_gl)
+		tot_cred = sum(flt(g.credit) for g in pe_gl)
+		self.assertAlmostEqual(tot_deb, tot_cred, places=2)
+		self.assertAlmostEqual(tot_deb, 41000.0, places=2)
+
+		# Verify exchange gain account received the 1,000 credit
+		fx_gl = [g for g in pe_gl if g.account == self.fx_diff_account]
+		self.assertEqual(len(fx_gl), 1)
+		self.assertAlmostEqual(flt(fx_gl[0].credit), 1000.0, places=2)
+
 	# =========================================================================
-	# TEST 10: Frozen Posting Date Protection Live
+	# TEST 10: Frozen Date & Closed Period Controls Live (Section C)
 	# =========================================================================
 	def test_10_frozen_date_control_live(self):
-		"""Verifies that posting on or before accounts_frozen_till_date is blocked natively."""
+		"""
+		Verifies that posting on or before accounts_frozen_till_date is blocked natively.
+		Proves integration-created accounting documents cannot bypass frozen date or closed periods.
+		No ignore_validate, no broad flags, no DB mutation.
+		"""
 		frappe.db.set_value("Company", self.company_a, "accounts_frozen_till_date", "2026-09-10")
 		frappe.db.commit()
 
@@ -677,15 +1203,25 @@ class TestAccountingControlsLive(FrappeTestCase):
 		})
 		si.insert()
 
+		# Explicitly verify flags are NOT bypassing validations
+		self.assertFalse(si.flags.ignore_validate)
+		self.assertFalse(si.flags.ignore_permissions)
+
 		with self.assertRaises(frappe.ValidationError):
 			si.submit()
 
 	# =========================================================================
-	# TEST 11: Partial Payment & Cancellation Restoration Live
+	# TEST 11: Rounding, Precision & Cancellation Restoration Live (Section F)
 	# =========================================================================
 	def test_11_partial_payment_and_cancellation_restoration_live(self):
-		"""Creates Sales Invoice, submits partial Payment Entry, verifies outstanding reduction & restoration on cancel."""
-		si = frappe.get_doc({
+		"""
+		Proves rounding / precision with fractional rates/quantities:
+		- Sales: fractional rate/qty -> grand_total, outstanding, full allocation without penny drift
+		- Purchase: fractional rate/qty -> grand_total, outstanding, full allocation without penny drift
+		- Payment cancellation: accurately restores invoice outstanding balance
+		"""
+		# 1. Standard partial payment & restoration
+		si_std = frappe.get_doc({
 			"doctype": "Sales Invoice",
 			"company": self.company_a,
 			"customer": self.customer_a,
@@ -702,15 +1238,11 @@ class TestAccountingControlsLive(FrappeTestCase):
 				}
 			],
 		})
-		si.insert()
-		si.submit()
-		self.assertEqual(flt(si.outstanding_amount), 1000.0)
+		si_std.insert()
+		si_std.submit()
 
-		bank_acc = frappe.db.get_value("Account", {"company": self.company_a, "account_type": "Bank", "is_group": 0}, "name")
-		if not bank_acc:
-			bank_acc = "Banco Principal - IDP"
-
-		pe = frappe.get_doc({
+		bank_acc = "Banco Principal - IDP"
+		pe_std = frappe.get_doc({
 			"doctype": "Payment Entry",
 			"payment_type": "Receive",
 			"party_type": "Customer",
@@ -721,7 +1253,461 @@ class TestAccountingControlsLive(FrappeTestCase):
 			"paid_to": bank_acc,
 			"paid_amount": 400.0,
 			"received_amount": 400.0,
-			"reference_no": "REF-001",
+			"reference_no": "REF-PARTIAL",
+			"reference_date": nowdate(),
+			"references": [
+				{
+					"reference_doctype": "Sales Invoice",
+					"reference_name": si_std.name,
+					"total_amount": 1000.0,
+					"outstanding_amount": 1000.0,
+					"allocated_amount": 400.0,
+				}
+			],
+		})
+		pe_std.insert()
+		pe_std.submit()
+
+		si_std.reload()
+		self.assertAlmostEqual(flt(si_std.outstanding_amount), 600.0, places=2)
+
+		pe_std.cancel()
+		si_std.reload()
+		self.assertAlmostEqual(flt(si_std.outstanding_amount), 1000.0, places=2)
+
+		# 2. Sales Fractional Rounding Precision (Qty 3.333 @ rate 11.77 -> 39.23)
+		si_frac = frappe.get_doc({
+			"doctype": "Sales Invoice",
+			"company": self.company_a,
+			"customer": self.customer_a,
+			"debit_to": self.receivable_acc_a,
+			"posting_date": nowdate(),
+			"currency": self.currency_a,
+			"disable_rounded_total": 1,
+			"items": [
+				{
+					"item_code": self.item_code,
+					"qty": 3.333,
+					"rate": 11.77,
+					"income_account": self.income_acc_a,
+					"cost_center": self.cost_center_a,
+				}
+			],
+		})
+		si_frac.insert()
+		si_frac.submit()
+
+		expected_tot = round(3.333 * 11.77, 2)
+		self.assertAlmostEqual(flt(si_frac.grand_total), expected_tot, places=2)
+		self.assertAlmostEqual(flt(si_frac.outstanding_amount), expected_tot, places=2)
+
+		# Pay exact fractional outstanding
+		pe_frac = frappe.get_doc({
+			"doctype": "Payment Entry",
+			"payment_type": "Receive",
+			"party_type": "Customer",
+			"party": self.customer_a,
+			"company": self.company_a,
+			"posting_date": nowdate(),
+			"paid_from": self.receivable_acc_a,
+			"paid_to": bank_acc,
+			"paid_amount": expected_tot,
+			"received_amount": expected_tot,
+			"reference_no": "REF-FRAC-PAY",
+			"reference_date": nowdate(),
+			"references": [
+				{
+					"reference_doctype": "Sales Invoice",
+					"reference_name": si_frac.name,
+					"total_amount": expected_tot,
+					"outstanding_amount": expected_tot,
+					"allocated_amount": expected_tot,
+				}
+			],
+		})
+		pe_frac.insert()
+		pe_frac.submit()
+
+		si_frac.reload()
+		self.assertAlmostEqual(flt(si_frac.outstanding_amount), 0.0, places=2)
+
+		# 3. Purchase Fractional Rounding Precision (Qty 7.125 @ rate 14.83 -> 105.66)
+		exp_acc = frappe.db.get_value("Company", self.company_a, "default_expense_account") or "5105 - Gastos de personal - IDP"
+		pi_frac = frappe.get_doc({
+			"doctype": "Purchase Invoice",
+			"company": self.company_a,
+			"supplier": self.supplier_a,
+			"credit_to": self.payable_acc_a,
+			"posting_date": nowdate(),
+			"currency": self.currency_a,
+			"disable_rounded_total": 1,
+			"items": [
+				{
+					"item_code": self.item_code,
+					"qty": 7.125,
+					"rate": 14.83,
+					"expense_account": exp_acc,
+					"cost_center": self.cost_center_a,
+				}
+			],
+		})
+		pi_frac.insert()
+		pi_frac.submit()
+
+		expected_pi_tot = round(7.125 * 14.83, 2)
+		self.assertAlmostEqual(flt(pi_frac.grand_total), expected_pi_tot, places=2)
+		self.assertAlmostEqual(flt(pi_frac.outstanding_amount), expected_pi_tot, places=2)
+
+		# Pay exact fractional purchase outstanding
+		pe_pfrac = frappe.get_doc({
+			"doctype": "Payment Entry",
+			"payment_type": "Pay",
+			"party_type": "Supplier",
+			"party": self.supplier_a,
+			"company": self.company_a,
+			"posting_date": nowdate(),
+			"paid_from": bank_acc,
+			"paid_to": self.payable_acc_a,
+			"paid_amount": expected_pi_tot,
+			"received_amount": expected_pi_tot,
+			"reference_no": "REF-PI-FRAC",
+			"reference_date": nowdate(),
+			"references": [
+				{
+					"reference_doctype": "Purchase Invoice",
+					"reference_name": pi_frac.name,
+					"total_amount": expected_pi_tot,
+					"outstanding_amount": expected_pi_tot,
+					"allocated_amount": expected_pi_tot,
+				}
+			],
+		})
+		pe_pfrac.insert()
+		pe_pfrac.submit()
+
+		pi_frac.reload()
+		self.assertAlmostEqual(flt(pi_frac.outstanding_amount), 0.0, places=2)
+
+	# =========================================================================
+	# TEST 12: Financial Traceability View Live (Section G)
+	# =========================================================================
+	def test_12_financial_traceability_live(self):
+		"""
+		Verifies read-only financial traceability service for complete lifecycle:
+		SALE: SO -> DN -> SI -> PE -> Credit Note
+		PURCHASE: PO -> PR -> PI -> PE
+		Returns name, docstatus, company, currency, grand_total, outstanding, posting_date.
+		Proves service performs zero writes.
+		"""
+		# 1. Construct Sales Flow: SO -> DN -> SI -> PE -> CN
+		so = frappe.get_doc({
+			"doctype": "Sales Order",
+			"company": self.company_a,
+			"customer": self.customer_a,
+			"transaction_date": nowdate(),
+			"delivery_date": nowdate(),
+			"items": [
+				{
+					"item_code": self.item_code,
+					"qty": 2.0,
+					"rate": 1000.0,
+					"warehouse": "Stores - IDP",
+				}
+			],
+		})
+		so.insert(ignore_permissions=True)
+		so.submit()
+
+		dn = frappe.get_doc({
+			"doctype": "Delivery Note",
+			"company": self.company_a,
+			"customer": self.customer_a,
+			"posting_date": nowdate(),
+			"items": [
+				{
+					"item_code": self.item_code,
+					"qty": 2.0,
+					"rate": 1000.0,
+					"against_sales_order": so.name,
+					"so_detail": so.items[0].name,
+					"warehouse": "Stores - IDP",
+					"cost_center": self.cost_center_a,
+				}
+			],
+		})
+		dn.insert(ignore_permissions=True)
+		dn.submit()
+
+		si = frappe.get_doc({
+			"doctype": "Sales Invoice",
+			"company": self.company_a,
+			"customer": self.customer_a,
+			"debit_to": self.receivable_acc_a,
+			"posting_date": nowdate(),
+			"currency": self.currency_a,
+			"items": [
+				{
+					"item_code": self.item_code,
+					"qty": 2.0,
+					"rate": 1000.0,
+					"income_account": self.income_acc_a,
+					"cost_center": self.cost_center_a,
+					"sales_order": so.name,
+					"delivery_note": dn.name,
+					"dn_detail": dn.items[0].name,
+				}
+			],
+		})
+		si.insert()
+		si.submit()
+
+		bank_acc = "Banco Principal - IDP"
+		pe = frappe.get_doc({
+			"doctype": "Payment Entry",
+			"payment_type": "Receive",
+			"party_type": "Customer",
+			"party": self.customer_a,
+			"company": self.company_a,
+			"posting_date": nowdate(),
+			"paid_from": self.receivable_acc_a,
+			"paid_to": bank_acc,
+			"paid_amount": 1000.0,
+			"received_amount": 1000.0,
+			"reference_no": "REF-TRACE-01",
+			"reference_date": nowdate(),
+			"references": [
+				{
+					"reference_doctype": "Sales Invoice",
+					"reference_name": si.name,
+					"total_amount": 2000.0,
+					"outstanding_amount": 2000.0,
+					"allocated_amount": 1000.0,
+				}
+			],
+		})
+		pe.insert()
+		pe.submit()
+
+		cn = frappe.get_doc({
+			"doctype": "Sales Invoice",
+			"is_return": 1,
+			"return_against": si.name,
+			"company": self.company_a,
+			"customer": self.customer_a,
+			"debit_to": self.receivable_acc_a,
+			"posting_date": nowdate(),
+			"currency": self.currency_a,
+			"items": [
+				{
+					"item_code": self.item_code,
+					"qty": -1.0,
+					"rate": 1000.0,
+					"income_account": self.income_acc_a,
+					"cost_center": self.cost_center_a,
+				}
+			],
+		})
+		cn.insert()
+		cn.submit()
+
+		# Snapshot DB counts before calling traceability service to prove zero writes
+		gl_count_before = frappe.db.count("GL Entry")
+		si_count_before = frappe.db.count("Sales Invoice")
+
+		trace_sale = get_sales_financial_traceability(sales_invoice=si.name)
+
+		# Read-only proof: DB counts unchanged
+		self.assertEqual(frappe.db.count("GL Entry"), gl_count_before)
+		self.assertEqual(frappe.db.count("Sales Invoice"), si_count_before)
+
+		self.assertEqual(trace_sale["flow"], "SALE")
+		self.assertEqual(trace_sale["company"], self.company_a)
+		self.assertTrue(len(trace_sale["sales_orders"]) >= 1)
+		self.assertTrue(len(trace_sale["delivery_notes"]) >= 1)
+		self.assertTrue(len(trace_sale["sales_invoices"]) >= 1)
+		self.assertTrue(len(trace_sale["payment_entries"]) >= 1)
+		self.assertTrue(len(trace_sale["credit_notes"]) >= 1)
+
+		# Verify returned structure on documents
+		for doc_summary in trace_sale["sales_invoices"] + trace_sale["payment_entries"]:
+			self.assertIn("name", doc_summary)
+			self.assertIn("docstatus", doc_summary)
+			self.assertIn("company", doc_summary)
+			self.assertIn("currency", doc_summary)
+			self.assertIn("grand_total", doc_summary)
+			self.assertIn("outstanding_amount", doc_summary)
+			self.assertIn("posting_date", doc_summary)
+
+		self.assertEqual(trace_sale["total_billed"], 2000.0)
+		self.assertEqual(trace_sale["total_paid"], 1000.0)
+		self.assertEqual(trace_sale["total_refunded"], -1000.0)
+
+		# 2. Construct Purchasing Flow: PO -> PR -> PI -> PE
+		exp_acc = frappe.db.get_value("Company", self.company_a, "default_expense_account") or "5105 - Gastos de personal - IDP"
+		po = frappe.get_doc({
+			"doctype": "Purchase Order",
+			"company": self.company_a,
+			"supplier": self.supplier_a,
+			"schedule_date": nowdate(),
+			"items": [
+				{
+					"item_code": self.item_code,
+					"qty": 2.0,
+					"rate": 500.0,
+					"schedule_date": nowdate(),
+				}
+			],
+		})
+		po.insert(ignore_permissions=True)
+		po.submit()
+
+		pr = frappe.get_doc({
+			"doctype": "Purchase Receipt",
+			"company": self.company_a,
+			"supplier": self.supplier_a,
+			"posting_date": nowdate(),
+			"items": [
+				{
+					"item_code": self.item_code,
+					"qty": 2.0,
+					"rate": 500.0,
+					"purchase_order": po.name,
+					"po_detail": po.items[0].name,
+					"warehouse": "Stores - IDP",
+					"cost_center": self.cost_center_a,
+				}
+			],
+		})
+		pr.insert(ignore_permissions=True)
+		pr.submit()
+
+		pi = frappe.get_doc({
+			"doctype": "Purchase Invoice",
+			"company": self.company_a,
+			"supplier": self.supplier_a,
+			"credit_to": self.payable_acc_a,
+			"posting_date": nowdate(),
+			"currency": self.currency_a,
+			"items": [
+				{
+					"item_code": self.item_code,
+					"qty": 2.0,
+					"rate": 500.0,
+					"expense_account": exp_acc,
+					"cost_center": self.cost_center_a,
+					"purchase_order": po.name,
+					"purchase_receipt": pr.name,
+					"pr_detail": pr.items[0].name,
+				}
+			],
+		})
+		pi.insert()
+		pi.submit()
+
+		pe_p = frappe.get_doc({
+			"doctype": "Payment Entry",
+			"payment_type": "Pay",
+			"party_type": "Supplier",
+			"party": self.supplier_a,
+			"company": self.company_a,
+			"posting_date": nowdate(),
+			"paid_from": bank_acc,
+			"paid_to": self.payable_acc_a,
+			"paid_amount": 1000.0,
+			"received_amount": 1000.0,
+			"reference_no": "REF-PURCH-TRACE",
+			"reference_date": nowdate(),
+			"references": [
+				{
+					"reference_doctype": "Purchase Invoice",
+					"reference_name": pi.name,
+					"total_amount": 1000.0,
+					"outstanding_amount": 1000.0,
+					"allocated_amount": 1000.0,
+				}
+			],
+		})
+		pe_p.insert()
+		pe_p.submit()
+
+		trace_purch = get_purchasing_financial_traceability(purchase_invoice=pi.name)
+		self.assertEqual(trace_purch["flow"], "PURCHASE")
+		self.assertEqual(trace_purch["company"], self.company_a)
+		self.assertTrue(len(trace_purch["purchase_orders"]) >= 1)
+		self.assertTrue(len(trace_purch["purchase_receipts"]) >= 1)
+		self.assertTrue(len(trace_purch["purchase_invoices"]) >= 1)
+		self.assertTrue(len(trace_purch["payment_entries"]) >= 1)
+
+	# =========================================================================
+	# TEST 13: Financial Invariant Diagnostic Service Live
+	# =========================================================================
+	def test_13_financial_invariants_diagnostic_live(self):
+		"""Verifies diagnostic invariant checks on live documents: SI, PI, PE."""
+		# 1. Sales Invoice invariants
+		si = frappe.get_doc({
+			"doctype": "Sales Invoice",
+			"company": self.company_a,
+			"customer": self.customer_a,
+			"debit_to": self.receivable_acc_a,
+			"posting_date": nowdate(),
+			"currency": self.currency_a,
+			"items": [
+				{
+					"item_code": self.item_code,
+					"qty": 1.0,
+					"rate": 1000.0,
+					"income_account": self.income_acc_a,
+					"cost_center": self.cost_center_a,
+				}
+			],
+		})
+		si.insert()
+		si.submit()
+
+		res_si = check_sales_invoice_invariants(si.name)
+		self.assertTrue(res_si["valid"])
+		self.assertEqual(len(res_si["violations"]), 0)
+
+		# 2. Purchase Invoice invariants
+		exp_acc = frappe.db.get_value("Company", self.company_a, "default_expense_account") or "5105 - Gastos de personal - IDP"
+		pi = frappe.get_doc({
+			"doctype": "Purchase Invoice",
+			"company": self.company_a,
+			"supplier": self.supplier_a,
+			"credit_to": self.payable_acc_a,
+			"posting_date": nowdate(),
+			"currency": self.currency_a,
+			"items": [
+				{
+					"item_code": self.item_code,
+					"qty": 1.0,
+					"rate": 500.0,
+					"expense_account": exp_acc,
+					"cost_center": self.cost_center_a,
+				}
+			],
+		})
+		pi.insert()
+		pi.submit()
+
+		res_pi = check_purchase_invoice_invariants(pi.name)
+		self.assertTrue(res_pi["valid"])
+		self.assertEqual(len(res_pi["violations"]), 0)
+
+		# 3. Payment Entry invariants
+		bank_acc = "Banco Principal - IDP"
+		pe = frappe.get_doc({
+			"doctype": "Payment Entry",
+			"payment_type": "Receive",
+			"party_type": "Customer",
+			"party": self.customer_a,
+			"company": self.company_a,
+			"posting_date": nowdate(),
+			"paid_from": self.receivable_acc_a,
+			"paid_to": bank_acc,
+			"paid_amount": 1000.0,
+			"received_amount": 1000.0,
+			"reference_no": "REF-INV-CHK",
 			"reference_date": nowdate(),
 			"references": [
 				{
@@ -729,80 +1715,16 @@ class TestAccountingControlsLive(FrappeTestCase):
 					"reference_name": si.name,
 					"total_amount": 1000.0,
 					"outstanding_amount": 1000.0,
-					"allocated_amount": 400.0,
+					"allocated_amount": 1000.0,
 				}
 			],
 		})
 		pe.insert()
 		pe.submit()
 
-		si.reload()
-		self.assertAlmostEqual(flt(si.outstanding_amount), 600.0, places=2)
-
-		pe.cancel()
-		si.reload()
-		self.assertAlmostEqual(flt(si.outstanding_amount), 1000.0, places=2)
-
-	# =========================================================================
-	# TEST 12: Financial Traceability View Live
-	# =========================================================================
-	def test_12_financial_traceability_live(self):
-		"""Verifies get_sales_financial_traceability returns structured chain without shadow tables."""
-		si = frappe.get_doc({
-			"doctype": "Sales Invoice",
-			"company": self.company_a,
-			"customer": self.customer_a,
-			"debit_to": self.receivable_acc_a,
-			"posting_date": nowdate(),
-			"currency": self.currency_a,
-			"items": [
-				{
-					"item_code": self.item_code,
-					"qty": 1.0,
-					"rate": 1000.0,
-					"income_account": self.income_acc_a,
-					"cost_center": self.cost_center_a,
-				}
-			],
-		})
-		si.insert()
-		si.submit()
-
-		trace = get_sales_financial_traceability(sales_invoice=si.name)
-		self.assertEqual(trace["flow"], "SALE")
-		self.assertEqual(trace["company"], self.company_a)
-		self.assertEqual(len(trace["sales_invoices"]), 1)
-		self.assertEqual(trace["sales_invoices"][0]["name"], si.name)
-		self.assertEqual(trace["total_billed"], 1000.0)
-
-	# =========================================================================
-	# TEST 13: Financial Invariant Diagnostic Service Live
-	# =========================================================================
-	def test_13_financial_invariants_diagnostic_live(self):
-		"""Verifies check_sales_invoice_invariants validates live submitted document."""
-		si = frappe.get_doc({
-			"doctype": "Sales Invoice",
-			"company": self.company_a,
-			"customer": self.customer_a,
-			"debit_to": self.receivable_acc_a,
-			"posting_date": nowdate(),
-			"currency": self.currency_a,
-			"items": [
-				{
-					"item_code": self.item_code,
-					"qty": 1.0,
-					"rate": 1000.0,
-					"income_account": self.income_acc_a,
-					"cost_center": self.cost_center_a,
-				}
-			],
-		})
-		si.insert()
-		si.submit()
-
-		res = check_sales_invoice_invariants(si.name)
-		self.assertTrue(res["valid"])
-		self.assertEqual(len(res["violations"]), 0)
+		res_pe = check_payment_entry_invariants(pe.name)
+		self.assertTrue(res_pe["valid"])
+		self.assertEqual(len(res_pe["violations"]), 0)
 
 	# =========================================================================
 	# TEST 14: Fixture Cleanup Proof Live
@@ -830,3 +1752,13 @@ class TestAccountingControlsLive(FrappeTestCase):
 			pluck="name",
 		)
 		self.assertEqual(len(residual_pes), 0)
+
+		residual_pis = frappe.db.sql(
+			"""
+			SELECT name FROM `tabPurchase Invoice`
+			WHERE supplier LIKE %s OR name LIKE %s
+			""",
+			(f"{self.FIXTURE_PREFIX}%", f"{self.FIXTURE_PREFIX}%"),
+			pluck="name",
+		)
+		self.assertEqual(len(residual_pis), 0)

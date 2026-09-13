@@ -43,6 +43,7 @@ def reconcile_external_taxes(
 	external_tax_amount: Union[float, int, str],
 	currency: Optional[str] = None,
 	tolerance: Optional[float] = None,
+	allow_review: bool = False,
 ) -> Dict[str, Any]:
 	"""
 	Reconciles native ERPNext calculated taxes against external channel order tax totals.
@@ -66,13 +67,26 @@ def reconcile_external_taxes(
 	# Currency-aware tolerance comparison
 	if tax_delta > (tol + 1e-6):
 		doc_name = getattr(doc, "name", None) or (doc.get("name") if isinstance(doc, dict) else "Draft")
-		raise MaterialTaxMismatchError(
-			_(
-				"Material Tax Mismatch on document '{0}': Native tax ({1:.2f}) differs from "
-				"external tax evidence ({2:.2f}) by {3:.2f}, exceeding currency '{4}' tolerance ({5}). "
-				"Review required — silent tax mutation is prohibited."
-			).format(doc_name, native_tax_amount, ext_tax, tax_delta, doc_currency, tol)
-		)
+		message = _(
+			"Material Tax Mismatch on document '{0}': Native tax ({1:.2f}) differs from "
+			"external tax evidence ({2:.2f}) by {3:.2f}, exceeding currency '{4}' tolerance ({5}). "
+			"Review required — silent tax mutation is prohibited."
+		).format(doc_name, native_tax_amount, ext_tax, tax_delta, doc_currency, tol)
+
+		if allow_review:
+			return {
+				"status": "REVIEW_REQUIRED",
+				"currency": doc_currency,
+				"native_tax_amount": native_tax_amount,
+				"external_tax_amount": ext_tax,
+				"tax_delta": round(tax_delta, 4),
+				"tolerance": tol,
+				"reconciled": False,
+				"allowed": False,
+				"reason": message,
+			}
+
+		raise MaterialTaxMismatchError(message)
 
 	return {
 		"status": "RECONCILED",
@@ -82,4 +96,5 @@ def reconcile_external_taxes(
 		"tax_delta": round(tax_delta, 4),
 		"tolerance": tol,
 		"reconciled": True,
+		"allowed": True,
 	}
