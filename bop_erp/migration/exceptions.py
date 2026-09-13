@@ -22,6 +22,26 @@ class SourceConnectionError(MigrationError):
 	pass
 
 
+class ProductionSourceBlockedError(SourceSafetyViolationError):
+	"""Raised when any attempt is made to connect to or extract from a PRODUCTION source environment."""
+	pass
+
+
+class SourceSchemaError(MigrationError):
+	"""Raised when source schema inspection or resolution fails."""
+	pass
+
+
+class SourceMappingError(MigrationError):
+	"""Raised when logical to physical schema mapping cannot be resolved or is invalid."""
+	pass
+
+
+class SourceReadError(MigrationError):
+	"""Raised when an error occurs during source ERP query extraction."""
+	pass
+
+
 class MigrationRunStateError(MigrationError):
 	"""Raised when an invalid state transition is attempted on a Migration Run."""
 	pass

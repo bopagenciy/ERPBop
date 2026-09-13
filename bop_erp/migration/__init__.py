@@ -11,11 +11,34 @@ from bop_erp.migration.exceptions import (
 	MigrationRunStateError,
 	MigrationValidationError,
 	NormalizationError,
+	ProductionSourceBlockedError,
 	SourceConnectionError,
+	SourceMappingError,
 	SourcePayloadDriftError,
+	SourceReadError,
 	SourceSafetyViolationError,
+	SourceSchemaError,
 	SourceWriteBlockedError,
 	StagingError,
+)
+from bop_erp.migration.adapters.prophet21 import (
+	Prophet21SourceAdapter,
+	SourceColumnMetadata,
+	SourceSchemaMetadata,
+	SourceTableMetadata,
+	extract_entity_to_staging,
+)
+from bop_erp.migration.adapters.prophet21_queries import (
+	DEFAULT_PAGE_SIZE,
+	MAX_PAGE_SIZE,
+	LogicalEntityMapping,
+	build_bounded_select_query,
+)
+from bop_erp.migration.adapters.sql_executor import (
+	ReadOnlySqlExecutor,
+	SyntheticSqlExecutor,
+	coerce_source_record,
+	coerce_source_value,
 )
 from bop_erp.migration.import_boundary import import_validated_entity
 from bop_erp.migration.normalization import (
@@ -89,4 +112,21 @@ __all__ = [
 	"MigrationValidationError",
 	"DryRunError",
 	"ImportBoundaryError",
+	"ProductionSourceBlockedError",
+	"SourceSchemaError",
+	"SourceMappingError",
+	"SourceReadError",
+	"Prophet21SourceAdapter",
+	"SourceColumnMetadata",
+	"SourceTableMetadata",
+	"SourceSchemaMetadata",
+	"extract_entity_to_staging",
+	"ReadOnlySqlExecutor",
+	"SyntheticSqlExecutor",
+	"LogicalEntityMapping",
+	"build_bounded_select_query",
+	"coerce_source_value",
+	"coerce_source_record",
+	"DEFAULT_PAGE_SIZE",
+	"MAX_PAGE_SIZE",
 ]
