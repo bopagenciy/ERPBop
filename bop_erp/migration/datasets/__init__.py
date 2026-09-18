@@ -44,8 +44,13 @@ from bop_erp.migration.datasets.registry import (
 	default_registry,
 )
 from bop_erp.migration.datasets.staging import (
+	compute_source_record_key_hash,
 	extract_composite_source_identity,
+	extract_item_id_from_record_id,
+	extract_source_key_components,
 	normalize_dataset_payload,
+	parse_source_record_id,
+	serialize_canonical_key,
 	stage_dataset_file,
 	stage_dataset_row,
 )
@@ -86,6 +91,11 @@ __all__ = [
 	"ProfileRegistry",
 	"default_registry",
 	"extract_composite_source_identity",
+	"extract_source_key_components",
+	"serialize_canonical_key",
+	"compute_source_record_key_hash",
+	"parse_source_record_id",
+	"extract_item_id_from_record_id",
 	"normalize_dataset_payload",
 	"stage_dataset_file",
 	"stage_dataset_row",

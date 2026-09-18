@@ -430,12 +430,19 @@ class TestDatasetIngestionUnit(FrappeTestCase):
 		self.assertEqual(hash1, hash2)
 		self.assertEqual(len(hash1), 64)
 
-	# 18. Composite Source Identity
+	# 18. Composite Source Identity (Collision-Safe Canonical Tuple)
 	def test_18_composite_source_identity(self):
 		prof = self.registry.get("P21_INVENTORY_LOCATION")
 		row = {"Item ID": "AB28400", "Company ID": "100", "Location ID": "LOC-EAST"}
 		ident = extract_composite_source_identity(row, prof)
-		self.assertEqual(ident, "AB28400::100::LOC-EAST")
+		self.assertEqual(ident, '["AB28400","100","LOC-EAST"]')
+		# Collision check: delimiter strings in values do NOT collide
+		row1 = {"Item ID": "ABC::DEF", "Company ID": "100", "Location ID": "123"}
+		row2 = {"Item ID": "ABC", "Company ID": "DEF::100", "Location ID": "123"}
+		self.assertNotEqual(
+			extract_composite_source_identity(row1, prof),
+			extract_composite_source_identity(row2, prof),
+		)
 
 	# 19. Row Number Not Used as Identity
 	def test_19_row_number_not_used_as_identity(self):

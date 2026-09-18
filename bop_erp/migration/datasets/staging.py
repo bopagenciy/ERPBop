@@ -20,22 +20,82 @@ from bop_erp.migration.namespaces import canonical_source_namespace
 from bop_erp.migration.staging import compute_payload_hash, compute_staging_identity
 
 
+def extract_source_key_components(
+	row: Dict[str, Any], profile: SourceDatasetProfile, source_row_num: int = 0
+) -> List[Any]:
+	"""
+	Extracts exact source key values for the profile's key fields.
+	Preserves exact types (booleans, numbers, leading-zero strings) without destructive coercion.
+	"""
+	key_parts: List[Any] = []
+	for k in profile.key_fields:
+		if k not in row or row[k] is None or (isinstance(row[k], str) and row[k].strip() == ""):
+			raise DatasetValidationError(
+				f"Row {source_row_num}: Key field '{k}' is missing or empty in profile '{profile.profile_id}'."
+			)
+		val = row[k]
+		if isinstance(val, str):
+			key_parts.append(val.strip())
+		else:
+			key_parts.append(val)
+	return key_parts
+
+
+def serialize_canonical_key(key_components: List[Any]) -> str:
+	"""
+	Serializes key components into a collision-safe, deterministic canonical JSON tuple representation.
+	Guarantees that ['ABC::DEF', '123'] != ['ABC', 'DEF::123'],
+	['01', '23'] != ['0', '123'], ['00123'] != ['123'], ['A', None] != ['A', ''],
+	and ['A', 0] != ['A', False].
+	"""
+	return json.dumps(key_components, ensure_ascii=False, separators=(",", ":"))
+
+
+def compute_source_record_key_hash(key_components: List[Any]) -> str:
+	"""
+	Computes the deterministic SHA-256 hash of the canonical key representation.
+	"""
+	canonical_repr = serialize_canonical_key(key_components)
+	return hashlib.sha256(canonical_repr.encode("utf-8")).hexdigest()
+
+
+def parse_source_record_id(source_record_id: str) -> List[Any]:
+	"""
+	Parses a source_record_id back into its key components list.
+	Supports canonical JSON array serialization, with fallback for plain strings
+	or legacy delimiter-separated strings.
+	"""
+	if not source_record_id:
+		return []
+	try:
+		val = json.loads(source_record_id)
+		if isinstance(val, list):
+			return val
+		return [val]
+	except Exception:
+		if "::" in source_record_id:
+			return source_record_id.split("::")
+		return [source_record_id]
+
+
+def extract_item_id_from_record_id(source_record_id: str) -> str:
+	"""
+	Extracts the root Item ID from a single or composite source_record_id.
+	"""
+	components = parse_source_record_id(source_record_id)
+	return str(components[0]) if components else str(source_record_id)
+
+
 def extract_composite_source_identity(
 	row: Dict[str, Any], profile: SourceDatasetProfile, source_row_num: int = 0
 ) -> str:
 	"""
 	Extracts a stable business identity key from the configured key fields of the profile.
+	Uses collision-safe canonical JSON tuple representation.
 	Never uses source row numbers, array indices, or offsets as business identity.
 	"""
-	key_parts: List[str] = []
-	for k in profile.key_fields:
-		val = row.get(k)
-		if val is None or str(val).strip() == "":
-			raise DatasetValidationError(
-				f"Row {source_row_num}: Key field '{k}' is missing or empty in profile '{profile.profile_id}'."
-			)
-		key_parts.append(str(val).strip())
-	return "::".join(key_parts)
+	key_components = extract_source_key_components(row, profile, source_row_num)
+	return serialize_canonical_key(key_components)
 
 
 def normalize_dataset_payload(row: Dict[str, Any], profile: SourceDatasetProfile) -> Dict[str, Any]:

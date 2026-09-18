@@ -110,8 +110,9 @@ def build_canonical_items_from_staging(
 		rec_id = r.source_record_id
 		payload = json.loads(r.source_payload_json or "{}")
 
-		# Item ID is either the rec_id directly or the first component of composite key
-		item_id = rec_id.split("::")[0] if "::" in rec_id else rec_id
+		# Item ID is extracted using canonical parser
+		from bop_erp.migration.datasets.staging import extract_item_id_from_record_id
+		item_id = extract_item_id_from_record_id(rec_id)
 
 		if item_id not in items:
 			items[item_id] = CanonicalSourceItem(item_id=item_id)
