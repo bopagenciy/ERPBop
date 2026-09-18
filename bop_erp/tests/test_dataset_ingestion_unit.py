@@ -728,9 +728,21 @@ class TestDatasetIngestionUnit(FrappeTestCase):
 		row_initial = {"Item ID": "DRIFT-01", "Item Description": "Original Description"}
 		row_drifted = {"Item ID": "DRIFT-01", "Item Description": "Modified Unexpected Description"}
 
-		stage_dataset_row(run_id, "items.xlsx", "Sheet1", 5, row_initial, prof)
+		doc1, _ = stage_dataset_row(run_id, "items.xlsx", "Sheet1", 5, row_initial, prof)
+		orig_raw = doc1.source_payload_json
+		orig_hash = doc1.source_payload_hash
+
 		with self.assertRaises(SourcePayloadDriftError):
 			stage_dataset_row(run_id, "items.xlsx", "Sheet1", 5, row_drifted, prof)
+
+		# Verify original row remains completely unchanged
+		doc_fresh = frappe.get_doc("Migration Staging Row", doc1.name)
+		self.assertEqual(doc_fresh.source_payload_json, orig_raw)
+		self.assertEqual(doc_fresh.source_payload_hash, orig_hash)
+		self.assertEqual(
+			json.loads(doc_fresh.source_payload_json)["Item Description"],
+			"Original Description",
+		)
 
 	# 50. Cross-Run Immutable Snapshot Behavior
 	def test_50_cross_run_immutable_snapshot_behavior(self):

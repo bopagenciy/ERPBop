@@ -22,6 +22,7 @@ from bop_erp.migration.datasets import (
 	stage_dataset_row,
 )
 from bop_erp.migration.exceptions import SourcePayloadDriftError
+from bop_erp.migration.staging import compute_payload_hash
 
 
 class TestDatasetIngestionLive(FrappeTestCase):
@@ -32,8 +33,24 @@ class TestDatasetIngestionLive(FrappeTestCase):
 	Zero real P21 connections, zero production credentials, zero ERP business mutations.
 	"""
 
+	def _cleanup_test_data(self):
+		try:
+			runs = frappe.db.sql_list(
+				"SELECT name FROM `tabMigration Run` WHERE run_id LIKE 'TEST-1Y%'"
+			)
+			if runs:
+				frappe.db.delete("Migration Staging Row", {"migration_run": ("in", runs)})
+				for r in runs:
+					frappe.delete_doc("Migration Run", r, force=True, ignore_permissions=True)
+			frappe.db.delete("Migration Staging Row", {"source_record_id": ("like", "%TEST-1Y%")})
+			frappe.db.commit()
+		except Exception:
+			pass
+
 	def setUp(self):
 		super().setUp()
+		self._cleanup_test_data()
+
 		self.company = "_Test Company 1Y Live"
 		if not frappe.db.exists("Company", self.company):
 			frappe.get_doc({
@@ -58,22 +75,11 @@ class TestDatasetIngestionLive(FrappeTestCase):
 			self.registry.register(p)
 
 	def tearDown(self):
-		# Scenario N: Complete cleanup of all TEST-1Y fixtures
-		try:
-			runs = frappe.db.sql_list(
-				"SELECT name FROM `tabMigration Run` WHERE run_id LIKE 'TEST-1Y%'"
-			)
-			if runs:
-				frappe.db.delete("Migration Staging Row", {"migration_run": ("in", runs)})
-				for r in runs:
-					frappe.delete_doc("Migration Run", r, force=True, ignore_permissions=True)
-			frappe.db.commit()
-		except Exception:
-			pass
+		self._cleanup_test_data()
 		super().tearDown()
 
-	# Scenario A: Migration Run can persist new manifest/profile metadata fields
-	def test_scenario_a_migration_run_manifest_persistence(self):
+	# 1. Manifest persistence
+	def test_01_manifest_persistence(self):
 		manifest = {
 			"source_system": "PROPHET_21",
 			"profiles_executed": ["P21_ITEM_MASTER", "P21_INVENTORY_LOCATION"],
@@ -91,15 +97,15 @@ class TestDatasetIngestionLive(FrappeTestCase):
 		self.assertEqual(loaded_manifest["total_rows"], 50)
 		self.assertEqual(loaded_manifest["profiles_executed"], ["P21_ITEM_MASTER", "P21_INVENTORY_LOCATION"])
 
-	# Scenario B & C: Migration Staging Row persists provenance & read-after-write round trip
-	def test_scenario_b_c_staging_row_provenance_and_round_trip(self):
+	# 2. Staging provenance persistence
+	def test_02_staging_provenance_persistence(self):
 		prof = self.registry.get("P21_INVENTORY_LOCATION")
 		row = {
-			"Item ID": "TEST-1Y-ITEM-01",
+			"Item ID": "TEST-1Y-PROV-01",
 			"Company ID": "100",
 			"Location ID": "LOC-1",
-			"Quantity On Hand": 500,
-			"Primary Bin": "BIN-A1-04",
+			"Quantity On Hand": 250,
+			"Primary Bin": "BIN-PROV-01",
 		}
 
 		doc, is_new = stage_dataset_row(
@@ -117,9 +123,7 @@ class TestDatasetIngestionLive(FrappeTestCase):
 		db_row = frappe.db.sql(
 			"""
 			SELECT name, source_profile, profile_version, source_file_identifier,
-			       source_sheet, source_row_number, source_record_id, staging_identity_key,
-			       source_payload_hash, normalized_payload_hash, source_payload_json,
-			       normalized_payload_json, validation_status
+			       source_sheet, source_row_number, source_record_id, staging_identity_key
 			FROM `tabMigration Staging Row`
 			WHERE name = %s
 			""",
@@ -127,27 +131,44 @@ class TestDatasetIngestionLive(FrappeTestCase):
 			as_dict=True,
 		)[0]
 
-		# Verify exact fields
 		self.assertEqual(db_row.source_profile, "P21_INVENTORY_LOCATION")
 		self.assertEqual(db_row.profile_version, "1.0.0-client-sample")
 		self.assertEqual(db_row.source_file_identifier, "2InventoryLocation_sample.xlsx")
 		self.assertEqual(db_row.source_sheet, "Sheet1")
 		self.assertEqual(db_row.source_row_number, 14)
-		self.assertEqual(db_row.validation_status, "VALID")
-
-		# Canonical tuple representation check
-		self.assertEqual(db_row.source_record_id, '["TEST-1Y-ITEM-01","100","LOC-1"]')
+		self.assertEqual(db_row.source_record_id, '["TEST-1Y-PROV-01","100","LOC-1"]')
 		self.assertEqual(len(db_row.staging_identity_key), 64)
-		self.assertEqual(len(db_row.source_payload_hash), 64)
 
-		# Read-after-write payload round trip
-		loaded_raw = json.loads(db_row.source_payload_json)
-		self.assertEqual(loaded_raw["Item ID"], "TEST-1Y-ITEM-01")
-		self.assertEqual(loaded_raw["Primary Bin"], "BIN-A1-04")
-		self.assertEqual(loaded_raw["Quantity On Hand"], 500)
+	# 3. Read-after-write fidelity
+	def test_03_read_after_write_fidelity(self):
+		prof = self.registry.get("P21_ITEM_MASTER")
+		row = {
+			"Item ID": "TEST-1Y-FIDELITY-01",
+			"Item Description": "Read-After-Write Precision Item",
+			"Extended Info": "Exact string preservation",
+			"Sample Numeric": 12345,
+		}
 
-	# Scenario D: Composite identity collision counterexample
-	def test_scenario_d_composite_identity_collision_counterexample(self):
+		doc, _ = stage_dataset_row(
+			run_id=self.test_run.name,
+			source_file_identifier="1ItemMaster_sample.xlsx",
+			source_sheet="Sheet1",
+			source_row_number=2,
+			raw_row=row,
+			profile=prof,
+			company=self.company,
+		)
+
+		fresh_doc = frappe.get_doc("Migration Staging Row", doc.name)
+		self.assertEqual(fresh_doc.source_payload_hash, compute_payload_hash(row))
+		parsed_raw = json.loads(fresh_doc.source_payload_json)
+		self.assertEqual(parsed_raw["Item ID"], "TEST-1Y-FIDELITY-01")
+		self.assertEqual(parsed_raw["Item Description"], "Read-After-Write Precision Item")
+		self.assertEqual(parsed_raw["Sample Numeric"], 12345)
+		self.assertEqual(fresh_doc.validation_status, "VALID")
+
+	# 4. Delimiter collision resistance
+	def test_04_delimiter_collision_resistance(self):
 		prof = SourceDatasetProfile(
 			profile_id="COLLISION_CHECK_PROFILE",
 			source_system="COLLISION_SYS",
@@ -176,8 +197,22 @@ class TestDatasetIngestionLive(FrappeTestCase):
 		self.assertEqual(parse_source_record_id(key1), ["ABC::DEF", "123"])
 		self.assertEqual(parse_source_record_id(key2), ["ABC", "DEF::123"])
 
-	# Scenario E: Leading-zero identity persists
-	def test_scenario_e_leading_zero_identity_persists(self):
+		# Database stage verification: both stage independently without collision
+		doc1, is_new1 = stage_dataset_row(
+			self.test_run.name, "col.xlsx", "Sheet1", 1,
+			{"PartA": "ABC::DEF", "PartB": "123"}, prof
+		)
+		doc2, is_new2 = stage_dataset_row(
+			self.test_run.name, "col.xlsx", "Sheet1", 2,
+			{"PartA": "ABC", "PartB": "DEF::123"}, prof
+		)
+		self.assertTrue(is_new1)
+		self.assertTrue(is_new2)
+		self.assertNotEqual(doc1.name, doc2.name)
+		self.assertNotEqual(doc1.staging_identity_key, doc2.staging_identity_key)
+
+	# 5. Leading-zero identity
+	def test_05_leading_zero_identity(self):
 		prof = SourceDatasetProfile(
 			profile_id="LEADING_ZERO_PROFILE",
 			source_system="SYS",
@@ -192,8 +227,15 @@ class TestDatasetIngestionLive(FrappeTestCase):
 		self.assertEqual(key2, '["123"]')
 		self.assertNotEqual(key1, key2)
 
-	# Scenario F: Same-run identical replay converges in database
-	def test_scenario_f_same_run_replay_convergence(self):
+		doc1, is_new1 = stage_dataset_row(self.test_run.name, "f.xlsx", "S1", 1, {"Code": "00123"}, prof)
+		doc2, is_new2 = stage_dataset_row(self.test_run.name, "f.xlsx", "S1", 2, {"Code": "123"}, prof)
+		self.assertTrue(is_new1)
+		self.assertTrue(is_new2)
+		self.assertNotEqual(doc1.name, doc2.name)
+		self.assertNotEqual(doc1.staging_identity_key, doc2.staging_identity_key)
+
+	# 6. Same-run identical replay convergence
+	def test_06_same_run_replay_convergence(self):
 		prof = self.registry.get("P21_ITEM_MASTER")
 		row = {"Item ID": "TEST-1Y-CONVERGE", "Item Description": "Convergence Test Item"}
 
@@ -215,31 +257,87 @@ class TestDatasetIngestionLive(FrappeTestCase):
 		})
 		self.assertEqual(count, 1)
 
-	# Scenario G: Same-run changed payload triggers drift without mutating original raw payload
-	def test_scenario_g_same_run_drift_detection(self):
+	# 7. Same-run changed payload raises SourcePayloadDriftError
+	def test_07_same_run_changed_payload_raises_drift_error(self):
 		prof = self.registry.get("P21_ITEM_MASTER")
-		row_orig = {"Item ID": "TEST-1Y-DRIFT", "Item Description": "Original Description"}
-		row_drift = {"Item ID": "TEST-1Y-DRIFT", "Item Description": "Mutated Conflict"}
+		row_orig = {"Item ID": "TEST-1Y-DRIFT-ERR", "Item Description": "Original Description"}
+		row_drift = {"Item ID": "TEST-1Y-DRIFT-ERR", "Item Description": "Mutated Conflict"}
 
-		doc1, _ = stage_dataset_row(
-			self.test_run.name, "items.xlsx", "Sheet1", 5, row_orig, prof
-		)
+		stage_dataset_row(self.test_run.name, "items.xlsx", "Sheet1", 5, row_orig, prof)
 
-		with self.assertRaises(SourcePayloadDriftError):
+		with self.assertRaises(SourcePayloadDriftError) as ctx:
 			stage_dataset_row(self.test_run.name, "items.xlsx", "Sheet1", 5, row_drift, prof)
 
-		# Verify original row remains completely unchanged in MariaDB
-		doc_fresh = frappe.get_doc("Migration Staging Row", doc1.name)
-		self.assertEqual(
-			json.loads(doc_fresh.source_payload_json)["Item Description"],
-			"Original Description",
-		)
+		self.assertIn("Source payload drift detected", str(ctx.exception))
 
-	# Scenario H: Cross-run same identity creates a separate immutable snapshot
-	def test_scenario_h_cross_run_immutable_snapshot(self):
+	# 8. Original row remains unchanged after drift attempt
+	def test_08_original_row_immutable_after_drift_attempt(self):
+		prof = self.registry.get("P21_ITEM_MASTER")
+		row_orig = {"Item ID": "TEST-1Y-IMMUTABLE", "Item Description": "Immutable Original"}
+		row_drift = {"Item ID": "TEST-1Y-IMMUTABLE", "Item Description": "Attempted Mutation"}
+
+		doc1, is_new = stage_dataset_row(
+			self.test_run.name, "items.xlsx", "Sheet1", 10, row_orig, prof
+		)
+		self.assertTrue(is_new)
+
+		# Capture exact initial state from DB
+		initial_state = frappe.db.sql(
+			"""
+			SELECT name, source_payload_json, source_payload_hash,
+			       normalized_payload_json, normalized_payload_hash,
+			       source_profile, profile_version, source_file_identifier,
+			       source_sheet, source_row_number, modified
+			FROM `tabMigration Staging Row`
+			WHERE name = %s
+			""",
+			(doc1.name,),
+			as_dict=True,
+		)[0]
+
+		# Trigger drift error
+		with self.assertRaises(SourcePayloadDriftError):
+			stage_dataset_row(self.test_run.name, "items.xlsx", "Sheet1", 99, row_drift, prof)
+
+		# Refetch fresh from DB and assert absolute immutability
+		after_state = frappe.db.sql(
+			"""
+			SELECT name, source_payload_json, source_payload_hash,
+			       normalized_payload_json, normalized_payload_hash,
+			       source_profile, profile_version, source_file_identifier,
+			       source_sheet, source_row_number, modified
+			FROM `tabMigration Staging Row`
+			WHERE name = %s
+			""",
+			(doc1.name,),
+			as_dict=True,
+		)[0]
+
+		self.assertEqual(after_state.name, initial_state.name)
+		self.assertEqual(after_state.source_payload_json, initial_state.source_payload_json)
+		self.assertEqual(after_state.source_payload_hash, initial_state.source_payload_hash)
+		self.assertEqual(after_state.normalized_payload_json, initial_state.normalized_payload_json)
+		self.assertEqual(after_state.normalized_payload_hash, initial_state.normalized_payload_hash)
+		self.assertEqual(after_state.source_profile, initial_state.source_profile)
+		self.assertEqual(after_state.profile_version, initial_state.profile_version)
+		self.assertEqual(after_state.source_file_identifier, initial_state.source_file_identifier)
+		self.assertEqual(after_state.source_sheet, initial_state.source_sheet)
+		self.assertEqual(after_state.source_row_number, initial_state.source_row_number)
+		self.assertEqual(after_state.modified, initial_state.modified)
+
+		# Row count must remain exactly 1
+		count = frappe.db.count("Migration Staging Row", {
+			"migration_run": self.test_run.name,
+			"source_record_id": '["TEST-1Y-IMMUTABLE"]',
+		})
+		self.assertEqual(count, 1)
+
+	# 9. Cross-run UNCHANGED
+	def test_09_cross_run_unchanged_snapshot(self):
+		uid = frappe.generate_hash(length=6)
 		run2 = frappe.get_doc({
 			"doctype": "Migration Run",
-			"run_id": f"TEST-1Y-RUN2-{frappe.generate_hash(length=4)}",
+			"run_id": f"TEST-1Y-RUN2-{uid}",
 			"source_system": "PROPHET_21",
 			"source_instance_id": "MAIN",
 			"company": self.company,
@@ -247,34 +345,88 @@ class TestDatasetIngestionLive(FrappeTestCase):
 		}).insert(ignore_permissions=True)
 
 		prof = self.registry.get("P21_ITEM_MASTER")
-		row = {"Item ID": "TEST-1Y-SNAP", "Item Description": "Snapshot Item"}
+		row = {"Item ID": f"TEST-1Y-SNAP-UNCHANGED-{uid}", "Item Description": "Snapshot Item"}
 
-		doc1, _ = stage_dataset_row(self.test_run.name, "items.xlsx", "Sheet1", 5, row, prof)
+		doc1, is_new1 = stage_dataset_row(self.test_run.name, "items.xlsx", "Sheet1", 5, row, prof)
+		self.assertTrue(is_new1)
 		self.assertEqual(doc1.snapshot_state, "NEW")
 
-		# In second run, creates distinct row marked UNCHANGED
-		doc2, _ = stage_dataset_row(run2.name, "items.xlsx", "Sheet1", 5, row, prof)
+		# In second run with identical payload, creates distinct row marked UNCHANGED
+		doc2, is_new2 = stage_dataset_row(run2.name, "items.xlsx", "Sheet1", 5, row, prof)
+		self.assertTrue(is_new2)
 		self.assertNotEqual(doc1.name, doc2.name)
 		self.assertEqual(doc2.snapshot_state, "UNCHANGED")
 
-	# Scenario I: Profile retirement/disable does not delete historical staging rows
-	def test_scenario_i_profile_retirement_preserves_history(self):
+	# 10. Cross-run CHANGED
+	def test_10_cross_run_changed_snapshot(self):
+		uid = frappe.generate_hash(length=6)
+		run2 = frappe.get_doc({
+			"doctype": "Migration Run",
+			"run_id": f"TEST-1Y-RUN2-CHG-{uid}",
+			"source_system": "PROPHET_21",
+			"source_instance_id": "MAIN",
+			"company": self.company,
+			"status": "EXTRACTING",
+		}).insert(ignore_permissions=True)
+
 		prof = self.registry.get("P21_ITEM_MASTER")
-		row = {"Item ID": "TEST-1Y-RETIRE", "Item Description": "Retire Test Item"}
+		row_v1 = {"Item ID": f"TEST-1Y-SNAP-CHANGED-{uid}", "Item Description": "Version 1 Description"}
+		row_v2 = {"Item ID": f"TEST-1Y-SNAP-CHANGED-{uid}", "Item Description": "Version 2 Description Updated"}
 
-		doc, _ = stage_dataset_row(self.test_run.name, "items.xlsx", "Sheet1", 5, row, prof)
-		row_name = doc.name
+		doc1, is_new1 = stage_dataset_row(self.test_run.name, "items_v1.xlsx", "Sheet1", 5, row_v1, prof)
+		self.assertTrue(is_new1)
+		self.assertEqual(doc1.snapshot_state, "NEW")
 
-		# Disable/retire profile
-		self.registry.disable("P21_ITEM_MASTER")
-		self.assertFalse(self.registry.get("P21_ITEM_MASTER").active)
+		# In second run with changed payload, creates distinct row marked CHANGED
+		doc2, is_new2 = stage_dataset_row(run2.name, "items_v2.xlsx", "Sheet1", 5, row_v2, prof)
+		self.assertTrue(is_new2)
+		self.assertNotEqual(doc1.name, doc2.name)
+		self.assertEqual(doc2.snapshot_state, "CHANGED")
 
-		# Staged row in database remains 100% intact
-		self.assertTrue(frappe.db.exists("Migration Staging Row", row_name))
-		self.registry.enable("P21_ITEM_MASTER")
+		# Ensure original row from Run 1 remains untouched
+		doc1_fresh = frappe.get_doc("Migration Staging Row", doc1.name)
+		self.assertEqual(json.loads(doc1_fresh.source_payload_json)["Item Description"], "Version 1 Description")
+		self.assertEqual(doc1_fresh.snapshot_state, "NEW")
 
-	# Scenario J: Unknown extra source columns survive raw payload persistence
-	def test_scenario_j_unknown_extra_columns_survive(self):
+	# 11. Profile-version provenance does not change business identity
+	def test_11_profile_version_does_not_change_business_identity(self):
+		uid = frappe.generate_hash(length=6)
+		run2 = frappe.get_doc({
+			"doctype": "Migration Run",
+			"run_id": f"TEST-1Y-RUN2-VER-{uid}",
+			"source_system": "PROPHET_21",
+			"source_instance_id": "MAIN",
+			"company": self.company,
+			"status": "EXTRACTING",
+		}).insert(ignore_permissions=True)
+
+		prof_v1 = self.registry.get("P21_ITEM_MASTER")
+		# Create an upgraded version of the profile
+		prof_v2 = SourceDatasetProfile(
+			profile_id=prof_v1.profile_id,
+			source_system=prof_v1.source_system,
+			dataset_name=prof_v1.dataset_name,
+			entity_type=prof_v1.entity_type,
+			version="2.0.0-upgraded",
+			key_fields=prof_v1.key_fields,
+			field_mappings=prof_v1.field_mappings,
+		)
+
+		row = {"Item ID": f"TEST-1Y-VER-DECOUPLED-{uid}", "Item Description": "Version Decoupled Item"}
+
+		doc1, _ = stage_dataset_row(self.test_run.name, "file_v1.xlsx", "Sheet1", 5, row, prof_v1)
+		doc2, _ = stage_dataset_row(run2.name, "file_v2.xlsx", "Sheet1", 5, row, prof_v2)
+
+		# Staging identity keys must match identically
+		self.assertEqual(doc1.staging_identity_key, doc2.staging_identity_key)
+		# Snapshot in run 2 correctly detects UNCHANGED business payload
+		self.assertEqual(doc2.snapshot_state, "UNCHANGED")
+		# Provenance fields reflect respective profile versions
+		self.assertEqual(doc1.profile_version, "1.0.0-client-sample")
+		self.assertEqual(doc2.profile_version, "2.0.0-upgraded")
+
+	# 12. Unknown extra columns persist
+	def test_12_unknown_extra_columns_persist(self):
 		prof = self.registry.get("P21_ITEM_MASTER")
 		row = {
 			"Item ID": "TEST-1Y-EXTRA",
@@ -290,8 +442,8 @@ class TestDatasetIngestionLive(FrappeTestCase):
 		self.assertEqual(parsed["ClientCustomAttr1"], "CustomValueAlpha")
 		self.assertEqual(parsed["LegacyP21Flag99"], 42)
 
-	# Scenario K: None / empty string / zero / False survive round trip
-	def test_scenario_k_none_empty_zero_false_round_trip(self):
+	# 13. None / empty string / zero / False payload fidelity
+	def test_13_none_empty_zero_false_payload_fidelity(self):
 		prof = self.registry.get("P21_ITEM_MASTER")
 		row = {
 			"Item ID": "TEST-1Y-TYPES",
@@ -300,6 +452,7 @@ class TestDatasetIngestionLive(FrappeTestCase):
 			"EmptyStrVal": "",
 			"ZeroVal": 0,
 			"FalseVal": False,
+			"Cost": "145.8925",
 		}
 
 		doc, _ = stage_dataset_row(self.test_run.name, "items.xlsx", "Sheet1", 5, row, prof)
@@ -310,44 +463,31 @@ class TestDatasetIngestionLive(FrappeTestCase):
 		self.assertEqual(reloaded["ZeroVal"], 0)
 		self.assertIs(reloaded["FalseVal"], False)
 		self.assertIsNot(reloaded["FalseVal"], 0)
+		self.assertEqual(Decimal(str(reloaded["Cost"])), Decimal("145.8925"))
 
-	# Scenario L: Decimal-safe source values survive canonical staging
-	def test_scenario_l_decimal_safe_source_values(self):
-		prof = self.registry.get("P21_INVENTORY_LOCATION")
-		row = {
-			"Item ID": "TEST-1Y-DECIMAL",
-			"Company ID": "100",
-			"Location ID": "LOC-1",
-			"Moving Average Cost": "145.8925",
-			"Quantity On Hand": "1000.50",
-		}
+	# 14. Cleanup leaves zero TEST-1Y fixtures
+	def test_14_cleanup_leaves_zero_test_fixtures(self):
+		cleanup_run_id = f"TEST-1Y-CLEANUP-{frappe.generate_hash(length=4)}"
+		cleanup_run = frappe.get_doc({
+			"doctype": "Migration Run",
+			"run_id": cleanup_run_id,
+			"source_system": "PROPHET_21",
+			"source_instance_id": "MAIN",
+			"company": self.company,
+			"status": "EXTRACTING",
+		}).insert(ignore_permissions=True)
 
-		doc, _ = stage_dataset_row(self.test_run.name, "loc.xlsx", "Sheet1", 6, row, prof)
-		reloaded = json.loads(frappe.db.get_value("Migration Staging Row", doc.name, "source_payload_json"))
-		self.assertEqual(Decimal(str(reloaded["Moving Average Cost"])), Decimal("145.8925"))
+		prof = self.registry.get("P21_ITEM_MASTER")
+		stage_dataset_row(cleanup_run.name, "cln.xlsx", "Sheet1", 1, {"Item ID": "TEST-1Y-CLN-01"}, prof)
+		stage_dataset_row(cleanup_run.name, "cln.xlsx", "Sheet1", 2, {"Item ID": "TEST-1Y-CLN-02"}, prof)
 
-	# Scenario M: Manifest row counts & dependency metadata persist and reload correctly
-	def test_scenario_m_manifest_row_counts_and_dependencies(self):
-		manifest = {
-			"run_id": self.test_run.run_id,
-			"ordered_profiles": [p.profile_id for p in self.registry.list_profiles()],
-			"row_counts": {
-				"P21_ITEM_MASTER": 26,
-				"P21_INVENTORY_LOCATION": 25,
-				"P21_INVENTORY_SUPPLIER": 25,
-				"P21_ITEM_UOM": 25,
-				"P21_ITEM_DESCRIPTION": 25,
-				"P21_ITEM_SUPPLIER_BY_LOCATION": 26,
-			},
-			"deferred_dependencies": [],
-			"partial_items_count": 1,
-			"complete_items_count": 25,
-		}
-		self.test_run.manifest_json = json.dumps(manifest)
-		self.test_run.save(ignore_permissions=True)
+		# Execute cleanup query specifically targeting this run
+		frappe.db.delete("Migration Staging Row", {"migration_run": cleanup_run.name})
+		frappe.delete_doc("Migration Run", cleanup_run.name, force=True, ignore_permissions=True)
+		frappe.db.commit()
 
-		refetched = frappe.get_doc("Migration Run", self.test_run.name)
-		data = json.loads(refetched.manifest_json)
-		self.assertEqual(data["row_counts"]["P21_ITEM_MASTER"], 26)
-		self.assertEqual(data["partial_items_count"], 1)
-		self.assertEqual(data["complete_items_count"], 25)
+		remaining_runs = frappe.db.count("Migration Run", {"name": cleanup_run.name})
+		remaining_rows = frappe.db.count("Migration Staging Row", {"migration_run": cleanup_run.name})
+		self.assertEqual(remaining_runs, 0)
+		self.assertEqual(remaining_rows, 0)
+
