@@ -73,3 +73,6 @@ docker-data/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Local client migration/import data
+local_data/
