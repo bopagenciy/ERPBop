@@ -138,10 +138,13 @@ def parse_xlsx_stream(
 		wb = openpyxl.load_workbook(safe_path, read_only=True, data_only=True)
 		sheet_name = profile.sheet_name or wb.sheetnames[0]
 		if sheet_name not in wb.sheetnames:
-			wb.close()
-			raise DatasetParsingError(
-				f"Sheet '{sheet_name}' not found in workbook '{safe_path.name}'. Available: {wb.sheetnames}"
-			)
+			if len(wb.sheetnames) == 1:
+				sheet_name = wb.sheetnames[0]
+			else:
+				wb.close()
+				raise DatasetParsingError(
+					f"Sheet '{sheet_name}' not found in workbook '{safe_path.name}'. Available: {wb.sheetnames}"
+				)
 
 		sheet = wb[sheet_name]
 		headers: List[str] = []

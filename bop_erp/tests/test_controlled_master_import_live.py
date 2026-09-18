@@ -581,11 +581,16 @@ class TestControlledMasterImportLive(FrappeTestCase):
 
 		# Ensure clean start for sample batch test if already present
 		for s_id in selected_sample_ids:
-			mapping = frappe.db.get_value("External ID Mapping", {"external_id": s_id}, "name")
-			if mapping:
-				frappe.delete_doc("External ID Mapping", mapping, force=True, ignore_permissions=True)
+			for m in frappe.db.get_all("External ID Mapping", filters={"external_id": s_id}, pluck="name"):
+				try:
+					frappe.delete_doc("External ID Mapping", m, force=True, ignore_permissions=True)
+				except Exception:
+					frappe.db.delete("External ID Mapping", {"name": m})
 			if frappe.db.exists("Item", s_id):
-				frappe.delete_doc("Item", s_id, force=True, ignore_permissions=True)
+				try:
+					frappe.delete_doc("Item", s_id, force=True, ignore_permissions=True)
+				except Exception:
+					frappe.db.delete("Item", {"name": s_id})
 		frappe.db.commit()
 
 		canonical_items = []
