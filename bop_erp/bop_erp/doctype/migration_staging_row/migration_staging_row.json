@@ -11,6 +11,11 @@
   "source_record_id",
   "source_parent_id",
   "staging_identity_key",
+  "source_profile",
+  "profile_version",
+  "source_file_identifier",
+  "source_sheet",
+  "source_row_number",
   "column_break_1",
   "snapshot_state",
   "validation_status",
@@ -39,11 +44,10 @@
   },
   {
    "fieldname": "entity_type",
-   "fieldtype": "Select",
+   "fieldtype": "Data",
    "in_list_view": 1,
    "in_standard_filter": 1,
    "label": "Entity Type",
-   "options": "CUSTOMER\nVENDOR\nITEM\nWAREHOUSE",
    "reqd": 1
   },
   {
@@ -65,6 +69,31 @@
    "length": 64,
    "read_only": 1,
    "reqd": 1
+  },
+  {
+   "fieldname": "source_profile",
+   "fieldtype": "Data",
+   "label": "Source Profile"
+  },
+  {
+   "fieldname": "profile_version",
+   "fieldtype": "Data",
+   "label": "Profile Version"
+  },
+  {
+   "fieldname": "source_file_identifier",
+   "fieldtype": "Data",
+   "label": "Source File Identifier"
+  },
+  {
+   "fieldname": "source_sheet",
+   "fieldtype": "Data",
+   "label": "Source Sheet"
+  },
+  {
+   "fieldname": "source_row_number",
+   "fieldtype": "Int",
+   "label": "Source Row Number"
   },
   {
    "fieldname": "column_break_1",

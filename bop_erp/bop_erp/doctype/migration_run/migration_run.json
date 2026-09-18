@@ -30,7 +30,8 @@
   "skipped_rows",
   "section_break_audit",
   "created_by_user",
-  "notes"
+  "notes",
+  "manifest_json"
  ],
  "fields": [
   {
@@ -189,6 +190,11 @@
    "fieldname": "notes",
    "fieldtype": "Long Text",
    "label": "Notes"
+  },
+  {
+   "fieldname": "manifest_json",
+   "fieldtype": "Long Text",
+   "label": "Manifest JSON"
   }
  ],
  "index_web_pages_for_search": 1,
