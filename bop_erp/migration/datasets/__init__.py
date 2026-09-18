@@ -54,6 +54,16 @@ from bop_erp.migration.datasets.staging import (
 	stage_dataset_file,
 	stage_dataset_row,
 )
+from bop_erp.migration.datasets.importers import (
+	ControlledItemImporter,
+	EligibilityStatus,
+	ImportEligibilityResult,
+	ItemImportPreview,
+	ItemImportResult,
+	build_target_item_code,
+	evaluate_item_eligibility,
+	generate_import_preview,
+)
 from bop_erp.migration.datasets.validation import (
 	validate_cross_dataset_relationship,
 	validate_row_structure,
@@ -101,4 +111,12 @@ __all__ = [
 	"stage_dataset_row",
 	"validate_cross_dataset_relationship",
 	"validate_row_structure",
+	"ControlledItemImporter",
+	"EligibilityStatus",
+	"ImportEligibilityResult",
+	"ItemImportPreview",
+	"ItemImportResult",
+	"build_target_item_code",
+	"evaluate_item_eligibility",
+	"generate_import_preview",
 ]
