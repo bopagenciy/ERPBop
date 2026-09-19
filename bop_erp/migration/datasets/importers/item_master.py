@@ -98,6 +98,8 @@ class ItemImportResult:
 	target_mappings: Dict[str, str] = field(default_factory=dict)
 	stock_mutation_count: int = 0
 	financial_mutation_count: int = 0
+	item_provenance: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+	source_data_classes: Dict[str, str] = field(default_factory=dict)
 
 	def to_dict(self) -> Dict[str, Any]:
 		return {
@@ -114,6 +116,8 @@ class ItemImportResult:
 			"target_mappings": dict(self.target_mappings),
 			"stock_mutation_count": self.stock_mutation_count,
 			"financial_mutation_count": self.financial_mutation_count,
+			"item_provenance": dict(self.item_provenance),
+			"source_data_classes": dict(self.source_data_classes),
 		}
 
 
@@ -479,6 +483,20 @@ class ControlledItemImporter:
 				else:
 					status_str = "REUSED"
 
+				prov = dict(canonical_item.provenance) if canonical_item.provenance else {}
+				prov.update({
+					"source_data_class": getattr(canonical_item, "source_data_class", "CLIENT_SAMPLE"),
+					"source_item_id": canonical_item.item_id,
+					"source_file": prov.get("source_file") or prov.get("source_file_identifier", ""),
+					"source_row": prov.get("source_row") or prov.get("source_row_number"),
+					"profile_id": prov.get("profile_id", "P21_ITEM_MASTER"),
+					"profile_version": prov.get("profile_version", "1.0.0-client-sample"),
+					"migration_run": run_id or prov.get("migration_run"),
+					"canonical_source_identity": json.dumps([canonical_item.item_id], ensure_ascii=False, separators=(",", ":")),
+					"mapping_id": mapping_doc.name,
+					"target_item_code": item_doc.name,
+				})
+
 				return {
 					"status": status_str,
 					"item_code": item_doc.item_code,
@@ -486,6 +504,7 @@ class ControlledItemImporter:
 					"mapping_id": mapping_doc.name,
 					"modified_fields": modified_fields,
 					"deferred_relationships": elig.deferred_relationships,
+					"provenance": prov,
 				}
 
 			else:
@@ -570,12 +589,27 @@ class ControlledItemImporter:
 							update_modified=False,
 						)
 
+				prov = dict(canonical_item.provenance) if canonical_item.provenance else {}
+				prov.update({
+					"source_data_class": getattr(canonical_item, "source_data_class", "CLIENT_SAMPLE"),
+					"source_item_id": canonical_item.item_id,
+					"source_file": prov.get("source_file") or prov.get("source_file_identifier", ""),
+					"source_row": prov.get("source_row") or prov.get("source_row_number"),
+					"profile_id": prov.get("profile_id", "P21_ITEM_MASTER"),
+					"profile_version": prov.get("profile_version", "1.0.0-client-sample"),
+					"migration_run": run_id or prov.get("migration_run"),
+					"canonical_source_identity": json.dumps([canonical_item.item_id], ensure_ascii=False, separators=(",", ":")),
+					"mapping_id": mapping_doc.name,
+					"target_item_code": item_doc.name,
+				})
+
 				return {
 					"status": "CREATED",
 					"item_code": item_doc.item_code,
 					"target_name": item_doc.name,
 					"mapping_id": mapping_doc.name,
 					"deferred_relationships": elig.deferred_relationships,
+					"provenance": prov,
 				}
 
 		except Exception as e:
@@ -602,6 +636,9 @@ class ControlledItemImporter:
 			res = self.import_item(item, run_id=run_id)
 			st = res.get("status")
 			item_id = item.item_id
+			result.source_data_classes[item_id] = getattr(item, "source_data_class", "CLIENT_SAMPLE")
+			if res.get("provenance"):
+				result.item_provenance[item_id] = res["provenance"]
 
 			if st == "CREATED":
 				result.created_items.append(item_id)

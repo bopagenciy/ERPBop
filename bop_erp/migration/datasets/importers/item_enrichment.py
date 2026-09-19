@@ -243,6 +243,8 @@ class ItemEnrichmentResult:
 	warnings: List[str] = field(default_factory=list)
 	errors: List[str] = field(default_factory=list)
 	completeness_reports: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+	item_provenance: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+	source_data_classes: Dict[str, str] = field(default_factory=dict)
 
 	def to_dict(self) -> Dict[str, Any]:
 		return {
@@ -263,6 +265,8 @@ class ItemEnrichmentResult:
 			"warnings": list(self.warnings),
 			"errors": list(self.errors),
 			"completeness_reports": dict(self.completeness_reports),
+			"item_provenance": dict(self.item_provenance),
+			"source_data_classes": dict(self.source_data_classes),
 		}
 
 
@@ -816,6 +820,13 @@ class ControlledItemEnricher:
 
 				if res.get("deferred_relationships"):
 					result.deferred_relationships[item.item_id] = res["deferred_relationships"]
+
+				result.source_data_classes[item.item_id] = getattr(item, "source_data_class", "CLIENT_SAMPLE")
+				prov = dict(item.provenance) if item.provenance else {}
+				prov.setdefault("source_item_id", item.item_id)
+				prov.setdefault("source_data_class", getattr(item, "source_data_class", "CLIENT_SAMPLE"))
+				prov.setdefault("target_item_code", res.get("target_code", item.item_id))
+				result.item_provenance[item.item_id] = prov
 
 			except Exception as e:
 				result.errors.append(f"Error enriching item {item.item_id}: {str(e)}")

@@ -3,6 +3,7 @@
 
 from bop_erp.migration.datasets.aggregation import (
 	CanonicalSourceItem,
+	SourceDataClass,
 	build_canonical_items_from_staging,
 	classify_item_completeness,
 )
@@ -81,6 +82,7 @@ from bop_erp.migration.datasets.validation import (
 
 __all__ = [
 	"CanonicalSourceItem",
+	"SourceDataClass",
 	"build_canonical_items_from_staging",
 	"classify_item_completeness",
 	"AuthorityDecision",

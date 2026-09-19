@@ -2,10 +2,16 @@
 # See license.txt
 
 from dataclasses import dataclass, field
+from enum import Enum
 import json
 from typing import Any, Dict, List, Optional, Set
 
 import frappe
+
+
+class SourceDataClass(str, Enum):
+	CLIENT_SAMPLE = "CLIENT_SAMPLE"
+	SYNTHETIC_FIXTURE = "SYNTHETIC_FIXTURE"
 
 
 @dataclass
@@ -26,6 +32,7 @@ class CanonicalSourceItem:
 	provenance: Dict[str, Any] = field(default_factory=dict)
 	validation_findings: List[Dict[str, Any]] = field(default_factory=list)
 	completeness_status: str = "PENDING"
+	source_data_class: str = SourceDataClass.CLIENT_SAMPLE.value
 
 	def to_dict(self) -> Dict[str, Any]:
 		return {
@@ -39,6 +46,7 @@ class CanonicalSourceItem:
 			"provenance": dict(self.provenance),
 			"validation_findings": list(self.validation_findings),
 			"completeness_status": self.completeness_status,
+			"source_data_class": self.source_data_class,
 		}
 
 
@@ -96,7 +104,9 @@ def build_canonical_items_from_staging(
 	staged_rows = frappe.db.sql(
 		"""
 		SELECT entity_type, source_record_id, source_payload_json,
-		       validation_status, validation_errors_json
+		       validation_status, validation_errors_json,
+		       source_file_identifier, source_row_number,
+		       source_profile, profile_version
 		FROM `tabMigration Staging Row`
 		WHERE migration_run = %s
 		ORDER BY creation ASC, name ASC
@@ -114,13 +124,28 @@ def build_canonical_items_from_staging(
 		from bop_erp.migration.datasets.staging import extract_item_id_from_record_id
 		item_id = extract_item_id_from_record_id(rec_id)
 
+		src_file = r.get("source_file_identifier") or ""
+		is_client = any(k in src_file.lower() for k in ("sample", "local_data", "p21_samples"))
+		data_class = SourceDataClass.CLIENT_SAMPLE.value if is_client else SourceDataClass.SYNTHETIC_FIXTURE.value
+
 		if item_id not in items:
-			items[item_id] = CanonicalSourceItem(item_id=item_id)
+			items[item_id] = CanonicalSourceItem(item_id=item_id, source_data_class=data_class)
 
 		item = items[item_id]
 
 		if ent == "ITEM_MASTER":
 			item.master = payload
+			item.source_data_class = data_class
+			item.provenance.update({
+				"source_data_class": data_class,
+				"source_item_id": item_id,
+				"source_file": src_file,
+				"source_row": r.get("source_row_number"),
+				"profile_id": r.get("source_profile"),
+				"profile_version": r.get("profile_version"),
+				"migration_run": run_id,
+				"canonical_source_identity": rec_id,
+			})
 		elif ent == "ITEM_DESCRIPTION":
 			item.descriptions.append(payload)
 		elif ent == "ITEM_UOM":
@@ -131,6 +156,13 @@ def build_canonical_items_from_staging(
 			item.suppliers.append(payload)
 		elif ent == "ITEM_SUPPLIER_BY_LOCATION":
 			item.supplier_location_overrides.append(payload)
+
+		item.provenance.setdefault("datasets", {})[ent] = {
+			"source_file": src_file,
+			"source_row": r.get("source_row_number"),
+			"profile_id": r.get("source_profile"),
+			"canonical_source_identity": rec_id,
+		}
 
 		if r.validation_status == "ERROR":
 			item.validation_findings.append({

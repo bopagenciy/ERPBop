@@ -13,6 +13,7 @@ from bop_erp.migration.datasets.importers.item_enrichment import (
 	generate_enrichment_preview,
 	reconcile_dataset_completeness,
 )
+from bop_erp.migration.datasets.aggregation import SourceDataClass
 from bop_erp.migration.datasets.importers.item_master import (
 	ControlledItemImporter,
 	EligibilityStatus,
@@ -25,6 +26,7 @@ from bop_erp.migration.datasets.importers.item_master import (
 )
 
 __all__ = [
+	"SourceDataClass",
 	"CompletenessGatePolicy",
 	"ControlledItemEnricher",
 	"ControlledItemImporter",
