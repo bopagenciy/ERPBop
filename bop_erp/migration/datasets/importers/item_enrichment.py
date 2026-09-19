@@ -88,6 +88,94 @@ class UOMMappingConfig:
 		return None
 
 
+class CompletenessGatePolicy(str, Enum):
+	ALLOW_PARTIAL = "ALLOW_PARTIAL"
+	STRICT = "STRICT"
+	REVIEW_REQUIRED = "REVIEW_REQUIRED"
+
+
+@dataclass
+class DatasetCompletenessReport:
+	"""
+	Reconciles root source items against a secondary dataset to track
+	matched, missing, and unexpected secondary-only records prior to target mutation.
+	"""
+
+	dataset_name: str
+	selected_root_ids: List[str]
+	secondary_ids: List[str]
+	matched_ids: List[str]
+	missing_ids: List[str]
+	unexpected_secondary_only_ids: List[str]
+	status: str = "COMPLETE"
+	policy: CompletenessGatePolicy = CompletenessGatePolicy.ALLOW_PARTIAL
+	warnings: List[str] = field(default_factory=list)
+
+	def to_dict(self) -> Dict[str, Any]:
+		return {
+			"dataset_name": self.dataset_name,
+			"selected_root_ids": list(self.selected_root_ids),
+			"secondary_ids": list(self.secondary_ids),
+			"matched_ids": list(self.matched_ids),
+			"missing_ids": list(self.missing_ids),
+			"unexpected_secondary_only_ids": list(self.unexpected_secondary_only_ids),
+			"status": self.status,
+			"policy": self.policy.value if hasattr(self.policy, "value") else str(self.policy),
+			"warnings": list(self.warnings),
+		}
+
+
+def reconcile_dataset_completeness(
+	selected_root_ids: List[str],
+	dataset_name: str,
+	secondary_ids: List[str],
+	policy: CompletenessGatePolicy = CompletenessGatePolicy.ALLOW_PARTIAL,
+	expected_missing_ids: Optional[Set[str]] = None,
+) -> DatasetCompletenessReport:
+	"""
+	Produces a deterministic completeness report comparing root IDs with secondary dataset IDs.
+	"""
+	root_set = set(str(i).strip() for i in selected_root_ids if i)
+	sec_set = set(str(i).strip() for i in secondary_ids if i)
+	expected_missing = expected_missing_ids or set()
+
+	matched = sorted(list(root_set & sec_set))
+	missing = sorted(list(root_set - sec_set))
+	unexpected_sec = sorted(list(sec_set - root_set))
+
+	warnings: List[str] = []
+	if missing:
+		unexp_missing = set(missing) - expected_missing
+		if unexp_missing:
+			warnings.append(f"Unexpected missing IDs in {dataset_name}: {sorted(list(unexp_missing))}")
+		else:
+			warnings.append(f"Expected missing IDs in {dataset_name}: {missing}")
+
+	if unexpected_sec:
+		warnings.append(f"Secondary dataset {dataset_name} has {len(unexpected_sec)} IDs not in selected root IDs.")
+
+	if not missing:
+		status = "COMPLETE"
+	elif all(m in expected_missing for m in missing) or policy == CompletenessGatePolicy.ALLOW_PARTIAL:
+		status = "PARTIAL_EXPECTED"
+	elif policy == CompletenessGatePolicy.STRICT:
+		status = "BLOCKED"
+	else:
+		status = "REVIEW_REQUIRED"
+
+	return DatasetCompletenessReport(
+		dataset_name=dataset_name,
+		selected_root_ids=list(selected_root_ids),
+		secondary_ids=list(secondary_ids),
+		matched_ids=matched,
+		missing_ids=missing,
+		unexpected_secondary_only_ids=unexpected_sec,
+		status=status,
+		policy=policy,
+		warnings=warnings,
+	)
+
+
 @dataclass
 class ItemEnrichmentPreview:
 	"""
@@ -99,6 +187,25 @@ class ItemEnrichmentPreview:
 	summary: Dict[str, int]
 	warnings: List[str]
 	deferred_relationships: Dict[str, List[str]]
+	completeness_reports: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+	@property
+	def is_blocked(self) -> bool:
+		return any(
+			rep.get("status") in ("BLOCKED", "REVIEW_REQUIRED")
+			for rep in self.completeness_reports.values()
+		) or self.summary.get("blocked", 0) > 0
+
+	@property
+	def blocking_reasons(self) -> List[str]:
+		reasons = []
+		for name, rep in self.completeness_reports.items():
+			if rep.get("status") in ("BLOCKED", "REVIEW_REQUIRED"):
+				reasons.extend(rep.get("warnings", []))
+		for item_id, item_info in self.items.items():
+			if item_info.get("status") == "BLOCKED":
+				reasons.append(f"{item_id}: {item_info.get('reason')}")
+		return reasons
 
 	def to_dict(self) -> Dict[str, Any]:
 		return {
@@ -107,6 +214,9 @@ class ItemEnrichmentPreview:
 			"summary": dict(self.summary),
 			"warnings": list(self.warnings),
 			"deferred_relationships": dict(self.deferred_relationships),
+			"completeness_reports": dict(self.completeness_reports),
+			"is_blocked": self.is_blocked,
+			"blocking_reasons": self.blocking_reasons,
 		}
 
 
@@ -132,6 +242,7 @@ class ItemEnrichmentResult:
 	deferred_relationships: Dict[str, List[str]] = field(default_factory=dict)
 	warnings: List[str] = field(default_factory=list)
 	errors: List[str] = field(default_factory=list)
+	completeness_reports: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 	def to_dict(self) -> Dict[str, Any]:
 		return {
@@ -151,6 +262,7 @@ class ItemEnrichmentResult:
 			"deferred_relationships": dict(self.deferred_relationships),
 			"warnings": list(self.warnings),
 			"errors": list(self.errors),
+			"completeness_reports": dict(self.completeness_reports),
 		}
 
 
@@ -193,21 +305,39 @@ class ControlledItemEnricher:
 
 	def __init__(
 		self,
-		company: str,
+		company: Optional[str] = None,
 		source_system: str = "PROPHET_21",
 		source_instance_id: Optional[str] = None,
 		uom_config: Optional[UOMMappingConfig] = None,
 		description_policy: FieldAuthorityPolicy = FieldAuthorityPolicy.SOURCE_AUTHORITATIVE,
 		uom_policy: FieldAuthorityPolicy = FieldAuthorityPolicy.REVIEW_ON_CONFLICT,
+		completeness_policy: Optional[CompletenessGatePolicy] = None,
+		expected_missing_ids: Optional[Dict[str, Set[str]]] = None,
+		completeness_gate_policy: Optional[CompletenessGatePolicy] = None,
+		expected_missing_secondary_ids: Optional[Dict[str, Set[str]]] = None,
 	):
-		self.company = company
+		self.company = company or (
+			frappe.defaults.get_user_default("Company")
+			if hasattr(frappe, "defaults") and frappe.defaults
+			else "_Test Company"
+		) or "_Test Company"
 		self.source_system = source_system
 		self.source_instance_id = source_instance_id
 		self.provider = canonical_provider(source_system, source_instance_id)
 		self.uom_config = uom_config or UOMMappingConfig()
 		self.description_policy = description_policy
 		self.uom_policy = uom_policy
-		self.channel_id = compute_migration_channel_id(company, source_system, source_instance_id)
+		self.completeness_policy = (
+			completeness_policy
+			or completeness_gate_policy
+			or CompletenessGatePolicy.ALLOW_PARTIAL
+		)
+		self.expected_missing_ids = (
+			expected_missing_ids
+			or expected_missing_secondary_ids
+			or {}
+		)
+		self.channel_id = compute_migration_channel_id(self.company, source_system, source_instance_id)
 
 	def resolve_target_item(self, item_id: str) -> Tuple[Optional[Any], Optional[str]]:
 		"""
@@ -427,12 +557,39 @@ class ControlledItemEnricher:
 				"stock_uom": item_doc.stock_uom,
 			}
 
+		# Run completeness pre-mutation gates
+		selected_ids = [i.item_id for i in canonical_items]
+		desc_ids = [i.item_id for i in canonical_items if i.descriptions]
+		uom_ids = [i.item_id for i in canonical_items if i.uoms]
+
+		desc_report = reconcile_dataset_completeness(
+			selected_root_ids=selected_ids,
+			dataset_name="ItemDescription",
+			secondary_ids=desc_ids,
+			policy=self.completeness_policy,
+			expected_missing_ids=self.expected_missing_ids.get("ItemDescription"),
+		)
+		uom_report = reconcile_dataset_completeness(
+			selected_root_ids=selected_ids,
+			dataset_name="ItemUnitofMeasure",
+			secondary_ids=uom_ids,
+			policy=self.completeness_policy,
+			expected_missing_ids=self.expected_missing_ids.get("ItemUnitofMeasure"),
+		)
+		completeness_reports = {
+			"ItemDescription": desc_report.to_dict(),
+			"ItemUnitofMeasure": uom_report.to_dict(),
+		}
+		warnings.extend(desc_report.warnings)
+		warnings.extend(uom_report.warnings)
+
 		return ItemEnrichmentPreview(
 			selected_items=[i.item_id for i in canonical_items],
 			items=items_preview,
 			summary=summary,
 			warnings=warnings,
 			deferred_relationships=deferred_relations,
+			completeness_reports=completeness_reports,
 		)
 
 	def enrich_item(
@@ -592,6 +749,37 @@ class ControlledItemEnricher:
 			run_id=actual_run_id,
 			items_processed=len(canonical_items),
 		)
+
+		# Completeness gate evaluation before mutations
+		selected_ids = [i.item_id for i in canonical_items]
+		desc_ids = [i.item_id for i in canonical_items if i.descriptions]
+		uom_ids = [i.item_id for i in canonical_items if i.uoms]
+
+		desc_report = reconcile_dataset_completeness(
+			selected_root_ids=selected_ids,
+			dataset_name="ItemDescription",
+			secondary_ids=desc_ids,
+			policy=self.completeness_policy,
+			expected_missing_ids=self.expected_missing_ids.get("ItemDescription"),
+		)
+		uom_report = reconcile_dataset_completeness(
+			selected_root_ids=selected_ids,
+			dataset_name="ItemUnitofMeasure",
+			secondary_ids=uom_ids,
+			policy=self.completeness_policy,
+			expected_missing_ids=self.expected_missing_ids.get("ItemUnitofMeasure"),
+		)
+		result.completeness_reports = {
+			"ItemDescription": desc_report.to_dict(),
+			"ItemUnitofMeasure": uom_report.to_dict(),
+		}
+		result.warnings.extend(desc_report.warnings)
+		result.warnings.extend(uom_report.warnings)
+
+		if self.completeness_policy == CompletenessGatePolicy.STRICT:
+			if desc_report.status == "BLOCKED" or uom_report.status == "BLOCKED":
+				result.errors.append("Completeness gate violation: unexpected missing relationships under STRICT policy.")
+				return result
 
 		for item in canonical_items:
 			try:

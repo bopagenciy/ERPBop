@@ -55,8 +55,10 @@ from bop_erp.migration.datasets.staging import (
 	stage_dataset_row,
 )
 from bop_erp.migration.datasets.importers import (
+	CompletenessGatePolicy,
 	ControlledItemEnricher,
 	ControlledItemImporter,
+	DatasetCompletenessReport,
 	DescriptionAction,
 	EligibilityStatus,
 	ImportEligibilityResult,
@@ -70,6 +72,7 @@ from bop_erp.migration.datasets.importers import (
 	evaluate_item_eligibility,
 	generate_enrichment_preview,
 	generate_import_preview,
+	reconcile_dataset_completeness,
 )
 from bop_erp.migration.datasets.validation import (
 	validate_cross_dataset_relationship,
@@ -118,8 +121,10 @@ __all__ = [
 	"stage_dataset_row",
 	"validate_cross_dataset_relationship",
 	"validate_row_structure",
+	"CompletenessGatePolicy",
 	"ControlledItemEnricher",
 	"ControlledItemImporter",
+	"DatasetCompletenessReport",
 	"DescriptionAction",
 	"EligibilityStatus",
 	"ImportEligibilityResult",
@@ -133,4 +138,5 @@ __all__ = [
 	"evaluate_item_eligibility",
 	"generate_enrichment_preview",
 	"generate_import_preview",
+	"reconcile_dataset_completeness",
 ]

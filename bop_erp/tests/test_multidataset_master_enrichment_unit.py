@@ -406,3 +406,123 @@ class TestMultiDatasetMasterEnrichmentUnit(TestCase):
 			self.enricher.enrich_item(canonical_item)
 
 		mock_rollback.assert_called_once()
+
+	# 19. Completeness reconciliation: complete join
+	def test_19_reconcile_dataset_completeness_complete(self):
+		from bop_erp.migration.datasets import (
+			CompletenessGatePolicy,
+			reconcile_dataset_completeness,
+		)
+		roots = ["AB28400", "AB28401", "AB28402"]
+		secondary = ["AB28400", "AB28401", "AB28402"]
+		report = reconcile_dataset_completeness(roots, "ItemDescription", secondary)
+		self.assertEqual(report.status, "COMPLETE")
+		self.assertEqual(report.matched_ids, ["AB28400", "AB28401", "AB28402"])
+		self.assertEqual(report.missing_ids, [])
+		self.assertEqual(report.unexpected_secondary_only_ids, [])
+
+	# 20. Completeness reconciliation: expected missing
+	def test_20_reconcile_dataset_completeness_expected_missing(self):
+		from bop_erp.migration.datasets import (
+			CompletenessGatePolicy,
+			reconcile_dataset_completeness,
+		)
+		roots = ["AB28400", "AB28401", "AB28406"]
+		secondary = ["AB28400", "AB28401"]
+		report = reconcile_dataset_completeness(
+			roots,
+			"ItemDescription",
+			secondary,
+			policy=CompletenessGatePolicy.STRICT,
+			expected_missing_ids={"AB28406"},
+		)
+		self.assertEqual(report.status, "PARTIAL_EXPECTED")
+		self.assertEqual(report.matched_ids, ["AB28400", "AB28401"])
+		self.assertEqual(report.missing_ids, ["AB28406"])
+
+	# 21. Completeness reconciliation: unexpected missing under STRICT policy blocks
+	def test_21_reconcile_dataset_completeness_strict_blocking(self):
+		from bop_erp.migration.datasets import (
+			CompletenessGatePolicy,
+			reconcile_dataset_completeness,
+		)
+		roots = ["AB28400", "AB28401", "AB28406"]
+		secondary = ["AB28400", "AB28401"]
+		# AB28406 not declared in expected_missing_ids
+		report = reconcile_dataset_completeness(
+			roots,
+			"ItemDescription",
+			secondary,
+			policy=CompletenessGatePolicy.STRICT,
+		)
+		self.assertEqual(report.status, "BLOCKED")
+		self.assertIn("Unexpected missing IDs in ItemDescription: ['AB28406']", report.warnings[0])
+
+	# 22. Completeness reconciliation: secondary-only IDs tracked
+	def test_22_reconcile_dataset_completeness_secondary_only_tracking(self):
+		from bop_erp.migration.datasets import reconcile_dataset_completeness
+		roots = ["AB28400"]
+		secondary = ["AB28400", "AB32176", "AB32182"]
+		report = reconcile_dataset_completeness(roots, "ItemUnitofMeasure", secondary)
+		self.assertEqual(report.matched_ids, ["AB28400"])
+		self.assertEqual(report.unexpected_secondary_only_ids, ["AB32176", "AB32182"])
+
+	# 23. Root Item identity extraction across all 15 test IDs
+	def test_23_root_item_identity_extraction_exact(self):
+		from bop_erp.migration.datasets.staging import (
+			extract_item_id_from_record_id,
+			serialize_canonical_key,
+		)
+		selected_15 = [
+			"AB28400", "AB28401", "AB28402", "AB28403", "AB28404",
+			"AB28405", "AB28406", "AB28407", "AB28408", "AB28409",
+			"AB28410", "AB28411", "AB28412", "AB28413", "AB39402"
+		]
+		for s_id in selected_15:
+			# Test canonical JSON representation and composite forms
+			rec_id_1 = serialize_canonical_key([s_id])
+			rec_id_2 = serialize_canonical_key([s_id, "EA"])
+			rec_id_3 = f"{s_id}::EA"
+			rec_id_4 = s_id
+			self.assertEqual(extract_item_id_from_record_id(rec_id_1), s_id)
+			self.assertEqual(extract_item_id_from_record_id(rec_id_2), s_id)
+			self.assertEqual(extract_item_id_from_record_id(rec_id_3), s_id)
+			self.assertEqual(extract_item_id_from_record_id(rec_id_4), s_id)
+
+	# 24. Parser row boundary and generator non-truncation proof
+	def test_24_parser_row_boundary_integrity(self):
+		from pathlib import Path
+		# Prove generator yields all items without premature stopping at 7
+		from bop_erp.migration.datasets.parser import parse_csv_stream
+		from bop_erp.migration.datasets.profiles import SourceDatasetProfile
+		import io
+
+		# Generate a CSV stream with 30 items
+		csv_lines = ["Item ID,Item Description\n"]
+		for i in range(1, 31):
+			csv_lines.append(f"ITEM-{i:03d},Description {i}\n")
+		csv_content = "".join(csv_lines)
+
+		profile = SourceDatasetProfile(
+			profile_id="TEST_PROFILE",
+			source_system="TEST",
+			dataset_name="Test",
+			entity_type="ITEM_MASTER",
+			file_type="csv",
+			sheet_name="",
+			header_row=1,
+			metadata_rows=[],
+			data_start_row=2,
+			example_rows_to_ignore=[],
+			key_fields=["Item ID"],
+			required_fields=["Item ID"],
+			field_mappings={"Item ID": "item_code"},
+		)
+
+		with patch("bop_erp.migration.datasets.parser.check_file_safety") as mock_safety:
+			mock_safety.return_value = Path("dummy.csv")
+			with patch("builtins.open", return_value=io.StringIO(csv_content)):
+				rows = list(parse_csv_stream("dummy.csv", profile))
+				self.assertEqual(len(rows), 30)
+				self.assertEqual(rows[0][1]["Item ID"], "ITEM-001")
+				self.assertEqual(rows[29][1]["Item ID"], "ITEM-030")

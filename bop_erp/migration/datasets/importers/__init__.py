@@ -2,13 +2,16 @@
 # See license.txt
 
 from bop_erp.migration.datasets.importers.item_enrichment import (
+	CompletenessGatePolicy,
 	ControlledItemEnricher,
+	DatasetCompletenessReport,
 	DescriptionAction,
 	ItemEnrichmentPreview,
 	ItemEnrichmentResult,
 	UOMAction,
 	UOMMappingConfig,
 	generate_enrichment_preview,
+	reconcile_dataset_completeness,
 )
 from bop_erp.migration.datasets.importers.item_master import (
 	ControlledItemImporter,
@@ -22,8 +25,10 @@ from bop_erp.migration.datasets.importers.item_master import (
 )
 
 __all__ = [
+	"CompletenessGatePolicy",
 	"ControlledItemEnricher",
 	"ControlledItemImporter",
+	"DatasetCompletenessReport",
 	"DescriptionAction",
 	"EligibilityStatus",
 	"ImportEligibilityResult",
@@ -37,4 +42,5 @@ __all__ = [
 	"evaluate_item_eligibility",
 	"generate_enrichment_preview",
 	"generate_import_preview",
+	"reconcile_dataset_completeness",
 ]

@@ -13,6 +13,7 @@ from frappe.utils import flt
 from bop_erp.constants import ExternalEntityType
 from bop_erp.migration.datasets import (
 	CanonicalSourceItem,
+	CompletenessGatePolicy,
 	ControlledItemEnricher,
 	ControlledItemImporter,
 	DescriptionAction,
@@ -24,6 +25,7 @@ from bop_erp.migration.datasets import (
 	generate_enrichment_preview,
 	get_initial_p21_profiles,
 	parse_xlsx_stream,
+	reconcile_dataset_completeness,
 )
 from bop_erp.migration.namespaces import canonical_provider, compute_migration_channel_id
 
@@ -771,3 +773,97 @@ class TestMultiDatasetMasterEnrichmentLive(FrappeTestCase):
 		self._cleanup_test_data()
 		self.assertFalse(frappe.db.exists("Item", target_code))
 		self.assertFalse(frappe.db.exists("External ID Mapping", {"external_id": item_id}))
+
+	# 31. Physical sample completeness reconciliation exact
+	def test_31_physical_sample_completeness_reconciliation_exact(self):
+		sample_dir = Path(frappe.get_app_path("bop_erp", "..", "local_data", "p21_samples")).resolve()
+		if not sample_dir.exists():
+			self.skipTest("p21_samples directory not found")
+
+		profiles = {p.profile_id: p for p in get_initial_p21_profiles()}
+		m_prof = profiles["P21_ITEM_MASTER"]
+		d_prof = profiles["P21_ITEM_DESCRIPTION"]
+		u_prof = profiles["P21_ITEM_UOM"]
+
+		m_file = sample_dir / "1ItemMaster_sample.xlsx"
+		d_file = sample_dir / "5ItemDescription_sample.xlsx"
+		u_file = sample_dir / "4ItemUnitofMeasure_sample.xlsx"
+
+		if not (m_file.exists() and d_file.exists() and u_file.exists()):
+			self.skipTest("Sample files not present")
+
+		m_items = {str(row["Item ID"]).strip() for _, row in parse_xlsx_stream(str(m_file), m_prof)}
+		d_items = {str(row["Item ID"]).strip() for _, row in parse_xlsx_stream(str(d_file), d_prof)}
+		u_items = {str(row["Item ID"]).strip() for _, row in parse_xlsx_stream(str(u_file), u_prof)}
+
+		# Master has 26 rows, Desc has 25, UOM has 25
+		self.assertEqual(len(m_items), 26)
+		self.assertEqual(len(d_items), 25)
+		self.assertEqual(len(u_items), 25)
+
+		selected_15 = [
+			"AB28400", "AB28401", "AB28402", "AB28403", "AB28404",
+			"AB28405", "AB28406", "AB28407", "AB28408", "AB28409",
+			"AB28410", "AB28411", "AB28412", "AB28413", "AB39402"
+		]
+
+		report_d = reconcile_dataset_completeness(selected_15, "ItemDescription", d_items)
+		report_u = reconcile_dataset_completeness(selected_15, "ItemUnitofMeasure", u_items)
+
+		# Exactly 7 matched, exactly 8 missing
+		expected_matched = ["AB28400", "AB28401", "AB28402", "AB28403", "AB28404", "AB28405", "AB39402"]
+		expected_missing = ["AB28406", "AB28407", "AB28408", "AB28409", "AB28410", "AB28411", "AB28412", "AB28413"]
+
+		self.assertEqual(report_d.matched_ids, expected_matched)
+		self.assertEqual(report_d.missing_ids, expected_missing)
+		self.assertEqual(report_u.matched_ids, expected_matched)
+		self.assertEqual(report_u.missing_ids, expected_missing)
+
+	# 32. Completeness gate policy live enforcement
+	def test_32_completeness_gate_policy_live_enforcement(self):
+		strict_enricher = ControlledItemEnricher(
+			company=self.company,
+			completeness_gate_policy=CompletenessGatePolicy.STRICT,
+		)
+		partial_enricher = ControlledItemEnricher(
+			company=self.company,
+			completeness_gate_policy=CompletenessGatePolicy.ALLOW_PARTIAL,
+		)
+
+		items = [
+			CanonicalSourceItem(
+				item_id="TEST-G1",
+				master={"Item ID": "TEST-G1"},
+				descriptions=[{"Item ID": "TEST-G1"}],
+				uoms=[{"Item ID": "TEST-G1", "Unit of Measure": "EA"}],
+			),
+			CanonicalSourceItem(
+				item_id="TEST-G2",
+				master={"Item ID": "TEST-G2"},
+				descriptions=[],
+				uoms=[{"Item ID": "TEST-G2", "Unit of Measure": "EA"}],
+			),
+		]
+
+		# STRICT policy marks preview blocked
+		preview_strict = strict_enricher.preview(items)
+		self.assertTrue(preview_strict.is_blocked)
+		self.assertEqual(preview_strict.completeness_reports["ItemDescription"]["status"], "BLOCKED")
+
+		# STRICT enrich_batch halts on completeness gate violation without mutating
+		res_strict = strict_enricher.enrich_batch(items, run_id=self.test_run.name)
+		self.assertTrue(any("Completeness gate violation" in err for err in res_strict.errors))
+		self.assertEqual(len(res_strict.items_updated), 0)
+
+		# STRICT policy with expected_missing passes
+		strict_enricher_with_expected = ControlledItemEnricher(
+			company=self.company,
+			completeness_gate_policy=CompletenessGatePolicy.STRICT,
+			expected_missing_secondary_ids={"ItemDescription": {"TEST-G2"}},
+		)
+		preview_with_expected = strict_enricher_with_expected.preview(items)
+		self.assertEqual(preview_with_expected.completeness_reports["ItemDescription"]["status"], "PARTIAL_EXPECTED")
+
+		# ALLOW_PARTIAL allows preview without block
+		preview_partial = partial_enricher.preview(items)
+		self.assertEqual(preview_partial.completeness_reports["ItemDescription"]["status"], "PARTIAL_EXPECTED")
